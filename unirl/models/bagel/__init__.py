@@ -21,20 +21,25 @@ BagelBundle`` only where a GPU model is constructed. ``rl_ops`` (the RL primitiv
 is flash-free too (torch + diffusers only).
 """
 
-from .conditions import BagelDiffusionConditions
+from .ar import BagelARParams, BagelARStage
+from .conditions import BagelARConditions, BagelDiffusionConditions
 from .config import BAGEL_MOE_GEN_LORA_TARGETS, BagelPipelineConfig
 from .diffusion import BagelDiffusionParams, BagelDiffusionStage, BagelDiffusionStep
-from .pipeline import BagelPipeline
+from .pipeline import BagelPipeline, BagelUniPipeline
 from .vae import BagelVAEDecodeStage, bagel_latent_geometry, bagel_latent_shape, unpatchify_latent
 
 __all__ = [
     "BAGEL_MOE_GEN_LORA_TARGETS",
+    "BagelARConditions",
+    "BagelARParams",
+    "BagelARStage",
     "BagelDiffusionConditions",
     "BagelDiffusionParams",
     "BagelDiffusionStage",
     "BagelDiffusionStep",
     "BagelPipeline",
     "BagelPipelineConfig",
+    "BagelUniPipeline",
     "BagelVAEDecodeStage",
     "bagel_latent_geometry",
     "bagel_latent_shape",

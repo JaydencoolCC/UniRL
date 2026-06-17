@@ -86,4 +86,7 @@ class BagelPipelineConfig:
             self.lora_target_modules = tuple(self.lora_target_modules)
 
 
-__all__ = ["BAGEL_MOE_GEN_LORA_TARGETS", "BagelPipelineConfig"]
+__all__ = [
+    "BAGEL_MOE_GEN_LORA_TARGETS",
+    "BagelPipelineConfig",
+]

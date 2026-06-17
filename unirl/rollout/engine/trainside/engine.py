@@ -75,6 +75,13 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                 f"TrainsideRolloutEngine.forward_batch_size must be >= 1 when set; got {forward_batch_size!r}"
             )
         self.forward_batch_size = forward_batch_size
+        # Pipelines that fan out P→P*N INSIDE generate (e.g. BAGEL uni) can't be chunked
+        # by the engine's req-level slicing (req.batch_size = prompt count), so hand them
+        # the same forward_batch_size to chunk their own fan-out. Generic hook: pipelines
+        # without it (e.g. SD3) keep the engine-level req chunking unchanged.
+        _set_fbs = getattr(self.pipeline, "set_forward_batch_size", None)
+        if callable(_set_fbs):
+            _set_fbs(forward_batch_size)
         # Build a σ-schedule only when a diffusion stage is present (PE wraps
         # both diffusion + ar, so check the resolved list, not the lone `stage`
         # param which is None on the stage_attrs path); AR-only needs none.

@@ -90,8 +90,15 @@ def unpatchify_latent(
 class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
     """BAGEL VAE decode: unpatchify final packed latent then decode to pixels."""
 
-    def __init__(self, bundle: "BagelBundle") -> None:
+    def __init__(self, bundle: "BagelBundle", *, decode_batch_size: int = 4) -> None:
         self.bundle = bundle
+        # Chunk the VAE decode along the batch axis. With a unified rollout the
+        # pipeline fans ONE prompt out to G samples internally (after the engine's
+        # forward_batch_size slice), so this stage can receive all G latents at once
+        # (e.g. G=24 @ 1024²). The fp32 decoder's upsample conv2d peaks at ~1GB/image,
+        # so decoding 24 at once OOMs a 7B-resident card; 4/chunk bounds the peak.
+        # Pure no_grad inference, per-image independent → numerically identical.
+        self.decode_batch_size = max(1, int(decode_batch_size))
 
     def decode(self, s: LatentSegment, *, image_shape: Optional[Tuple[int, int]] = None) -> Images:
         """Decode the final clean latent in *s* into ``[N, 3, H, W]`` pixels in ``[0, 1]``.
@@ -125,10 +132,25 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             raise ValueError(f"BagelVAEDecodeStage.decode: image_shape grid h*w={h * w} != packed seq={seq}.")
 
         spatial = unpatchify_latent(clean.float(), h=h, w=w, patch_size=p, latent_channels=z)
+        vae = self.bundle.vae.to(torch.float32)
+        bs = self.decode_batch_size
         with torch.no_grad():
-            decoded = self.bundle.vae.to(torch.float32).decode(spatial)
+            if n <= bs:
+                decoded = vae.decode(spatial)
+            else:
+                # Decode in batch-axis chunks to bound the fp32 upsample-conv peak
+                # (per-image independent; cat keeps the [N, 3, H, W] order).
+                decoded = torch.cat(
+                    [vae.decode(spatial[i : i + bs]) for i in range(0, n, bs)], dim=0
+                )
         pixels = (decoded * 0.5 + 0.5).clamp(0.0, 1.0)
-        return Images(pixels=pixels)
+        # Move to CPU before returning: decoded pixels are only ever consumed as
+        # CPU PIL (reward scoring via tensor_frame_to_pil, rollout dump) and the
+        # flow algorithm uses latents, not decoded images. Keeping them on GPU
+        # makes the reward-step ray.get() gather deserialize onto the driver's
+        # cuda:0 (stacked on the rank-0 worker) → OOM at 32-GPU scale where the
+        # gathered batch is 4x the 8-GPU smoke.
+        return Images(pixels=pixels.cpu())
 
 
 __all__ = ["BagelVAEDecodeStage", "bagel_latent_geometry", "bagel_latent_shape", "unpatchify_latent"]
