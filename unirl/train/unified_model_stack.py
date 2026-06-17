@@ -34,6 +34,7 @@ optimizer step, in contrast to the single-stage ``TrainStack``.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Dict, List, Mapping, Tuple
 
 import torch
@@ -320,9 +321,25 @@ class UnifiedModelTrainStack(Remote):
 
         self.on_rollout_end()
 
-        # Reduce each track's per-optimizer-step results into one summary (averages
-        # scalars / metrics; passthrough when num_updates_per_batch == 1).
-        return {name: _aggregate_update_results([upd[name] for upd in per_update]) for name in self.algorithms}
+        # Reduce each track's per-optimizer-step results into one summary, attaching
+        # each optimizer step's own metrics on ``per_update`` so the logger emits ONE
+        # wandb point per optimizer update (on-policy update0 vs off-policy update1+
+        # stay distinct series instead of being averaged into one misleading
+        # ratio_mean). Mirrors TrainStack.train_track; passthrough at num_updates==1.
+        results: Dict[str, TrainStepResult] = {}
+        for name in self.algorithms:
+            updates = [upd[name] for upd in per_update]
+            aggregated = _aggregate_update_results(updates)
+            if len(updates) > 1:
+                aggregated = replace(
+                    aggregated,
+                    per_update=tuple(
+                        {**dict(r.metrics), "loss": float(r.loss), "grad_norm": float(r.grad_norm), "lr": float(r.lr)}
+                        for r in updates
+                    ),
+                )
+            results[name] = aggregated
+        return results
 
     def _current_lr(self) -> float:
         optimizer = self.fsdp_backend.optimizer
