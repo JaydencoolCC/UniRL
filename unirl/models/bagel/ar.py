@@ -271,9 +271,7 @@ class BagelARStage(ARStage[BagelARConditions]):
         lengths = [int(n) for n in segment.lengths.tolist()]
         cu = [int(c) for c in segment.cu_seqlens.tolist()]
         if len(prompts) != len(lengths):
-            raise ValueError(
-                f"BagelARStage.replay: {len(prompts)} prompt(s) but {len(lengths)} segment sample(s)."
-            )
+            raise ValueError(f"BagelARStage.replay: {len(prompts)} prompt(s) but {len(lengths)} segment sample(s).")
 
         out: List[torch.Tensor] = []
         for b, prompt in enumerate(prompts):

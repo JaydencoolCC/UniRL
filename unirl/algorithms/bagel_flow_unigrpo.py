@@ -149,9 +149,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         if self._ref_snapshot is not None:
             return
         snap = {
-            name: p.detach().to(dtype=torch.bfloat16)
-            for name, p in transformer.named_parameters()
-            if p.requires_grad
+            name: p.detach().to(dtype=torch.bfloat16) for name, p in transformer.named_parameters() if p.requires_grad
         }
         if not snap:
             raise RuntimeError(
@@ -211,9 +209,7 @@ class BagelFlowUniGRPO(FlowGRPO):
             return
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         with torch.no_grad():
-            result = self.stage.replay(
-                typed_conds, segment=segment, params=self.params, step_indices=target_steps
-            )
+            result = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
         segment.sde_logp = result.log_probs.detach().cpu()
         segment.sde_means = result.prev_sample_means.detach().cpu()
 
@@ -356,9 +352,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         new_logp = replay.log_probs  # [1, S']
         mu_theta = replay.prev_sample_means  # [1, S', seq, C]
         if mu_theta is None:
-            raise RuntimeError(
-                "BagelFlowUniGRPO(ratio_norm=True): stage.replay returned no prev_sample_means (μ_θ)."
-            )
+            raise RuntimeError("BagelFlowUniGRPO(ratio_norm=True): stage.replay returned no prev_sample_means (μ_θ).")
         old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
             dtype=new_logp.dtype, device=new_logp.device
         )

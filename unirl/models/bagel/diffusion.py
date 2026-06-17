@@ -504,7 +504,9 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         """
         text, image_shape = conditions.single()
         gen, cfg_text, cfg_img = self._build_contexts(text)
-        gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, [image_shape], device=device)
+        gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(
+            gen, cfg_text, cfg_img, [image_shape], device=device
+        )
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
         return gi, forward_kwargs
 
@@ -551,9 +553,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         from B per-sample segments).
         """
         if conditions.batch_size > 1:
-            return self._diffuse_batched(
-                conditions, schedule=schedule, params=params, initial_latents=initial_latents
-            )
+            return self._diffuse_batched(conditions, schedule=schedule, params=params, initial_latents=initial_latents)
         bagel = self.model.model
         device = torch.device(self.model.device)
         schedule = schedule.to(device)
@@ -672,9 +672,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         image_shapes = [tuple(s) for s in conditions.image_shapes]
         n = len(texts)
         gen, cfg_text, cfg_img = self._build_contexts_batch(texts)
-        gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(
-            gen, cfg_text, cfg_img, image_shapes, device=device
-        )
+        gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shapes, device=device)
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
 
         if initial_latents is not None:

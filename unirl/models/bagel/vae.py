@@ -140,9 +140,7 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             else:
                 # Decode in batch-axis chunks to bound the fp32 upsample-conv peak
                 # (per-image independent; cat keeps the [N, 3, H, W] order).
-                decoded = torch.cat(
-                    [vae.decode(spatial[i : i + bs]) for i in range(0, n, bs)], dim=0
-                )
+                decoded = torch.cat([vae.decode(spatial[i : i + bs]) for i in range(0, n, bs)], dim=0)
         pixels = (decoded * 0.5 + 0.5).clamp(0.0, 1.0)
         # Move to CPU before returning: decoded pixels are only ever consumed as
         # CPU PIL (reward scoring via tensor_frame_to_pil, rollout dump) and the

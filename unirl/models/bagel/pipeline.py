@@ -388,9 +388,7 @@ class BagelUniPipeline(BagelPipeline):
             )
         ar_params = get_ar_params(req.sampling_params)
         if ar_params is None:
-            raise TypeError(
-                "BagelUniPipeline.generate: sampling_params must carry an 'ar' (ARSamplingParams) block."
-            )
+            raise TypeError("BagelUniPipeline.generate: sampling_params must carry an 'ar' (ARSamplingParams) block.")
         params = get_diffusion_params(req.sampling_params)
         if not isinstance(params, BagelDiffusionParams):
             raise TypeError(
@@ -440,9 +438,7 @@ class BagelUniPipeline(BagelPipeline):
         if fbs is None or fbs <= 1:
             for image_text in image_texts:  # legacy navit bs=1 (untouched)
                 cond_i = BagelDiffusionConditions.for_sample(text=image_text, image_shape=image_shape)
-                segments.append(
-                    self.diffusion.diffuse(cond_i, schedule=schedule, params=params, initial_latents=None)
-                )
+                segments.append(self.diffusion.diffuse(cond_i, schedule=schedule, params=params, initial_latents=None))
                 shapes.append(image_shape)
         else:
             # forward_batch_size pack-B: navit-pack up to fbs same-shape images per
@@ -451,9 +447,7 @@ class BagelUniPipeline(BagelPipeline):
             for start in range(0, len(image_texts), fbs):
                 chunk = image_texts[start : start + fbs]
                 cond_b = BagelDiffusionConditions(texts=list(chunk), image_shapes=[image_shape] * len(chunk))
-                segments.append(
-                    self.diffusion.diffuse(cond_b, schedule=schedule, params=params, initial_latents=None)
-                )
+                segments.append(self.diffusion.diffuse(cond_b, schedule=schedule, params=params, initial_latents=None))
                 shapes.extend([image_shape] * len(chunk))
 
         segment = self._batch_segments(segments)

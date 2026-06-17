@@ -218,9 +218,7 @@ class UnifiedModelTrainer(BaseTrainer):
                 self.ar_rollout = None
                 self.dit_rollout = None
                 rollout_parsed = parse_hydra_cfg(rollout_cfg)
-                self._rollout_is_trainside = (
-                    "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
-                )
+                self._rollout_is_trainside = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
                 if self._rollout_is_trainside:
                     self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)
                     self._enable_fsdp_offload = False  # shares live FSDP modules
@@ -598,9 +596,7 @@ class UnifiedModelTrainer(BaseTrainer):
         # without this expansion the geneval scorer raises (no per-item spec).
         # Empty when the data source carries no metadata (e.g. pickscore prompts).
         reward_metadata = (
-            [req.metadata[i // (n_rec * n_img)] for i in range(len(img_track.sample_ids))]
-            if req.metadata
-            else []
+            [req.metadata[i // (n_rec * n_img)] for i in range(len(img_track.sample_ids))] if req.metadata else []
         )
         reward_req = RolloutReq(
             sample_ids=list(img_track.sample_ids),
