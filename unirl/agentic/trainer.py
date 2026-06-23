@@ -33,7 +33,7 @@ import dataclasses
 import logging
 import math
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from hydra.utils import instantiate
@@ -197,20 +197,21 @@ class AsyncAgenticTrainer(BaseTrainer):
     # Over-sample + dynamic filter -> a full batch of informative groups
     # ------------------------------------------------------------------
 
-    def _collect_batch(self, rollout_id: int) -> List[RolloutResp]:
-        """Generate (over-sampled), score, filter, and return ``batch_size`` shards.
+    def _collect_oversampled(self, rollout_id: int) -> RolloutResp:
+        """Over-sample → score → split → dynamic filter → drain ``batch_size``.
 
         Generates ``ceil(ratio*B)`` prompts, scores + credit-assigns, splits into
-        per-prompt shards, drops zero-variance groups, and drains the freshest
-        ``B``. Falls back to keeping zero-variance groups only if too few
-        informative ones survive (a training batch must be full).
+        per-prompt shards, drops zero-variance groups, drains the freshest ``B``,
+        and concatenates them back into one resp. Falls back to keeping
+        zero-variance groups if too few informative ones survive (a training batch
+        must be full).
 
         ``get_samples(over)`` is respected by data sources that honor the arg
         (e.g. ``DefaultDataSource``); ``MultimodalRLDataSource`` ignores it and
         yields its configured ``prompts_per_rollout`` batch — so to over-sample
         with that source, set ``prompts_per_rollout = ceil(ratio*batch_size)``.
-        The filter is applied whenever more groups than ``batch_size`` arrive,
-        independent of how many prompts the source actually returned.
+        Only reached when ``over_sample_ratio > 1`` (the simple, no-buffer
+        :meth:`train_step` fast path handles the common B==B case).
         """
         over = max(self.batch_size, math.ceil(self.over_sample_ratio * self.batch_size))
         inputs = self.data_source.get_samples(over)
@@ -242,7 +243,25 @@ class AsyncAgenticTrainer(BaseTrainer):
                 f"AsyncAgenticTrainer: collected {buffer.size()} group(s) but need {self.batch_size}; "
                 "increase over_sample_ratio or batch_size."
             )
-        return [p[0] for p in picked]
+        shards = [p[0] for p in picked]
+        return RolloutResp(
+            tracks={
+                THINK_TRACK: RolloutTrack.concat([s.tracks[THINK_TRACK] for s in shards]),
+                IMAGE_TRACK: RolloutTrack.concat([s.tracks[IMAGE_TRACK] for s in shards]),
+            }
+        )
+
+    def _collect_simple(self, rollout_id: int) -> RolloutResp:
+        """No over-sampling: generate ``batch_size`` prompts, score, credit-assign.
+
+        The proven single-shot flow (PETrainer / UnifiedModelTrainer): no buffer,
+        no driver-side ``split``/``concat`` of the opaque Bagel KV-cache
+        conditions — the scored resp goes straight to advantages + training.
+        """
+        inputs = self.data_source.get_samples(self.batch_size)
+        req = self._build_req(inputs, rollout_id)
+        resp = self.rollout.generate(req)
+        return self._score(req, resp)
 
     # ------------------------------------------------------------------
     # One step
@@ -250,13 +269,10 @@ class AsyncAgenticTrainer(BaseTrainer):
 
     def train_step(self, rollout_id: int, training_progress: float) -> Tuple[Dict[str, TrainStepResult], float]:
         t0 = time.perf_counter()
-        shards = self._collect_batch(rollout_id)
-        resp = RolloutResp(
-            tracks={
-                THINK_TRACK: RolloutTrack.concat([s.tracks[THINK_TRACK] for s in shards]),
-                IMAGE_TRACK: RolloutTrack.concat([s.tracks[IMAGE_TRACK] for s in shards]),
-            }
-        )
+        if self.over_sample_ratio > 1.0:
+            resp = self._collect_oversampled(rollout_id)
+        else:
+            resp = self._collect_simple(rollout_id)
 
         # Mean image reward for the log line (before advantages mutate tracks).
         mean_reward = 0.0
