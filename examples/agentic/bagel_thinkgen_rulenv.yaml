@@ -1,0 +1,243 @@
+# @package _global_
+# BAGEL-7B-MoT half-async AGENTIC RL — multi-turn think→gen→obs, trainside colocate.
+#
+# Generalizes Bagel's single-turn t2ti to a T-turn agentic loop driven by
+# unirl.agentic: each turn the und path PLANS (<think>) and the gen experts RENDER
+# an image; a RuleEnv weaves deterministic refinement feedback into the next turn's
+# context (obs is prefix-only — never a training segment). PickScore scores every
+# image; the reward is credit-assigned up to the think track; GRPO (think) +
+# FlowGRPO (image) train ONE shared backbone in a single UnifiedModelTrainStack
+# step. Over-sampling + a zero-variance dynamic filter pick informative groups.
+#
+# Colocate / trainside: the live FSDP Bagel pipeline IS the sampler (no separate
+# engine, no weight sync). One shared LoRA covers BOTH the und projections (think)
+# and the gen experts (image).
+#
+# Divisibility (DP_SCATTER), with B=batch_size, N=sessions_per_prompt, T=max_turns,
+# D=num_devices:  B*N % D == 0  AND  B*N*T % D == 0.
+# Smoke defaults: B=4, N=2, T=2, D=8 → 8 sessions, 16 think+image rows (both ÷8).
+#
+# Launch (single node, 8xH20):
+#   DATA_PATH=/abs/datasets/pickscore/train.txt BAGEL_PATH=/abs/models/BAGEL-7B-MoT \
+#   python -m unirl.train_agentic --config-name agentic/bagel_thinkgen_rulenv num_devices=8
+#
+# Compose check (CPU): python -m unirl.train_agentic \
+#   --config-name agentic/bagel_thinkgen_rulenv --cfg job --resolve
+
+num_devices: 8
+batch_size: 4                  # P prompt groups trained per rollout
+sessions_per_prompt: 2         # N sessions per prompt (GRPO group size)
+max_turns: 2                   # T fixed think→gen→obs turns per session (P0)
+over_sample_ratio: 1.0         # 1.0 = no over-sampling (filter unit-tested separately)
+reward_std_eps: 1.0e-6
+buffer_max_staleness: 0        # on-policy (colocate trainside never syncs)
+
+num_rollouts: 2000             # intentionally large; stop manually
+adv_normalization_scope: group # per-prompt GRPO normalization
+normalize_adv_by_std: true
+
+save_interval: 50
+save_dir: ${oc.env:CKPT_DIR,tmp/ckpt_bagel_agentic}
+save_mode: auto                # LoRA active -> LoRA-only checkpoints
+
+transport_kind: colocate_store
+workers_per_device: 1
+
+logging:
+  report_to_wandb: ${oc.env:REPORT_WANDB,false}
+  project_name: ${oc.env:WANDB_PROJECT,bagel-agentic}
+  run_name: ${oc.env:WANDB_RUN_NAME,bagel_thinkgen_rulenv}
+  tags: [bagel, agentic, thinkgen, multiturn, pickscore, trainside]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 5
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp32   # keep diffuse<->replay bit-exact (image ratio=1)
+    logprob_precision: fp32
+    shift: 3.0
+    enable_vit: false            # t2i think→gen: no input image, so no und ViT tower
+    use_lora: true
+    lora_target_modules:         # UNION: und projections (think) + gen experts (image)
+      - self_attn.q_proj
+      - self_attn.k_proj
+      - self_attn.v_proj
+      - self_attn.o_proj
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
+      - self_attn.q_proj_moe_gen
+      - self_attn.k_proj_moe_gen
+      - self_attn.v_proj_moe_gen
+      - self_attn.o_proj_moe_gen
+      - mlp_moe_gen.gate_proj
+      - mlp_moe_gen.up_proj
+      - mlp_moe_gen.down_proj
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelPipeline
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  # think replay scorer: 'train' (forward_train, validated default) or 'inference'
+  # (forward_inference, kernel-matched to rollout → cleaner ratio for text-only think).
+  replay_mode: ${oc.env:REPLAY_MODE,train}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32                 # fp32 LoRA master + Adam (reward-collapse fix)
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true     # 7B + multi-turn replay + diffusion: required
+    use_torch_compile: false
+    root_wrap: false                   # vendored BAGEL calls embed_tokens/lm_head outside a root forward
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:                    # = bundle.lora_target_modules (und + gen)
+      - self_attn.q_proj
+      - self_attn.k_proj
+      - self_attn.v_proj
+      - self_attn.o_proj
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
+      - self_attn.q_proj_moe_gen
+      - self_attn.k_proj_moe_gen
+      - self_attn.v_proj_moe_gen
+      - self_attn.o_proj_moe_gen
+      - mlp_moe_gen.gate_proj
+      - mlp_moe_gen.up_proj
+      - mlp_moe_gen.down_proj
+
+# Trainside multi-turn agentic engine (shares the live pipeline). The trainer
+# injects `pipeline=`; everything else is scalar config.
+rollout:
+  _target_: unirl.agentic.engine.BagelAgenticEngine
+  max_turns: ${max_turns}
+  system_prompt: null            # null -> Bagel's native GEN_THINK_SYSTEM_PROMPT
+  honor_done: false              # P0 runs fixed turns (uniform GRPO groups)
+  env_instructions:
+    - "Reflect on the previous attempt and revise the plan to improve visual fidelity, composition, and prompt alignment. Then describe the refined image."
+    - "Critique the latest image for missing or distorted details and rewrite the plan to fix them while staying faithful to the original request."
+
+# Local PickScore on the train GPUs (auto-downloads CLIP-ViT-H from HF).
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+# GRPO over the think ("ar") track — trains the und path.
+ar_algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 1.0e-2
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelARConditions
+  sampling_temperature: 1.0
+
+# FlowGRPO over the image track — trains the gen experts.
+image_algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelDiffusionConditions
+  params: ${sampling.diffusion}
+
+# ONE shared backbone, TWO algorithms → ONE optimizer step.
+stack:
+  _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
+  micro_batch_size: 1                  # navit bs=1 (Bagel AR + diffusion are per-sample)
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,datasets/pickscore/train.txt}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,datasets/pickscore/test.txt}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# Composed sampling dict: 'ar' drives each turn's think, 'diffusion' each turn's
+# image. samples_per_prompt = 1 on both — the N-session fan-out is the trainer's
+# sessions_per_prompt, not a per-call batch.
+sampling:
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 1
+    temperature: 1.0
+    top_p: 1.0
+    top_k: 0
+    max_new_tokens: 256          # think/plan budget (cut for smoke; raise for richer plans)
+  diffusion:
+    _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
+    samples_per_prompt: 1
+    num_inference_steps: 14
+    guidance_scale: 1.0
+    cfg_text_scale: 1            # No-CFG single forward (smoke); >1 enables instruction CFG
+    cfg_img_scale: 1.0
+    cfg_interval: [0.4, 1.0]
+    cfg_renorm_min: 0.0
+    cfg_renorm_type: text_channel
+    eta: 1.0                     # SDE exploration noise
+    height: 512
+    width: 512
+    seed: 42
+    init_same_noise: false       # each session draws its own x_T (in-group diversity)
+    autocast_precision: bf16
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    scheduler:
+      _target_: unirl.utils.scheduler_utils.WindowScheduler
+      num_timesteps: 7
+      config:
+        _target_: unirl.utils.scheduler_utils.WindowConfig
+        strategy: random
+        window_size: 3
