@@ -28,6 +28,7 @@ from unirl.models.wan21.image_encode import WAN21ImageLatentEncodeStage
 from unirl.models.wan21.pipeline import WAN21Pipeline
 from unirl.models.wan21.text_embed import WAN21TextEmbedStage
 from unirl.models.wan21.vae import WAN21VAEDecodeStage
+from unirl.models.wan21.video_encode import WAN21VideoLatentEncodeStage
 
 __all__ = [
     "WAN21Bundle",
@@ -40,4 +41,5 @@ __all__ = [
     "WAN21PipelineConfig",
     "WAN21TextEmbedStage",
     "WAN21VAEDecodeStage",
+    "WAN21VideoLatentEncodeStage",
 ]

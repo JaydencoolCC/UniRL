@@ -23,13 +23,16 @@ with the configured ``shift``. This mirrors legacy
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Optional
+
+import torch
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, Texts, Videos
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
 from unirl.types.sampling import DiffusionSamplingParams
@@ -42,6 +45,7 @@ from .diffusion import WAN21DiffusionStage, WAN21DiffusionStep
 from .image_encode import WAN21ImageLatentEncodeStage
 from .text_embed import WAN21TextEmbedStage
 from .vae import WAN21VAEDecodeStage
+from .video_encode import WAN21VideoLatentEncodeStage, add_flowmatch_noise
 
 
 class WAN21Pipeline(Pipeline):
@@ -230,9 +234,46 @@ class WAN21Pipeline(Pipeline):
             )
         schedule = req.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
-        # pre-shipped initial_latents tensor (img2img / i2v first-frame) still wins.
-        initial_latents = NoiseRecipe.from_rollout_req(req).resolve()
+        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe).
+        # V2V reuses the same recipe as its additive noise source, so resolve
+        # the tensor only after deciding whether a condition video is present.
+        noise_recipe = NoiseRecipe.from_rollout_req(req)
+        initial_latents = None
+
+        videos_prim = req.primitives.get("video")
+        if videos_prim is not None:
+            if not isinstance(videos_prim, Videos):
+                raise TypeError(
+                    f"WAN21Pipeline.generate: req.primitives['video'] must be Videos, got {type(videos_prim).__name__}"
+                )
+            if int(len(videos_prim)) != len(texts.texts):
+                raise ValueError(
+                    f"WAN21Pipeline.generate: video count {len(videos_prim)} != text count {len(texts.texts)}"
+                )
+            if noise_recipe.initial_latents is not None:
+                raise ValueError(
+                    "WAN21Pipeline.generate: V2V video primitive cannot be combined with "
+                    "request_conditions['initial_latents']."
+                )
+            schedule, params = self._v2v_effective_schedule(schedule, params)
+            clean_latents = WAN21VideoLatentEncodeStage(
+                self.bundle,
+                num_frames=int(params.num_frames),
+                height=int(params.height),
+                width=int(params.width),
+            ).encode(videos_prim)
+            recipe = noise_recipe.for_batch(
+                int(clean_latents.shape[0]),
+                latent_shape=tuple(int(x) for x in clean_latents.shape[1:]),
+            )
+            noise = recipe.resolve(device=clean_latents.device, dtype=clean_latents.dtype)
+            if noise is None:
+                noise = torch.randn_like(clean_latents)
+            initial_latents = add_flowmatch_noise(clean_latents, noise, schedule[0])
+        else:
+            # Plain T2V / I2V: pre-shipped initial_latents wins; otherwise
+            # regenerate the driver-authored x_T recipe when present.
+            initial_latents = noise_recipe.resolve()
 
         latent_seg = self.diffusion.diffuse(
             wan_conds, schedule=schedule, params=params, initial_latents=initial_latents
@@ -249,6 +290,39 @@ class WAN21Pipeline(Pipeline):
                     decoded=videos,
                 ),
             }
+        )
+
+    @staticmethod
+    def _v2v_effective_schedule(
+        schedule: Any,
+        params: DiffusionSamplingParams,
+    ) -> tuple[Any, DiffusionSamplingParams]:
+        """Apply diffusers-style V2V strength by cropping the denoise schedule."""
+        raw_strength = getattr(params, "strength", None)
+        if raw_strength is None:
+            raw_strength = (params.sampler_kwargs or {}).get("strength", 0.8)
+        strength = float(raw_strength)
+        if not 0.0 < strength <= 1.0:
+            raise ValueError(f"WAN21Pipeline.generate: V2V strength must be in (0, 1], got {strength}")
+
+        total_steps = int(params.num_inference_steps)
+        init_timestep = min(int(total_steps * strength), total_steps)
+        t_start = max(total_steps - init_timestep, 0)
+        effective_schedule = schedule[t_start:]
+        effective_steps = int(effective_schedule.shape[0]) - 1
+        if effective_steps < 1:
+            raise ValueError(
+                f"WAN21Pipeline.generate: V2V strength={strength} leaves no denoising steps "
+                f"from num_inference_steps={total_steps}."
+            )
+
+        sde_indices = None
+        if params.sde_indices is not None:
+            sde_indices = [int(i) - t_start for i in params.sde_indices if t_start <= int(i) < total_steps]
+        return effective_schedule, dataclasses.replace(
+            params,
+            num_inference_steps=effective_steps,
+            sde_indices=sde_indices,
         )
 
 
