@@ -183,7 +183,13 @@ image_algorithm:
   stage_attr: diffusion
   clip_range: 5.0e-3
   clip_schedule: constant
-  old_logp_source: replay
+  # 'rollout' (not 'replay'): UnifiedModelTrainStack runs ONE update and calls
+  # prepare_segment on the FULL track; Bagel diffusion is navit bs=1
+  # (conditions.single()), so a full-batch replay anchor errors. 'rollout' uses
+  # the trajectory sde_logp emitted by diffuse (fp32 => ratio=1 on the single
+  # update); the per-sample new_logp replay still runs in compute_loss_and_backward
+  # (micro_batch_size=1). Switch to 'replay' only with a micro-sliced prepare_segment.
+  old_logp_source: rollout
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.bagel.conditions.BagelDiffusionConditions
