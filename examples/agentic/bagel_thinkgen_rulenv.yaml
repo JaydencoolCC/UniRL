@@ -86,9 +86,13 @@ pipeline:
   trajectory_precision: fp32
   logprob_precision: fp32
   shift: 3.0
-  # think replay scorer: 'train' (forward_train, validated default) or 'inference'
-  # (forward_inference, kernel-matched to rollout → cleaner ratio for text-only think).
-  replay_mode: ${oc.env:REPLAY_MODE,train}
+  # think replay scorer. MUST be 'inference' for the unified (think+image) stack:
+  # 'train' sets language_model.train() (forward_train), and the subsequent diffusion
+  # replay's forward_flow then dispatches to forward_train (no packed_query_sequence)
+  # -> TypeError. 'inference' uses forward_inference (grad over [prompt+response],
+  # trains the und/think path, ratio~1) AND leaves the model in eval() so the
+  # diffusion replay uses forward_inference too.
+  replay_mode: ${oc.env:REPLAY_MODE,inference}
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 
