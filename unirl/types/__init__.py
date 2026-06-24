@@ -21,6 +21,9 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     "RolloutReq": ("unirl.types.rollout_req", "RolloutReq"),
     "RolloutResp": ("unirl.types.rollout_resp", "RolloutResp"),
     "RolloutTrack": ("unirl.types.rollout_resp", "RolloutTrack"),
+    # Endomorphism rollout types (LIN-446; docs/rollout-sample-refactor.md).
+    "Sample": ("unirl.types.sample", "Sample"),
+    "Part": ("unirl.types.sample", "Part"),
     "ARSamplingParams": ("unirl.types.sampling", "ARSamplingParams"),
     "BaseSamplingParams": ("unirl.types.sampling", "BaseSamplingParams"),
     "DiffusionSamplingParams": ("unirl.types.sampling", "DiffusionSamplingParams"),
