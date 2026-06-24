@@ -219,8 +219,19 @@ class BagelAgenticEngine(BaseRolloutEngine):
         return gen, cfg_text, cfg_img
 
     def _detokenize(self, tokens: torch.Tensor) -> str:
-        """Decode response tokens to text, stripped at ``<|im_end|>`` (t2ti parity)."""
-        return self.pipeline.bundle.tokenizer.decode([int(t) for t in tokens.tolist()]).split("<|im_end|>")[0]
+        """Decode response tokens to text, stripped at ``<|im_end|>`` (t2ti parity).
+
+        Robust to ids the AR head can sample but the tokenizer can't map to a
+        string: BAGEL's lm_head vocab is padded past the tokenizer vocab, so a
+        rare off-distribution sample lands on a phantom id whose
+        ``convert_ids_to_tokens`` is ``None`` (``"".join`` would then raise). Drop
+        those ids before decoding.
+        """
+        tok = self.pipeline.bundle.tokenizer
+        ids = [int(t) for t in tokens.tolist()]
+        pieces = tok.convert_ids_to_tokens(ids)
+        ids = [i for i, p in zip(ids, pieces) if p is not None]
+        return tok.decode(ids).split("<|im_end|>")[0]
 
     # ------------------------------------------------------------------
     # Response assembly (flatten sessions → 2 tracks)

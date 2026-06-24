@@ -30,6 +30,9 @@ class _FakeTokenizer:
     def encode(self, text):
         return [(abs(hash(text)) % 100) + 1, len(text) % 50 + 1]
 
+    def convert_ids_to_tokens(self, ids):
+        return [f"t{i}" for i in ids]  # all mappable (no None)
+
     def decode(self, ids):
         return f"text<{len(ids)}>"  # no <|im_end|> -> kept whole
 
