@@ -113,8 +113,7 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
             frames = frames.to(dtype=torch.float32).clamp_(0.0, 1.0)
         if int(frames.shape[1]) != 3:
             raise ValueError(
-                f"WAN V2V expects RGB condition video frames [T, 3, H, W], got {tuple(frames.shape)} "
-                f"from {uri}"
+                f"WAN V2V expects RGB condition video frames [T, 3, H, W], got {tuple(frames.shape)} from {uri}"
             )
         videos_per_prompt.append(PrimVideo(frames=frames))
         any_loaded = True

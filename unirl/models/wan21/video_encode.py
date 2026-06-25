@@ -8,7 +8,7 @@ normalization that decode later reverses.
 
 from __future__ import annotations
 
-from typing import Any, List, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
@@ -100,7 +100,9 @@ class WAN21VideoLatentEncodeStage(EncodeStage[Videos, torch.Tensor]):
         latents_std = getattr(vae_config, "latents_std", None)
         if latents_mean is not None and latents_std is not None:
             z_dim = int(getattr(vae_config, "z_dim", latent_condition.shape[1]))
-            mean = torch.tensor(latents_mean, device=self.bundle.device, dtype=self.bundle.dtype).view(1, z_dim, 1, 1, 1)
+            mean = torch.tensor(latents_mean, device=self.bundle.device, dtype=self.bundle.dtype).view(
+                1, z_dim, 1, 1, 1
+            )
             std = torch.tensor(latents_std, device=self.bundle.device, dtype=self.bundle.dtype).view(1, z_dim, 1, 1, 1)
             return (latent_condition - mean) / std
 
