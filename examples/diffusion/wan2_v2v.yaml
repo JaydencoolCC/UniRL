@@ -94,16 +94,21 @@ rollout:
   forward_batch_size: 1
 
 reward:
+  # Edit-delta reward: PickScore-to-target minus CLIP-similarity-to-source, so an
+  # un-edited V2V output (already high on plain PickScore) nets ~0 and reward only
+  # rises as the model applies the style edit. lambda_source weights "how much to
+  # change from the source"; raise it to push stronger edits.
   _target_: unirl.reward.service.RewardService
   backend:
-    _target_: unirl.reward.local.video_pickscore.VideoPickScoreScorer
+    _target_: unirl.reward.local.video_clip_delta.VideoCLIPDeltaScorer
     base_device: cuda
     config:
-      _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
+      _target_: unirl.reward.local.video_clip_delta.VideoCLIPDeltaSpec
       batch_size: 8
       device: auto
       processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
       model_id: yuvalkirstain/PickScore_v1
+      lambda_source: 1.0
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
