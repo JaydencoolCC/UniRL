@@ -31,10 +31,14 @@ import torch
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
-from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs, texts_from_req
+from unirl.rollout.engine.vllm_omni.utils import (
+    collect_dit_outputs,
+    diffusion_gen_part,
+    image_input_part,
+    texts_from_sample,
+)
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 
 def _ragged_pad_cat(pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> TextEmbedCondition:
@@ -66,25 +70,25 @@ class QwenImageInputAdapter(DitInputAdapter):
         super().__init__(modality)
         self.model_config = model_config
 
-    def build_prompts(self, req: RolloutReq) -> List[Any]:
+    def build_prompts(self, sample: Sample) -> List[Any]:
         """``{"prompt"}`` dicts; ``negative_prompt`` ONLY when CFG is armed.
 
         Upstream ``_extract_prompts`` disarms CFG only when EVERY dict lacks
         the key (``""`` counts as present), so the shared skeleton's
         unconditional ``negative_prompt: ""`` cannot be reused here.
         """
-        if req.primitives.get("image") is not None:
-            raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
-        texts = texts_from_req(req)
-        diff_params = req.sampling_params.get("diffusion")
+        if image_input_part(sample) is not None:
+            raise ValueError(f"modality={self.modality!r} does not accept an image input Part")
+        texts = texts_from_sample(sample)
+        diff_params = diffusion_gen_part(sample).sampling_params
         if float(diff_params.guidance_scale) > 1.0:
             negative_prompt = str(getattr(diff_params, "negative_prompt", "") or "")
             return [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
         return [{"prompt": text} for text in texts.texts]
 
-    def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
-        sampling = super().build_sampling(req)
-        diff_params = req.sampling_params.get("diffusion")
+    def build_sampling(self, sample: Sample) -> List[StageSampling]:
+        sampling = super().build_sampling(sample)
+        diff_params = diffusion_gen_part(sample).sampling_params
         kwargs = sampling[0].kwargs
         # Qwen's CFG knob: set it ALWAYS so upstream's ``or 4.0`` default
         # never fires (at <= 1.0 ``do_true_cfg`` stays False regardless of
@@ -108,7 +112,7 @@ class QwenImageOutputAdapter(DitOutputAdapter):
         "in the stage YAML)."
     )
 
-    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+    def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """Ragged-pad-concat the per-request Qwen ``text_capture`` dicts.
 
         Written by ``RLQwenImagePipeline`` after intercepting
@@ -117,7 +121,7 @@ class QwenImageOutputAdapter(DitOutputAdapter):
         fired (CFG armed) — and then it must have fired for every request
         of the call (sampling params are uniform across a generate call).
         """
-        del req
+        del sample
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
@@ -158,17 +162,17 @@ class QwenImageT2iAdapter(ModelAdapter):
         self.input_adapter = QwenImageInputAdapter(self.modality, model_config=model_config)
         self.output_adapter = QwenImageOutputAdapter(self.modality)
 
-    def validate_request(self, req: RolloutReq) -> None:
-        if req.primitives.get("image") is not None:
+    def validate_request(self, sample: Sample) -> None:
+        if image_input_part(sample) is not None:
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use an image-conditioned modality instead."
             )
 
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        return self.input_adapter.build(req)
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        return self.input_adapter.build(sample)
 
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        return self.output_adapter.build(req, per_request)
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        return self.output_adapter.build(sample, per_request)
 
 
 __all__ = ["QwenImageInputAdapter", "QwenImageOutputAdapter", "QwenImageT2iAdapter"]

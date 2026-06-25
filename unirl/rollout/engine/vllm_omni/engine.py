@@ -1,8 +1,8 @@
 """``vllm_omni`` engine core — wiring + delegation only.
 
 A thin core over the backend seam: it names no concrete modality (the adapter,
-picked from the registry by ``config.modality``, owns the
-``RolloutReq``↔``RolloutResp`` conversion and the per-modality topology knobs)
+picked from the registry by ``config.modality``, owns the ``Sample`` →
+``Sample`` conversion and the per-modality topology knobs)
 and no concrete backend (the seam owns the runtime — boot, ports, env quirks,
 the per-stage ``collective_rpc`` fan-out). Weight sync is a :class:`WeightSync`
 component constructed over the seam; the offload lifecycle (a single flag)
@@ -33,10 +33,9 @@ from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
+from unirl.rollout.engine.vllm_omni.utils import diffusion_gen_part
 from unirl.rollout.engine.vllm_omni.weight_sync import WeightSync
-from unirl.sde.runtime import ensure_req_sigmas
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 
 class VLLMOmniRolloutEngine(BaseRolloutEngine):
@@ -107,7 +106,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     # ------------------------------------------------------------------ #
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, req: RolloutReq) -> RolloutResp:
+    def generate(self, sample: Sample) -> Sample:
         # Defense-in-depth the v1 wake-failure path documented but never
         # implemented: a failed LoRA re-push keeps the engine offloaded so
         # this guard catches callers that swallowed the wake_up exception.
@@ -115,20 +114,40 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             not self._is_offloaded,
             "VLLMOmniRolloutEngine.generate: engine is offloaded (wake_up first).",
         )
-        self.adapter.validate_request(req)
-        # Main-repo SSOT for σ: pin once via the shared helper; the adapter
-        # forwards it on the wire and ``build_image_segment`` asserts the
-        # worker echoed it back. AR-only modalities have no diffusion params,
-        # so the adapter opts out (ensure_req_sigmas would raise on them).
+        self.adapter.validate_request(sample)
+        # Main-repo SSOT for σ: pin once onto the diffusion gen Part; the adapter
+        # forwards it on the wire and ``build_image_segment`` asserts the worker
+        # echoed it back. AR-only modalities have no diffusion gen Part, so the
+        # adapter opts out (needs_sigmas=False).
         if self.adapter.needs_sigmas:
-            ensure_req_sigmas(req, self.schedule_policy)
-        calls = self.adapter.build_inputs(req)
+            self._ensure_sample_sigmas(sample)
+        calls = self.adapter.build_inputs(sample)
         per_request = self._backend.generate(
             calls,
             attach_lora=self._weight_sync.lora_loaded,
             ar_lora_passthrough=self.adapter.ar_lora_passthrough,
         )
-        return self.adapter.build_response(req, per_request)
+        return self.adapter.build_response(sample, per_request)
+
+    def _ensure_sample_sigmas(self, sample: Sample) -> None:
+        """Pin the σ schedule onto the diffusion gen Part's ``DiffusionSamplingParams.sigmas``.
+
+        Sample-shaped analogue of ``ensure_req_sigmas``: σ is the single source
+        of truth, computed from the model-owned schedule policy applied to the
+        request's (T, H, W). Shared across the part's samples (one params
+        object). Idempotent — a pre-pinned σ is left as-is.
+        """
+        gen_part = diffusion_gen_part(sample)
+        if gen_part is None:
+            return
+        diffusion = gen_part.sampling_params
+        if diffusion.sigmas is not None:
+            return
+        diffusion.sigmas = self.schedule_policy.compute_sigma(
+            num_inference_steps=int(diffusion.num_inference_steps),
+            height=int(diffusion.height),
+            width=int(diffusion.width),
+        )
 
     # ------------------------------------------------------------------ #
     # Lifecycle — the offload flag lives here; decorators re-applied

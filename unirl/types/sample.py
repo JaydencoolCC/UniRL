@@ -31,6 +31,7 @@ from unirl.distributed.tensor.batch import (
     shared_field,
 )
 from unirl.distributed.tensor.ref import hydrate
+from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
 from unirl.types.primitives import Audios, Images, Texts, Videos
 from unirl.types.sample_id import child_id, parent_id
@@ -63,6 +64,10 @@ class Part(Batch):
 
     segment: Optional[Segment] = field(kind=FieldKind.CONCAT, default=None)
     primitive: Optional[Primitive] = field(kind=FieldKind.CONCAT, default=None)
+    # Encoded conditioning produced for this part, kept for trainer-side replay —
+    # the carrier for what the old ``RolloutTrack.conditions`` held. Per-sample
+    # (CONCAT); defaults to ``{}`` so an unpopulated part is an empty dict, not None.
+    conditions: Dict[str, Condition] = field(kind=FieldKind.CONCAT, default_factory=dict)
     media_preview: Optional[MediaPreview] = concat_field(default=None)
 
     rewards: Optional[torch.Tensor] = concat_field(default=None)
@@ -71,6 +76,9 @@ class Part(Batch):
     status: Optional[torch.Tensor] = concat_field(default=None)
 
     metadata: List[Dict[str, Any]] = concat_field(default_factory=list)
+    # Request-side routing / override metadata (task / bot_task / chat / ar);
+    # renamed from the old ``RolloutReq.stage_config``. Shared across a part's samples.
+    control: Dict[str, Any] = shared_field(default_factory=dict)
     # The sampling params this part was generated under (provenance; set at fork).
     sampling_params: Optional[BaseSamplingParams] = shared_field(default=None)
 
@@ -81,6 +89,7 @@ class Part(Batch):
         segment: Optional[Segment] = None,
         *,
         primitive: Optional[Primitive] = None,
+        control: Optional[Dict[str, Any]] = None,
         metadata: Optional[List[Optional[Dict[str, Any]]]] = None,
     ) -> "Part":
         """Build a turn-0 input Part (the prompt, a root; untrained).
@@ -99,6 +108,7 @@ class Part(Batch):
             sample_ids=list(sample_ids),
             segment=segment,
             primitive=primitive,
+            control=dict(control) if control else {},
             metadata=list(metadata) if metadata else [],
         )
 
@@ -185,6 +195,34 @@ class Part(Batch):
             segment=new_segment,
             sampling_params=sampling_params,
         )
+
+    def fill(
+        self,
+        *,
+        segment: Optional[Segment] = None,
+        primitive: Optional[Primitive] = None,
+        conditions: Optional[Dict[str, Condition]] = None,
+        media_preview: Optional[MediaPreview] = None,
+        status: Optional[torch.Tensor] = None,
+    ) -> "Part":
+        """Return a copy of this gen-shell part with generation outputs written.
+
+        The producer-side counterpart of :meth:`fork`: ``fork`` makes the empty
+        shell (ids + ``sampling_params``), the engine generates, then ``fill``
+        writes the results. Only non-``None`` arguments are written; ids,
+        ``sampling_params`` and everything else are preserved.
+        """
+        kwargs: Dict[str, Any] = {f.name: getattr(self, f.name) for f in dc_fields(self)}
+        for name, value in (
+            ("segment", segment),
+            ("primitive", primitive),
+            ("conditions", conditions),
+            ("media_preview", media_preview),
+            ("status", status),
+        ):
+            if value is not None:
+                kwargs[name] = value
+        return type(self)(**kwargs)
 
     def compute_advantages(
         self,

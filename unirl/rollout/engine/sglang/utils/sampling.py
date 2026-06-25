@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Sample
 
 
 @dataclass(frozen=True)
@@ -30,35 +30,29 @@ class ResolvedSampling:
     block: Dict[str, Any] = field(default_factory=dict)
 
 
-def resolve_sampling(config: Any, req: RolloutReq) -> ResolvedSampling:
-    """Resolve the SRT sampling block for one request.
+def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
+    """Resolve the SRT sampling block for one request ``Sample``.
 
-    Reproduces the predecessor's exact precedence:
+    Sources: the frontier gen ``Part``'s ``ARSamplingParams`` (temperature /
+    top_p / top_k / max_new_tokens) > the input ``Part``'s ``control['ar']`` bag
+    (stop / system_instruction / return_logprob) > engine-config defaults.
 
-    - ``n``: 1 when ``config.samples_pre_expanded`` (the caller already
-      expanded P prompts → P*N entries, one per GRPO sibling — re-applying
-      ``samples_per_prompt`` would generate N completions per expanded entry);
-      else ``ar.samples_per_prompt``, else ``stage_ar['n']``, else 1.
-    - ``temperature`` / ``top_p`` / ``max_new_tokens``: typed AR params, else
-      the config defaults.
-    - ``top_k``: MUST be threaded through — without it SGLang falls back to
-      the model generation_config default (top_k=20 for Qwen3), which peaks
-      the sampling vs the trainer's top_k=0 (unrestricted) → low intra-group
-      diversity → GRPO advantages collapse. The trainer's ``top_k=0`` (HF
-      convention) maps to SGLang's ``-1`` (disabled); positive passes through.
-      With no typed AR params the predecessor sent ``-1`` (disabled), never
-      the config field — reproduced here.
-    - ``return_logprob`` (default True), ``system_instruction``, and the
-      ``stop`` / ``stop_token_ids`` / ``skip_special_tokens`` passthroughs
-      come from ``stage_config['ar']``.
+    - ``n`` (the per-prompt fan-out the backend must generate) is the **fork
+      branch** ``len(gen) // len(input)``, so the backend fills the pre-forked gen
+      shell exactly — this subsumes the old ``samples_pre_expanded`` two-mode logic
+      (the fork *is* the expansion in the Sample model).
+    - ``top_k``: MUST be threaded through — without it SGLang falls back to the
+      model generation_config default (top_k=20 for Qwen3), peaking the sampling
+      vs the trainer's top_k=0 (unrestricted) → low intra-group diversity → GRPO
+      advantages collapse. The trainer's ``top_k=0`` (HF convention) maps to
+      SGLang's ``-1`` (disabled); positive passes through.
     """
-    ar = req.sampling_params.get("ar")
-    stage_ar: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
+    input_part, gen_part = sample.parts[0], sample.parts[-1]
+    ar = gen_part.sampling_params
+    stage_ar: Dict[str, Any] = dict(input_part.control.get("ar") or {})
 
-    if config.samples_pre_expanded:
-        n = 1
-    else:
-        n = int(ar.samples_per_prompt if ar is not None else stage_ar.get("n", 1))
+    n_in = len(input_part.sample_ids)
+    n = (len(gen_part.sample_ids) // n_in) if n_in else 1
 
     raw_top_k = int(ar.top_k) if ar is not None else 0
     block: Dict[str, Any] = {

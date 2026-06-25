@@ -16,16 +16,15 @@ import torch
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult
-from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs
+from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs, image_input_part
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 
 class Sd3OutputAdapter(DitOutputAdapter):
     """Single-"image"-track response with the SD3 text-capture conditions."""
 
-    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+    def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """Concat the per-request SD3 ``text_capture`` dicts into one condition.
 
         Written by ``RLStableDiffusion3Pipeline`` after intercepting
@@ -33,7 +32,7 @@ class Sd3OutputAdapter(DitOutputAdapter):
         padding to ``max_sequence_length`` is fixed), so a plain dim-0 concat
         suffices.
         """
-        del req
+        del sample
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
@@ -72,17 +71,17 @@ class Sd3T2iAdapter(ModelAdapter):
         self.input_adapter = DitInputAdapter(self.modality)
         self.output_adapter = Sd3OutputAdapter(self.modality)
 
-    def validate_request(self, req: RolloutReq) -> None:
-        if req.primitives.get("image") is not None:
+    def validate_request(self, sample: Sample) -> None:
+        if image_input_part(sample) is not None:
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use an image-conditioned modality instead."
             )
 
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        return self.input_adapter.build(req)
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        return self.input_adapter.build(sample)
 
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        return self.output_adapter.build(req, per_request)
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        return self.output_adapter.build(sample, per_request)
 
 
 __all__ = ["Sd3OutputAdapter", "Sd3T2iAdapter"]

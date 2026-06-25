@@ -1,7 +1,7 @@
 """``sglang_diffusion`` engine core — wiring + delegation only.
 
 A thin core over the backend seam: it names no concrete model (the adapter, picked
-from the registry by ``config.model_family``, owns the ``RolloutReq``↔``RolloutResp``
+from the registry by ``config.model_family``, owns the ``Sample`` → ``Sample``
 conversion) and no concrete backend (the seam owns the runtime). Weight sync is a
 :class:`WeightSync` component constructed over the seam; the offload lifecycle (a
 single flag) lives directly on the engine. The frozen ``base.py`` surface is
@@ -33,10 +33,8 @@ from unirl.rollout.engine.sglang_diffusion.config import (
 )
 from unirl.rollout.engine.sglang_diffusion.weight_sync import WeightSync
 from unirl.sde.noise import generate_latents
-from unirl.sde.runtime import ensure_req_sigmas
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Part, Sample
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
@@ -124,46 +122,89 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
     # ------------------------------------------------------------------ #
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, req: RolloutReq) -> RolloutResp:
+    def generate(self, sample: Sample) -> Sample:
+        gen = sample.parts[-1]
         require(
-            int(req.batch_size) > 0,
-            "SGLangDiffusionRolloutEngine.generate requires a non-empty req (batch_size > 0)",
+            int(gen.batch_size) > 0,
+            "SGLangDiffusionRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
-        # σ SSOT: pin once on the full batch (a shared field, so req.slice keeps it).
-        ensure_req_sigmas(req, self.schedule_policy)
+        # σ SSOT: pin once onto the gen part's (shared) sampling_params, so every
+        # forward-batch chunk sees the same schedule.
+        self._ensure_sample_sigmas(sample)
 
         fbs = self.cfg.forward_batch_size
-        bs = int(req.batch_size)
+        bs = int(gen.batch_size)
         if fbs is None or bs <= fbs:
-            return self._generate_batch(req)
+            return self._generate_batch(sample)
 
-        outputs: List[RolloutResp] = []
+        # Slice the gen part into chunks; the input part (prompts) is small and
+        # shared, so keep it whole and concat the filled gen parts back.
+        input_part = sample.parts[0]
+        gen_chunks: List[Part] = []
         for start in range(0, bs, fbs):
             end = min(start + fbs, bs)
-            outputs.append(self._generate_batch(req.slice(start, end)))
+            chunk = self._generate_batch(Sample(parts=[input_part, gen.slice(start, end)]))
+            gen_chunks.append(chunk.parts[-1])
             torch.cuda.empty_cache()
-        return RolloutResp.concat(outputs)
+        return Sample(parts=[input_part, Part.concat(gen_chunks)])
 
-    def _generate_batch(self, req: RolloutReq) -> RolloutResp:
-        initial_noise = self._resolve_initial_noise(req)
-        kwargs = self.adapter.build_inputs(req, initial_noise=initial_noise)
+    def _ensure_sample_sigmas(self, sample: Sample) -> None:
+        """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``.
+
+        Sample-shaped analogue of ``ensure_req_sigmas``: σ is the single source of
+        truth, computed from the model-owned schedule policy applied to the
+        request's (T, H, W). Shared across the part's samples (one params object).
+        """
+        diffusion = sample.parts[-1].sampling_params
+        if diffusion is None or diffusion.sigmas is not None:
+            return
+        diffusion.sigmas = self.schedule_policy.compute_sigma(
+            num_inference_steps=int(diffusion.num_inference_steps),
+            height=int(diffusion.height),
+            width=int(diffusion.width),
+        )
+
+    def _generate_batch(self, sample: Sample) -> Sample:
+        initial_noise = self._resolve_initial_noise(sample)
+        kwargs = self.adapter.build_inputs(sample, initial_noise=initial_noise)
         raw = self._backend.generate(kwargs)
-        return self.adapter.build_response(req, raw)
+        return self.adapter.build_response(sample, raw)
 
-    def _resolve_initial_noise(self, req: RolloutReq) -> Optional[torch.Tensor]:
-        """NoiseRecipe (driver-authoritative x_T) → init_same_noise → None. Model-agnostic."""
-        xt = NoiseRecipe.from_rollout_req(req).resolve()
+    def _resolve_initial_noise(self, sample: Sample) -> Optional[torch.Tensor]:
+        """Driver-authoritative x_T → init_same_noise fallback → None. Model-agnostic.
+
+        The x_T noise key is derived from the lineage path (OD-2): the parent
+        (group) id under ``init_same_noise`` so siblings share x_T, else the
+        per-sample id. ``initial_latents`` (img2img) rides on the gen part's
+        ``LatentSegment`` shell; the regen shape on ``init_noise_latent_shape``.
+        """
+        gen = sample.parts[-1]
+        diffusion = gen.sampling_params
+        seg = gen.segment
+        initial_latents = getattr(seg, "initial_latents", None) if seg is not None else None
+        share = bool(getattr(diffusion, "init_same_noise", False)) if diffusion is not None else False
+        keys = gen.group_ids if share else list(gen.sample_ids)
+        recipe = NoiseRecipe(
+            noise_group_ids=[str(k) for k in keys],
+            base_seed=int(diffusion.seed) if diffusion is not None and diffusion.seed is not None else 0,
+            latent_shape=(
+                tuple(diffusion.init_noise_latent_shape)
+                if diffusion is not None and diffusion.init_noise_latent_shape
+                else None
+            ),
+            initial_latents=initial_latents,
+        )
+        xt = recipe.resolve()
         if xt is not None:
             return xt
         if not bool(self.cfg.init_same_noise):
             return None
 
-        diffusion = req.sampling_params.get("diffusion")
         require(
             diffusion is not None and diffusion.seed is not None,
-            "init_same_noise=True requires req.sampling_params diffusion seed",
+            "init_same_noise=True requires a diffusion seed",
         )
-        batch_size = int(req.batch_size)
+        batch_size = int(gen.batch_size)
         latent_shape = self._backend.prepare_latent_shape(
             height=int(diffusion.height),
             width=int(diffusion.width),
@@ -178,7 +219,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             dtype=dtype,
             init_same_noise=True,
             samples_per_prompt=int(diffusion.samples_per_prompt),
-            noise_group_ids=[str(gid) for gid in req.group_ids],
+            noise_group_ids=[str(g) for g in gen.group_ids],
             base_seed=int(diffusion.seed),
         )
 

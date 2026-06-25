@@ -9,12 +9,15 @@ input/output sub-adapters; these are the mechanics they lean on.
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
 from unirl.rollout.engine.vllm_omni.utils.prompts import (
-    pil_images_from_req,
-    texts_from_req,
+    ar_gen_part,
+    diffusion_gen_part,
+    image_input_part,
+    pil_images_from_sample,
+    texts_from_sample,
 )
-from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_req
+from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_diffusion
 from unirl.rollout.engine.vllm_omni.utils.tracks import (
-    assemble_tracks,
+    assemble_sample,
     build_ar_segment,
     build_image_segment,
     collect_dit_outputs,
@@ -26,19 +29,22 @@ from unirl.rollout.engine.vllm_omni.utils.tracks import (
 )
 
 __all__ = [
-    "assemble_tracks",
+    "ar_gen_part",
+    "assemble_sample",
     "build_ar_segment",
     "build_image_segment",
     "collect_dit_outputs",
     "core_diff_kwargs",
     "decoded_text_from_ar",
+    "diffusion_gen_part",
     "grouped_pils_to_videos",
+    "image_input_part",
     "pack_initial_noise_extra_args",
     "pick_stage_output",
-    "pil_images_from_req",
+    "pil_images_from_sample",
     "pils_to_images",
     "sde_extra_args",
     "seed_from_sample_id",
-    "sigmas_list_from_req",
-    "texts_from_req",
+    "sigmas_list_from_diffusion",
+    "texts_from_sample",
 ]

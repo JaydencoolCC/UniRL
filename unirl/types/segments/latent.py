@@ -59,6 +59,9 @@ class LatentSegment(Segment):
     modality: Modality = shared_field(default=Modality.IMAGE)
 
     latents: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    # Start-of-denoising latent (x_T or encoded init image), per-sample, set on the
+    # gen-shell before generation (img2img / driver-materialized x_T). CONCAT.
+    initial_latents: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     sigmas: Optional[torch.Tensor] = shared_field(default=None)
     indices: Optional[torch.Tensor] = shared_field(default=None)
     sde_logp: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)

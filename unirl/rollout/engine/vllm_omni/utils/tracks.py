@@ -16,8 +16,8 @@ import torch
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions import Condition
 from unirl.types.primitives import Image, Images, Text, Texts, Video, Videos
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
+from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 from unirl.types.segments import Segment
 from unirl.types.segments.latent import make_image_segment
 
@@ -383,53 +383,60 @@ def build_ar_segment(per_request: Sequence[Sequence[Any]]) -> Optional[Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Track assembly — the shared tail of every shape's ``build_response``
+# Sample assembly — the shared tail of every shape's ``build_response``
 # --------------------------------------------------------------------------- #
 
 
-def assemble_tracks(
-    req: RolloutReq,
+def _gen_part_index_for_track(sample: Sample, track_name: str) -> int:
+    """Index of the pre-forked gen ``Part`` a track's segment fills.
+
+    Lineage is positional: the parts are already ``[input, ar?, image?]`` (the
+    caller forks them in stage order). A track maps to the gen Part whose
+    ``sampling_params`` type matches — ``"ar"`` → ``ARSamplingParams``;
+    ``"image"`` / ``"video"`` → ``DiffusionSamplingParams`` — so the 1-to-1
+    ar→image linkage the old ``parent_track="ar"`` encoded is now just the
+    parts' order.
+    """
+    want = ARSamplingParams if track_name == "ar" else DiffusionSamplingParams
+    for i, part in enumerate(sample.parts):
+        if i == 0:  # the input Part is never a gen target
+            continue
+        if isinstance(part.sampling_params, want):
+            return i
+    raise RuntimeError(
+        f"assemble_sample: no gen Part with {want.__name__} for track {track_name!r} "
+        f"(parts carry {[type(p.sampling_params).__name__ for p in sample.parts]})"
+    )
+
+
+def assemble_sample(
+    sample: Sample,
     *,
     segments_for_track: Dict[str, Segment],
     decoded_for_track: Dict[str, Optional[Any]],
     conditions: Dict[str, Condition],
-) -> RolloutResp:
-    """Pack per-track segments/decoded/conditions into a ``RolloutResp``.
+) -> Sample:
+    """Fill the request ``Sample``'s gen ``Part``s with the per-track outputs.
 
-    Tracks are one per ``segments_for_track`` key, each carrying its own
-    decoded value (or ``None``). ``conditions`` were resp-wide in the legacy
-    shape; keep that behavior by replicating onto every track (the legacy
-    single-image-track replay is the only consumer today).
-
-    HI3 think_recaption lineage: when both an "image" and an "ar" segment are
-    present the image is generated from the AR output 1-to-1, so
-    ``image.parent_track = "ar"`` with parent_ids aligned to ``ar.sample_ids``;
-    every other track is a root (``parent_ids = req.group_ids``).
+    One filled Part per ``segments_for_track`` key, each carrying its own
+    segment + decoded primitive (or ``None``). ``conditions`` were resp-wide in
+    the legacy shape; keep that behavior by replicating onto every filled Part
+    (the legacy single-image-track replay is the only consumer today). The
+    input Part and any untouched gen Part pass through unchanged.
     """
-    sample_ids = list(req.sample_ids)
-    parent_ids = list(req.group_ids)
-    has_ar = "ar" in segments_for_track
-    tracks: Dict[str, RolloutTrack] = {}
+    new_parts = list(sample.parts)
     for track_name, segment in segments_for_track.items():
-        if track_name == "image" and has_ar:
-            parent: Optional[str] = "ar"
-            track_parent_ids = list(sample_ids)
-        else:
-            parent = None
-            track_parent_ids = list(parent_ids)
-        tracks[track_name] = RolloutTrack(
-            sample_ids=list(sample_ids),
-            parent_ids=track_parent_ids,
-            parent_track=parent,
-            conditions=dict(conditions),
+        idx = _gen_part_index_for_track(sample, track_name)
+        new_parts[idx] = new_parts[idx].fill(
             segment=segment,
-            decoded=decoded_for_track.get(track_name),
+            primitive=decoded_for_track.get(track_name),
+            conditions=dict(conditions),
         )
-    return RolloutResp(tracks=tracks)
+    return Sample(parts=new_parts)
 
 
 __all__ = [
-    "assemble_tracks",
+    "assemble_sample",
     "build_ar_segment",
     "build_image_segment",
     "collect_dit_outputs",

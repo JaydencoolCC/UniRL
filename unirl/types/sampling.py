@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 from unirl.config.require import require
 
 if TYPE_CHECKING:
+    import torch
+
     from unirl.utils.scheduler_utils import TimestepScheduler
 
 
@@ -93,6 +95,13 @@ class DiffusionSamplingParams(BaseSamplingParams):
     seed: Optional[int] = 42
     init_same_noise: bool = False
     noise_group_ids: Optional[List[str]] = None
+    # x_T noise recipe: the per-sample latent shape each engine regenerates a
+    # byte-identical initial noise into (pairs with init_same_noise + seed).
+    init_noise_latent_shape: Optional[List[int]] = None
+    # Resolved σ schedule for this rollout, pinned by the rollout-engine adapter
+    # before generation (single source of truth). The engine echoes it back on
+    # ``LatentSegment.sigmas`` and ``sigma_verify`` asserts the two match.
+    sigmas: Optional[torch.Tensor] = None
 
     # --- SDE ---
     eta: float = 1.0

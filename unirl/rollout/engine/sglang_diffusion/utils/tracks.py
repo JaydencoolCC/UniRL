@@ -12,7 +12,7 @@ branches (those move to adapter overrides).
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -25,7 +25,6 @@ from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.primitives import Images
-from unirl.types.rollout_req import RolloutReq
 from unirl.types.segments.latent import LatentSegment, make_image_segment
 from unirl.types.trajectory_store import compute_trajectory_positions
 
@@ -48,7 +47,7 @@ def collect_trajectory_latents(results: Sequence[RawResult]) -> torch.Tensor:
 
 def validate_packed_trajectory(
     traj: torch.Tensor,
-    req: RolloutReq,
+    diffusion: Any,
     *,
     family: str,
     downsample: int,
@@ -69,12 +68,11 @@ def validate_packed_trajectory(
         traj.ndim == 4,
         f"{family}: packed trajectory must be 4-D [B, T, S, C]; got rank {traj.ndim}, shape {tuple(traj.shape)}.",
     )
-    diffusion = req.sampling_params.get("diffusion")
     height = int(diffusion.height) if diffusion.height is not None else None
     width = int(diffusion.width) if diffusion.width is not None else None
     require(
         height is not None and width is not None,
-        f"{family}: need height/width from req.sampling_params to unpack the packed "
+        f"{family}: need height/width from the diffusion sampling params to unpack the packed "
         f"[B, T, S, C] trajectory; both must be set.",
     )
     if require_divisible:

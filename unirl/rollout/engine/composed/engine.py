@@ -1,16 +1,19 @@
 """ComposedRolloutEngine — two-child engine orchestrating PE serial flow.
 
-Holds an ``ar`` child and a ``diffusion`` child. ``generate(req)`` runs
+Holds an ``ar`` child and a ``diffusion`` child. ``generate(sample)`` runs
 them sequentially:
 
-1. AR child rewrites each of P prompts into N PE candidates  → ``[P*N]`` AR track
-2. Diffusion child generates M images per PE                  → ``[P*N*M]`` diffusion track
-3. Returns a 2-track ``RolloutResp`` with explicit lineage
-   (``parent_track="ar"`` on diffusion, ``parent_ids`` chains from
-   prompt → PE → image).
+1. AR child rewrites each of P prompts into N PE candidates  → ``[P*N]`` ar Part
+2. Diffusion child generates M images per PE                  → ``[P*N*M]`` diffusion Part
+3. Returns the filled 3-part ``[input, ar, diffusion]`` ``Sample`` — lineage is
+   positional (parent = preceding part) and the path ids chain
+   prompt → PE → image.
 
-Each child config carries its own ``_target_``; ``__init__`` builds the child
-engine via ``config.<child>.make_engine(...)``.
+The request ``Sample`` is pre-forked ``[input, ar_shell, diffusion_shell]``
+(the caller forks; carrying BOTH the AR and diffusion sampling params, which a
+single Part's one ``sampling_params`` slot cannot). Each child config carries
+its own ``_target_``; ``__init__`` builds the child engine via
+``config.<child>.make_engine(...)``.
 
 Weight sync uses prefix-based tensor routing: the training side prepends
 ``"{track_name}."`` to tensor keys; this engine demuxes by prefix and
@@ -30,8 +33,8 @@ from unirl.models.pe.instruction import postprocess_pe_texts
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, _track_with_field
+from unirl.types.sample import Part, Sample
+from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
 logger = logging.getLogger(__name__)
 
@@ -124,154 +127,167 @@ class ComposedRolloutEngine(BaseRolloutEngine):
     # ------------------------------------------------------------------
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run PE serial flow: AR expansion → diffusion sampling → 2-track resp.
+    def generate(self, sample: Sample) -> Sample:
+        """Run PE serial flow: AR expansion → diffusion sampling → 3-part Sample.
 
         Dispatched ``DP_SCATTER`` (like vllm-omni / trainside): the Handle shards the
-        req across DP workers (each owns its own sglang + sglang_diffusion subprocess),
+        Sample across DP workers (each owns its own sglang + sglang_diffusion subprocess),
         every worker runs the serial flow on its prompt-shard, and ``_collect_dp_merge``
-        merges the per-worker 2-track resps. (``BROADCAST`` would return a list
-        of per-worker resps via ``_collect_passthrough`` and break the trainer.)
-        """
-        require(int(req.batch_size) > 0, "ComposedRolloutEngine.generate: empty req")
-        text_primitive = req.primitives.get("text")
-        require(
-            text_primitive is not None,
-            "ComposedRolloutEngine.generate: req.primitives['text'] required",
-        )
-        P = int(req.batch_size)
+        merges the per-worker Samples via ``Sample.concat``. (``BROADCAST`` would return a
+        list of per-worker Samples via ``_collect_passthrough`` and break the trainer.)
 
-        ar_params = req.sampling_params.get("ar")
-        diff_params = req.sampling_params.get("diffusion")
-        N = int(ar_params.samples_per_prompt) if ar_params is not None else 1
-        M = int(diff_params.samples_per_prompt) if diff_params is not None else 1
-        require(N >= 1, f"ComposedRolloutEngine.generate: ar.n={N} must be >= 1")
-        require(M >= 1, f"ComposedRolloutEngine.generate: diffusion.samples_per_prompt={M} must be >= 1")
+        The request is pre-forked ``[input, ar_shell, diffusion_shell]``: the AR shell
+        carries ``ARSamplingParams`` (branch N), the diffusion shell
+        ``DiffusionSamplingParams`` (branch M, σ / x_T recipe).
+        """
+        input_part, ar_shell, diffusion_shell = self._unpack_request(sample)
+
+        P = len(input_part.sample_ids)
+        require(P > 0, "ComposedRolloutEngine.generate: empty Sample")
+        text_primitive = input_part.primitive
+        require(
+            isinstance(text_primitive, Texts),
+            "ComposedRolloutEngine.generate: input Part.primitive must be Texts",
+        )
+        require(
+            len(ar_shell.sample_ids) % P == 0,
+            f"ComposedRolloutEngine: ar shell {len(ar_shell.sample_ids)} not a multiple of P={P}",
+        )
+        N = len(ar_shell.sample_ids) // P
+        require(
+            N >= 1 and len(diffusion_shell.sample_ids) % len(ar_shell.sample_ids) == 0,
+            f"ComposedRolloutEngine: diffusion shell {len(diffusion_shell.sample_ids)} "
+            f"not a multiple of P*N={P * N}",
+        )
+        M = len(diffusion_shell.sample_ids) // len(ar_shell.sample_ids)
+        require(M >= 1, f"ComposedRolloutEngine.generate: diffusion branch M={M} must be >= 1")
 
         # ── Stage 1: AR child ────────────────────────────────────────
         self._ar.wake_up()
         self._diffusion.sleep()
 
-        ar_shell = req.make_root_track(
-            track_name="ar",
-            branch=N,
-            decode_to_condition=None,
+        # AR child request: the prompts + the AR shell. The input Part's
+        # ``control`` carries the AR routing (forward parent's "chat" + "ar"
+        # subsets, inject pe_instruction on both — ``sglang`` reads "ar" while
+        # ``Qwen3Pipeline`` reads "chat").
+        ar_input = Part.input(
+            sample_ids=list(input_part.sample_ids),
+            primitive=text_primitive,
+            control=self._ar_control(input_part.control or {}),
         )
-
-        # AR sub-req stage_config: forward parent's "chat" + "ar" subsets
-        # and inject pe_instruction on both — ``sglang`` reads "ar" while
-        # ``Qwen3Pipeline`` reads "chat".
-        ar_stage_config: Dict[str, Any] = {
-            key: dict(req.stage_config[key]) for key in ("chat", "ar") if key in req.stage_config
-        }
-        if self.cfg.pe_instruction:
-            for key in ("ar", "chat"):
-                ar_stage_config.setdefault(key, {})["system_instruction"] = self.cfg.pe_instruction
-
-        ar_sub_req = RolloutReq(
-            sample_ids=list(req.sample_ids),
-            group_ids=list(req.group_ids),
-            primitives={"text": text_primitive},
-            request_conditions=dict(req.request_conditions),
-            sampling_params={"ar": ar_params},
-            stage_config=ar_stage_config,
-            sigmas=None,
-        )
-        ar_resp = self._ar.generate(ar_sub_req)
+        ar_out = self._ar.generate(Sample(parts=[ar_input, ar_shell]))
+        ar_part = ar_out.parts[-1]
         require(
-            len(ar_resp.tracks) == 1,
-            f"ComposedRolloutEngine: AR child must return single-track resp; got {sorted(ar_resp.tracks.keys())}",
-        )
-        ar_inner = next(iter(ar_resp.tracks.values()))
-        require(
-            len(ar_inner.sample_ids) == P * N,
-            f"ComposedRolloutEngine: AR child returned {len(ar_inner.sample_ids)} samples; expected {P}*{N}={P * N}",
+            len(ar_part.sample_ids) == P * N,
+            f"ComposedRolloutEngine: AR child returned {len(ar_part.sample_ids)} samples; expected {P}*{N}={P * N}",
         )
 
-        ar_track = _track_with_field(ar_shell, "segment", ar_inner.segment)
-        ar_track = _track_with_field(ar_track, "decoded", ar_inner.decoded)
-        ar_track = _track_with_field(ar_track, "conditions", dict(ar_inner.conditions))
+        # PE extraction: clean the AR text the diffusion child conditions on
+        # (rewritten onto the ar Part's primitive so wandb / logging see it too).
+        pe_texts = ar_part.primitive
+        require(
+            isinstance(pe_texts, Texts) and len(pe_texts.texts) == P * N,
+            f"ComposedRolloutEngine: AR Part decoded missing or wrong length "
+            f"(expected {P * N}, got {len(pe_texts.texts) if isinstance(pe_texts, Texts) else 'None'})",
+        )
+        pe_texts = self._extract_pe(pe_texts, text_primitive, N)
+        ar_part = ar_part.fill(primitive=pe_texts)
 
         # ── Stage 1 → Stage 2 transition ────────────────────────────
         self._ar.sleep()
         self._diffusion.wake_up()
 
-        # ── Stage 2: diffusion track shell via fork_track ───────────
-        diff_shell = ar_track.fork_track(
-            parent_name="ar",
-            child_name="diffusion",
-            branch=M,
-            decode_to_condition=None,
+        # ── Stage 2: diffusion child ─────────────────────────────────
+        # The PE ids ("p0/0") are non-root, so they cannot be a child Sample's
+        # root input. Re-root the PE prompts onto fresh ids, fork the diffusion
+        # shell off them (preserving the shell's sampling params + x_T segment),
+        # generate, then map the per-sample outputs back onto our
+        # lineage-correct diffusion_shell — row order matches (both
+        # group-by-parent, branch=M, same parent order).
+        pe_input = Part.input(
+            sample_ids=[f"pe{k}" for k in range(P * N)],
+            primitive=pe_texts,
         )
-
-        pe_texts = ar_track.decoded
+        diff_child_shell = pe_input.fork(
+            M,
+            sampling_params=diffusion_shell.sampling_params,
+            new_segment=diffusion_shell.segment,
+        )
+        diff_out = self._diffusion.generate(Sample(parts=[pe_input, diff_child_shell]))
+        diff_child = diff_out.parts[-1]
         require(
-            pe_texts is not None and len(pe_texts.texts) == P * N,
-            f"ComposedRolloutEngine: AR track decoded missing or wrong "
-            f"length (expected {P * N}, got "
-            f"{len(pe_texts.texts) if pe_texts is not None else 'None'})",
+            len(diff_child.sample_ids) == len(diffusion_shell.sample_ids),
+            f"ComposedRolloutEngine: diffusion child returned {len(diff_child.sample_ids)} "
+            f"samples; expected {P}*{N}*{M}={P * N * M}",
+        )
+        diffusion_part = diffusion_shell.fill(
+            segment=diff_child.segment,
+            primitive=diff_child.primitive,
+            conditions=dict(diff_child.conditions),
+            media_preview=diff_child.media_preview,
         )
 
-        # Optional marker-based PE extraction: keep only the substring after
-        # the marker so the diffusion child sees the rewritten prompt instead
-        # of the LLM's reasoning preamble. Off-format outputs fall back to
-        # the original user prompt to keep diffusion from collapsing to
-        # blank text. ``ar_track.decoded`` is rewritten in place so wandb
-        # / logging see the cleaned text.
-        if self.cfg.pe_marker:
-            cleaned_texts, stats = postprocess_pe_texts(
-                pe_texts.texts,
-                user_prompts=text_primitive.texts,
-                samples_per_prompt=N,
-                marker=self.cfg.pe_marker,
-                max_chars=self.cfg.pe_max_chars,
+        return Sample(parts=[input_part, ar_part, diffusion_part])
+
+    # ------------------------------------------------------------------
+    # Generation helpers
+    # ------------------------------------------------------------------
+
+    def _unpack_request(self, sample: Sample) -> tuple:
+        """Resolve the pre-forked ``[input, ar_shell, diffusion_shell]`` request.
+
+        Shells are located by ``sampling_params`` type (AR vs diffusion), not
+        strictly by position, so the contract survives extra chained input Parts
+        (multi-input, later)."""
+        require(
+            bool(sample.parts) and sample.parts[0].is_root,
+            "ComposedRolloutEngine.generate: requires a root input Part at parts[0]",
+        )
+        input_part = sample.parts[0]
+        ar_shell = next((p for p in sample.parts[1:] if isinstance(p.sampling_params, ARSamplingParams)), None)
+        diffusion_shell = next(
+            (p for p in sample.parts[1:] if isinstance(p.sampling_params, DiffusionSamplingParams)), None
+        )
+        require(ar_shell is not None, "ComposedRolloutEngine.generate: requires an AR gen-shell Part (ARSamplingParams)")
+        require(
+            diffusion_shell is not None,
+            "ComposedRolloutEngine.generate: requires a diffusion gen-shell Part (DiffusionSamplingParams)",
+        )
+        return input_part, ar_shell, diffusion_shell
+
+    def _ar_control(self, control: Dict[str, Any]) -> Dict[str, Any]:
+        """The AR child input Part's ``control``: parent's "chat" + "ar" subsets
+        with pe_instruction injected on both."""
+        ar_control: Dict[str, Any] = {key: dict(control[key]) for key in ("chat", "ar") if key in control}
+        if self.cfg.pe_instruction:
+            for key in ("ar", "chat"):
+                ar_control.setdefault(key, {})["system_instruction"] = self.cfg.pe_instruction
+        return ar_control
+
+    def _extract_pe(self, pe_texts: Texts, text_primitive: Texts, samples_per_prompt: int) -> Texts:
+        """Optional marker-based PE extraction: keep only the substring after the
+        marker so the diffusion child sees the rewritten prompt instead of the
+        LLM's reasoning preamble. Off-format outputs fall back to the original
+        user prompt to keep diffusion from collapsing to blank text."""
+        if not self.cfg.pe_marker:
+            return pe_texts
+        cleaned_texts, stats = postprocess_pe_texts(
+            pe_texts.texts,
+            user_prompts=text_primitive.texts,
+            samples_per_prompt=samples_per_prompt,
+            marker=self.cfg.pe_marker,
+            max_chars=self.cfg.pe_max_chars,
+        )
+        if any(stats.values()):
+            logger.info(
+                "ComposedRolloutEngine: PE-extract — marker=%r, %d/%d empty, %d truncated, %d fallback_to_original",
+                self.cfg.pe_marker,
+                stats["empty"],
+                len(pe_texts.texts),
+                stats["truncated"],
+                stats["fallback"],
             )
-            if any(stats.values()):
-                logger.info(
-                    "ComposedRolloutEngine: PE-extract — marker=%r, %d/%d empty, %d truncated, %d fallback_to_original",
-                    self.cfg.pe_marker,
-                    stats["empty"],
-                    len(pe_texts.texts),
-                    stats["truncated"],
-                    stats["fallback"],
-                )
-            pe_texts = Texts(texts=cleaned_texts)
-            ar_track = _track_with_field(ar_track, "decoded", pe_texts)
-
-        expanded_texts = [t for t in pe_texts.texts for _ in range(M)]
-        require(
-            len(expanded_texts) == P * N * M,
-            f"ComposedRolloutEngine: expanded_texts wrong length ({len(expanded_texts)} vs expected {P * N * M})",
-        )
-
-        diff_sub_req = RolloutReq(
-            sample_ids=list(diff_shell.sample_ids),
-            group_ids=list(diff_shell.parent_ids or diff_shell.sample_ids),
-            primitives={"text": Texts(texts=expanded_texts)},
-            request_conditions=dict(req.request_conditions),
-            sampling_params={"diffusion": diff_params},
-            sigmas=req.sigmas,
-        )
-        diff_resp = self._diffusion.generate(diff_sub_req)
-        require(
-            len(diff_resp.tracks) == 1,
-            f"ComposedRolloutEngine: diffusion child must return single-track "
-            f"resp; got {sorted(diff_resp.tracks.keys())}",
-        )
-        diff_inner = next(iter(diff_resp.tracks.values()))
-        require(
-            len(diff_inner.sample_ids) == P * N * M,
-            f"ComposedRolloutEngine: diffusion child returned "
-            f"{len(diff_inner.sample_ids)} samples; expected "
-            f"{P}*{N}*{M}={P * N * M}",
-        )
-
-        diff_track = _track_with_field(diff_shell, "segment", diff_inner.segment)
-        diff_track = _track_with_field(diff_track, "decoded", diff_inner.decoded)
-        diff_track = _track_with_field(diff_track, "conditions", dict(diff_inner.conditions))
-        diff_track = _track_with_field(diff_track, "media_preview", diff_inner.media_preview)
-
-        return RolloutResp(tracks={"ar": ar_track, "diffusion": diff_track})
+        return Texts(texts=cleaned_texts)
 
     # ------------------------------------------------------------------
     # Prefix demux helper

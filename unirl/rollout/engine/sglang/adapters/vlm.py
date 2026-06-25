@@ -23,7 +23,7 @@ from unirl.rollout.engine.sglang.adapters.text import TextLMAdapter
 from unirl.rollout.engine.sglang.backends import RawResult
 from unirl.rollout.engine.sglang.utils import ResolvedSampling, pil_to_base64
 from unirl.types.primitives import Images
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Sample
 
 
 @register_adapter("vlm")
@@ -45,9 +45,9 @@ class VLMAdapter(TextLMAdapter):
     # build_inputs — processor path (overrides the chat-template path)
     # ------------------------------------------------------------------ #
 
-    def build_inputs(self, req: RolloutReq, *, sampling: ResolvedSampling) -> PreparedInputs:
-        prompts = self.extract_prompts(req)
-        pil_images = self.extract_images(req, n_prompts=len(prompts))
+    def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
+        prompts = self.extract_prompts(sample)
+        pil_images = self.extract_images(sample, n_prompts=len(prompts))
 
         wire: List[Dict[str, Any]] = []
         prompt_token_ids: List[List[int]] = []
@@ -72,12 +72,18 @@ class VLMAdapter(TextLMAdapter):
             mm=mm_encs,
         )
 
-    def extract_images(self, req: RolloutReq, *, n_prompts: int) -> List[Any]:
-        image_prim = req.primitives.get("image")
+    def extract_images(self, sample: Sample, *, n_prompts: int) -> List[Any]:
+        # Multi-input multimodal Sample: an image input Part (Images primitive)
+        # chained alongside the text input Part. The caller that builds chained
+        # input parts is deferred (docs/rollout-sample-refactor.md §3); until then
+        # this raises with an actionable message.
+        image_part = next((p for p in sample.parts[:-1] if isinstance(p.primitive, Images)), None)
         require(
-            image_prim is not None and isinstance(image_prim, Images),
-            f"{type(self).__name__} requires req.primitives['image']: Images",
+            image_part is not None,
+            f"{type(self).__name__} requires an image input Part (Images primitive); "
+            "multi-input text+image request Samples are not wired yet.",
         )
+        image_prim = image_part.primitive
         require(
             len(image_prim) == n_prompts,
             f"{type(self).__name__}: image batch {len(image_prim)} != prompt count {n_prompts}",
@@ -117,7 +123,7 @@ class VLMAdapter(TextLMAdapter):
     # build_conditions — prompt condition + the multimodal replay conditions
     # ------------------------------------------------------------------ #
 
-    def build_conditions(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
+    def build_conditions(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
         """Add per-sample ``pixel_values`` / ``image_grid_thw`` to the base.
 
         Replicated from the prompt-level processor encoding so each sibling
@@ -125,7 +131,7 @@ class VLMAdapter(TextLMAdapter):
         (per-sample lists with FieldKind.CONCAT semantics — they survive the
         DP split/merge and reach the replay aligned with ``prompt``).
         """
-        conditions = super().build_conditions(req, prepared, raw)
+        conditions = super().build_conditions(sample, prepared, raw)
         if prepared.mm:
             _, prompt_index = self.replicate_per_sample(prepared)
             per_sample_pixel_values = [prepared.mm[i].pixel_values for i in prompt_index]

@@ -2,7 +2,7 @@
 
 A thin core over the backend seam: it names no concrete model (the adapter,
 picked from the registry by ``config.model_family``, owns the
-``RolloutReq``↔``RolloutResp`` conversion) and no concrete transport (the seam
+``Sample`` → ``Sample`` conversion) and no concrete transport (the seam
 owns the SRT runtime — server subprocess + HTTP, or the in-process Engine,
 picked by ``config.backend``). Weight sync is a :class:`WeightSync` component
 constructed over the seam; the offload lifecycle (the two staged flags) lives
@@ -34,8 +34,7 @@ from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
 from unirl.rollout.engine.sglang.utils import resolve_sampling
 from unirl.rollout.engine.sglang.weight_sync import WeightSync
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
 
@@ -146,14 +145,14 @@ class SGLangRolloutEngine(BaseRolloutEngine):
     # ------------------------------------------------------------------ #
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run text generation against the engine and return a typed response."""
+    def generate(self, sample: Sample) -> Sample:
+        """Run text generation against the engine and return the filled ``Sample``."""
         require(
-            int(req.batch_size) > 0,
-            "SGLangRolloutEngine.generate requires non-empty req (batch_size > 0)",
+            int(sample.parts[-1].batch_size) > 0,
+            "SGLangRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
-        sampling = resolve_sampling(self.cfg, req)
-        prepared = self.adapter.build_inputs(req, sampling=sampling)
+        sampling = resolve_sampling(self.cfg, sample)
+        prepared = self.adapter.build_inputs(sample, sampling=sampling)
         # Activate the synced LoRA adapter for these requests — the visible
         # line connecting WeightSync's state to the wire (the adapter and the
         # seam stay unaware of weight sync).
@@ -162,7 +161,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             for payload in prepared.wire:
                 payload["lora_path"] = active_adapter
         raw = self._backend.generate(prepared.wire)
-        return self.adapter.build_response(req, prepared, raw)
+        return self.adapter.build_response(sample, prepared, raw)
 
     # ------------------------------------------------------------------ #
     # Lifecycle — the offload flags live here; decorators re-applied

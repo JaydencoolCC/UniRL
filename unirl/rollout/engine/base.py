@@ -1,7 +1,7 @@
-"""Rollout engine base class for the ``RolloutReq``/``RolloutResp`` path.
+"""Rollout engine base class for the ``Sample`` → ``Sample`` path.
 
 Subclasses (``VLLMOmniRolloutEngine``, ``SGLangDiffusionRolloutEngine``,
-``TrainsideRolloutEngine``) take all runtime deps as ``__init__`` kwargs
+``SGLangRolloutEngine``, ``ComposedRolloutEngine``) take all runtime deps as ``__init__`` kwargs
 and complete construction in one shot — no separate ``initialize(device)``
 step. After ``__init__`` returns the engine is fully usable: model loaded,
 worker subprocesses spawned, dist groups brought up. This matches the
@@ -18,8 +18,7 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 
 class BaseEngineConfig(ABC):
@@ -98,8 +97,8 @@ class BaseRolloutEngine(Remote, ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run one rollout against the engine and return its typed response."""
+    def generate(self, sample: Sample) -> Sample:
+        """Run one rollout: fill the request ``Sample``'s gen Parts and return it."""
 
     # ------------------------------------------------------------------
     # Weight sync — bucketed CUDA-IPC (verl-omni pattern)

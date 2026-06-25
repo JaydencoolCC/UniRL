@@ -27,8 +27,7 @@ from unirl.rollout.engine.sglang.utils import (
     pack_prompt_condition,
 )
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.segments.text import TextSegment
 
 logger = logging.getLogger(__name__)
@@ -56,14 +55,8 @@ class TextLMAdapter(ModelAdapter):
     # build_inputs — RolloutReq → per-prompt /generate payloads
     # ------------------------------------------------------------------ #
 
-    def build_inputs(self, req: RolloutReq, *, sampling: ResolvedSampling) -> PreparedInputs:
-        prompts = self.extract_prompts(req)
-        require(
-            req.primitives.get("image") is None,
-            f"{type(self).__name__}: req contains images but config.image_token "
-            "is None (text-only mode). Set image_token in the engine config to "
-            "enable VLM.",
-        )
+    def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
+        prompts = self.extract_prompts(sample)
 
         use_template = self._has_chat_template()
         require(
@@ -94,18 +87,13 @@ class TextLMAdapter(ModelAdapter):
             resolved_n=sampling.n,
         )
 
-    def extract_prompts(self, req: RolloutReq) -> List[str]:
-        text_primitive = req.primitives.get("text")
+    def extract_prompts(self, sample: Sample) -> List[str]:
+        text_primitive = sample.parts[0].primitive
         require(
             text_primitive is not None and isinstance(text_primitive, Texts),
-            f"{type(self).__name__} requires req.primitives['text']: Texts",
+            f"{type(self).__name__} requires the input Part.primitive: Texts",
         )
-        prompts = list(text_primitive.texts)
-        require(
-            len(prompts) == int(req.batch_size),
-            f"{type(self).__name__}: prompt count {len(prompts)} != req.batch_size {int(req.batch_size)}",
-        )
-        return prompts
+        return list(text_primitive.texts)
 
     def base_payload(self, sampling: ResolvedSampling) -> Dict[str, Any]:
         """The sampling fields every ``/generate`` payload carries."""
@@ -156,14 +144,16 @@ class TextLMAdapter(ModelAdapter):
     # build_response — the template: one fan-out stage per RolloutTrack field
     # ------------------------------------------------------------------ #
 
-    def build_response(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> RolloutResp:
-        """Pack the seam's per-candidate results into a typed ``RolloutResp``.
+    def build_response(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Sample:
+        """Fill the frontier gen ``Part`` from the seam's per-candidate results.
 
         ``raw`` is in prompt-major order: candidate ``k`` of prompt ``i`` is at
-        index ``i * n + k`` (the seam's ordering contract). The count is checked
-        once here; each stage then derives its field from ``(req, prepared,
-        raw)`` independently, iterating ``raw`` in that shared order.
+        index ``i * n + k`` (the seam's ordering contract) — the same group-by-
+        parent order the gen shell was forked in, so row ``j`` of the gen part
+        maps to ``raw[j]``. Each stage derives its field from ``(sample, prepared,
+        raw)`` independently in that shared order.
         """
+        input_part, gen_part = sample.parts[0], sample.parts[-1]
         n = int(prepared.resolved_n)
         n_prompts = len(prepared.prompt_token_ids)
         require(
@@ -171,48 +161,27 @@ class TextLMAdapter(ModelAdapter):
             f"{type(self).__name__}.build_response: expected {n_prompts * n} "
             f"candidates ({n_prompts} prompts × n={n}); got {len(raw)}",
         )
-
-        sample_ids, group_ids = self.build_ids(req, prepared, raw)
-        return RolloutResp(
-            tracks={
-                self.track_name: RolloutTrack(
-                    sample_ids=sample_ids,
-                    parent_ids=list(group_ids) if group_ids else None,
-                    conditions=self.build_conditions(req, prepared, raw),
-                    segment=self.build_segment(req, prepared, raw),
-                    decoded=self.build_decoded(req, prepared, raw),
-                ),
-            }
+        require(
+            len(gen_part.sample_ids) == len(raw),
+            f"{type(self).__name__}.build_response: gen shell holds "
+            f"{len(gen_part.sample_ids)} samples but the seam returned {len(raw)}",
         )
 
-    def build_ids(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Tuple[List[str], List[str]]:
-        """The per-row ``(sample_ids, group_ids)``, prompt-major.
+        filled = gen_part.fill(
+            segment=self.build_segment(sample, prepared, raw),
+            primitive=self.build_decoded(sample, prepared, raw),
+            conditions=self.build_conditions(sample, prepared, raw),
+        )
+        return Sample(parts=[input_part, filled])
 
-        For ``n > 1`` the sample-id is mangled as ``f"{sid}#{k}"`` to keep
-        uniqueness while group membership stays intact.
-        """
-        n = int(prepared.resolved_n)
-        has_req_sids = bool(req.sample_ids)
-        has_req_gids = bool(req.group_ids)
-
-        sample_ids: List[str] = []
-        group_ids: List[str] = []
-        for prompt_idx in range(len(prepared.prompt_token_ids)):
-            req_sid = req.sample_ids[prompt_idx] if has_req_sids else f"s{prompt_idx}"
-            req_gid = req.group_ids[prompt_idx] if has_req_gids else req_sid
-            for k in range(n):
-                sample_ids.append(f"{req_sid}#{k}" if n > 1 else req_sid)
-                group_ids.append(req_gid)
-        return sample_ids, group_ids
-
-    def build_segment(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> TextSegment:
+    def build_segment(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> TextSegment:
         """Pack the per-candidate tokens/logprobs, each row pointing at its own slot."""
         return TextSegment.pack(
             tokens=[torch.tensor(list(r.token_ids or []), dtype=torch.long) for r in raw],
             log_probs=[torch.tensor(list(r.logprobs or []), dtype=torch.float32) for r in raw],
         )
 
-    def build_decoded(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Texts:
+    def build_decoded(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Texts:
         """Emit the RAW sampler text per candidate (verl-reference parity).
 
         Reward grading scores the full decoded response. The predecessor's
@@ -223,7 +192,7 @@ class TextLMAdapter(ModelAdapter):
         """
         return Texts(texts=[r.text or "" for r in raw])
 
-    def build_conditions(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
+    def build_conditions(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
         """The replay conditions — the prompt ids the server saw, per sample.
 
         Each prompt's ids are replicated across its ``n`` siblings (every

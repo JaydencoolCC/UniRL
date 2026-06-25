@@ -44,18 +44,19 @@ from unirl.rollout.engine.vllm_omni.backends import (
     StageSampling,
 )
 from unirl.rollout.engine.vllm_omni.utils import (
-    assemble_tracks,
+    ar_gen_part,
+    assemble_sample,
     build_ar_segment,
     collect_dit_outputs,
     decoded_text_from_ar,
-    pil_images_from_req,
-    seed_from_sample_id,
-    texts_from_req,
+    diffusion_gen_part,
+    image_input_part,
+    pil_images_from_sample,
+    texts_from_sample,
 )
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Part, Sample
 
 # --------------------------------------------------------------------------- #
 # Chat-template prompt construction
@@ -233,7 +234,7 @@ def hi3_ar_fused_conditions(per_request: List[List[OmniRawResult]]) -> Dict[str,
 
 
 class Hi3InputAdapter:
-    """``RolloutReq`` → HI3 AR-bearing :class:`GenerateCall` (one, whole batch).
+    """Request ``Sample`` → HI3 AR-bearing :class:`GenerateCall` (one, whole batch).
 
     One class covers every AR-bearing HI3 modality; the constructor row says
     what varies:
@@ -296,20 +297,29 @@ class Hi3InputAdapter:
                 return f"{self.bot_task_base}_{bot_task}", sys_type
         return self.task_key, sys_type
 
-    def build_prompts(self, req: RolloutReq) -> List[Dict[str, Any]]:
-        """The HI3 chat-templated per-prompt entries (+ the image gates)."""
-        task, sys_type = self._resolve_task(req.stage_config or {})
+    def build_prompts(self, sample: Sample) -> List[Dict[str, Any]]:
+        """The HI3 chat-templated per-prompt entries (+ the image gates).
 
-        texts = texts_from_req(req)
+        ``stage_config`` (the ``bot_task`` / ``sys_type`` routing) now rides
+        the input Part's ``control`` bag (docs/rollout-sample-refactor.md §4).
+        """
+        task, sys_type = self._resolve_task(sample.parts[0].control or {})
+
+        texts = texts_from_sample(sample)
         n = len(texts.texts)
 
-        pil_images = pil_images_from_req(req, n) if self.image_input else []
+        pil_images = pil_images_from_sample(sample, n) if self.image_input else []
         if self.image_input and not pil_images:
-            raise ValueError(f"modality={self.modality!r} requires req.primitives['image']")
-        if not self.image_input and req.primitives.get("image") is not None:
-            raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
+            raise ValueError(
+                f"modality={self.modality!r} requires an image input Part (Images primitive); "
+                "multi-input text+image request Samples are not wired yet "
+                "(docs/rollout-sample-refactor.md §2 non-goals)."
+            )
+        if not self.image_input and image_input_part(sample) is not None:
+            raise ValueError(f"modality={self.modality!r} does not accept an image input Part")
 
-        diff_params = req.sampling_params.get("diffusion")
+        diff_part = diffusion_gen_part(sample)
+        diff_params = diff_part.sampling_params if diff_part is not None else None
         return _build_prompt_entries(
             texts,
             task=task,
@@ -319,17 +329,17 @@ class Hi3InputAdapter:
             decorate=lambda entry, i: self._decorate(entry, i, pil_images=pil_images, diff_params=diff_params),
         )
 
-    def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
+    def build_sampling(self, sample: Sample) -> List[StageSampling]:
         """AR always; a DiT stage rides along iff ``"dit" in self.stages``."""
-        diff_params = req.sampling_params.get("diffusion")
-        ar_params = req.sampling_params.get("ar")
+        ar_params = ar_gen_part(sample).sampling_params
         sampling = [self._ar_sampling(ar_params)]
         if "dit" in self.stages:
-            sampling.append(self._dit_sampling(req, diff_params))
+            gen_part = diffusion_gen_part(sample)
+            sampling.append(self._dit_sampling(gen_part, gen_part.sampling_params))
         return sampling
 
-    def build(self, req: RolloutReq) -> List[GenerateCall]:
-        return [GenerateCall(prompts=self.build_prompts(req), sampling=self.build_sampling(req))]
+    def build(self, sample: Sample) -> List[GenerateCall]:
+        return [GenerateCall(prompts=self.build_prompts(sample), sampling=self.build_sampling(sample))]
 
     def _decorate(self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], diff_params: Any) -> None:
         """The per-entry extras, derived from the constructor flags."""
@@ -360,8 +370,8 @@ class Hi3InputAdapter:
             ),
         )
 
-    def _dit_sampling(self, req: RolloutReq, diff_params: Any) -> StageSampling:
-        diff_kwargs = core_diff_kwargs(req, diff_params)
+    def _dit_sampling(self, gen_part: Part, diff_params: Any) -> StageSampling:
+        diff_kwargs = core_diff_kwargs(diff_params)
         seed = getattr(diff_params, "seed", None)
         if seed is not None:
             diff_kwargs["seed"] = int(seed)
@@ -370,19 +380,24 @@ class Hi3InputAdapter:
 
         # HI3's DiT latent shape is AR-dynamic (only known in-worker after
         # stage 0), so the driver cannot ship a materialized x_T tensor.
-        if (req.request_conditions or {}).get("initial_latents") is not None:
+        seg = gen_part.segment
+        if getattr(seg, "initial_latents", None) is not None:
             raise NotImplementedError(
                 f"{type(self).__name__}: modality={self.modality!r} cannot consume a "
-                f"pre-materialized request_conditions['initial_latents'] tensor "
-                f"(HI3 DiT latent shape is AR-dynamic). Ship the x_T RECIPE via "
-                f"req.init_noise_group_ids instead."
+                f"pre-materialized LatentSegment.initial_latents tensor "
+                f"(HI3 DiT latent shape is AR-dynamic). Ship the x_T RECIPE via the "
+                f"gen Part's lineage instead."
             )
 
-        # Driver-authoritative x_T RECIPE: per-image gids (+ seed; NO shape —
-        # the pipeline's prepare_latents hook fills the AR-resolved shape and
-        # regenerates the byte-identical x_T via NoiseRecipe.for_batch).
-        if req.init_noise_group_ids:
-            extra_args["init_noise_group_ids"] = [str(g) for g in req.init_noise_group_ids]
+        # Driver-authoritative x_T RECIPE: per-image gids derived from the gen
+        # Part's lineage (OD-2; group id when siblings share x_T, else the
+        # per-sample id) + seed; NO shape — the pipeline's prepare_latents hook
+        # fills the AR-resolved shape and regenerates the byte-identical x_T via
+        # NoiseRecipe.for_batch.
+        share = bool(getattr(diff_params, "init_same_noise", False))
+        keys = gen_part.group_ids if share else list(gen_part.sample_ids)
+        if keys:
+            extra_args["init_noise_group_ids"] = [str(g) for g in keys]
             extra_args["init_noise_seed"] = int(seed) if seed is not None else 0
 
         if extra_args:
@@ -424,68 +439,18 @@ class Hi3DitRecaptionInputAdapter:
         #: the recaption text is injected via ``extra['ar_generated_text']``).
         self.sys_type = sys_type
 
-    def build(self, req: RolloutReq) -> List[GenerateCall]:
-        if req.primitives.get("image") is not None:
-            raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
-
-        texts = texts_from_req(req)
-        cot = req.primitives.get("cot_text")
-        if not isinstance(cot, Texts):
-            raise TypeError(
-                f"modality={self.modality!r} requires req.primitives['cot_text'] (Texts of recaptions); "
-                f"got {type(cot).__name__ if cot is not None else 'None'}."
-            )
-        if len(cot.texts) != len(texts.texts):
-            raise ValueError(f"{self.modality}: cot_text count {len(cot.texts)} != prompt count {len(texts.texts)}.")
-
-        sys_type = (req.stage_config or {}).get("sys_type") or self.sys_type
-        diff_params = req.sampling_params.get("diffusion")
-
-        base_kwargs = core_diff_kwargs(req, diff_params)
-        height = int(base_kwargs["height"])
-        width = int(base_kwargs["width"])
-
-        # Base extra_args mirror the v1 builder: sparse SDE indices + the
-        # WHOLE batch's x_T recipe gids (+ the regen base seed — distinct from
-        # the per-image SAMPLING seed below; per-image x_T variety comes from
-        # the gid, not this seed). NO init_noise_latent_shape — HI3's DiT
-        # latent shape is AR-dynamic and resolved in the worker.
-        base_extra = sde_extra_args(diff_params)
-        recipe_gids = list(req.init_noise_group_ids or [])
-        if recipe_gids:
-            base_extra["init_noise_group_ids"] = [str(g) for g in recipe_gids]
-            base_extra["init_noise_seed"] = (
-                int(diff_params.seed) if getattr(diff_params, "seed", None) is not None else 0
-            )
-
-        calls: List[GenerateCall] = []
-        for idx, (sample_id, text, recap) in enumerate(zip(req.sample_ids, texts.texts, cot.texts)):
-            prompt = {
-                "prompt": text,
-                "height": height,
-                "width": width,
-                "use_system_prompt": sys_type,
-                "extra": {"ar_generated_text": recap},
-            }
-            kwargs = dict(base_kwargs)
-            kwargs["seed"] = seed_from_sample_id(sample_id)
-            extra_args = dict(base_extra)
-            # Each single-prompt generate runs with batch_size=1 in the
-            # worker, so ship ONLY this sample's x_T recipe gid.
-            gid = recipe_gids[idx] if idx < len(recipe_gids) else None
-            if gid is not None and extra_args.get("init_noise_group_ids"):
-                extra_args["init_noise_group_ids"] = [str(gid)]
-            if extra_args:
-                kwargs["extra_args"] = extra_args
-            calls.append(
-                GenerateCall(
-                    prompts=[prompt],
-                    sampling=[StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=kwargs)],
-                    # Single-prompt call: its flat output list IS the group.
-                    group_by_request_id=False,
-                )
-            )
-        return calls
+    def build(self, sample: Sample) -> List[GenerateCall]:
+        # The externally-injected recaption rides a SECOND input primitive
+        # (the old ``req.primitives['cot_text']``), which in the Sample model is
+        # a chained ``cot_text`` input Part alongside the prompt Part — a
+        # multi-input request Sample. Chained input Parts are a deferred non-goal
+        # (docs/rollout-sample-refactor.md §2), so this standalone-DiT recaption
+        # modality is not wired yet.
+        raise NotImplementedError(
+            f"modality={self.modality!r} needs a chained cot_text input Part "
+            "(the AR-generated recaption); multi-input request Samples are not "
+            "wired yet (docs/rollout-sample-refactor.md §2 non-goals)."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -494,7 +459,7 @@ class Hi3DitRecaptionInputAdapter:
 
 
 class Hi3TextOutputAdapter:
-    """Per-request AR results → the single-"ar"-track :class:`RolloutResp`.
+    """Per-request AR results → the filled single-"ar"-track ``Sample``.
 
     Same three-hook shape as :class:`~.dit.DitOutputAdapter`
     (:meth:`build_segments` / :meth:`build_decoded` / :meth:`build_conditions`,
@@ -506,39 +471,39 @@ class Hi3TextOutputAdapter:
     def __init__(self, modality: str) -> None:
         self.modality = modality
 
-    def build_segments(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        del req
+    def build_segments(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del sample
         segments: Dict[str, Any] = {}
         ar_segment = build_ar_segment(per_request)
         if ar_segment is not None:
             segments["ar"] = ar_segment
         return segments
 
-    def build_decoded(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        del req
+    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del sample
         return {"ar": decoded_text_from_ar(per_request)}
 
-    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+    def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """AR-track conditions. Default: none (no replay capture in scope)."""
-        del req, per_request
+        del sample, per_request
         return {}
 
-    def build(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
+    def build(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
         if not per_request or not any(per_request):
             raise ValueError("build_response: empty per-request outputs (Omni.generate returned nothing surfaceable).")
-        return assemble_tracks(
-            req,
-            segments_for_track=self.build_segments(req, per_request),
-            decoded_for_track=self.build_decoded(req, per_request),
-            conditions=self.build_conditions(req, per_request),
+        return assemble_sample(
+            sample,
+            segments_for_track=self.build_segments(sample, per_request),
+            decoded_for_track=self.build_decoded(sample, per_request),
+            conditions=self.build_conditions(sample, per_request),
         )
 
 
 class Hi3ArRecaptionOutputAdapter(Hi3TextOutputAdapter):
     """AR-track response + the ARGRPO fused prompt-capture conditions."""
 
-    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        del req
+    def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del sample
         return hi3_ar_fused_conditions(per_request)
 
 
@@ -548,15 +513,15 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
     def __init__(self, modality: str) -> None:
         super().__init__(modality, stage_id=1)
 
-    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        del req
+    def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del sample
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
         return hi3_fused_conditions(diff_outputs, modality=self.modality)
 
-    def build_decoded(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        decoded = super().build_decoded(req, per_request)
+    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        decoded = super().build_decoded(sample, per_request)
         # Surface the AR-generated text (best-effort; don't break rollout if
         # AR text extraction fails).
         try:
@@ -569,8 +534,8 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
 class Hi3DitRecaptionOutputAdapter(DitOutputAdapter):
     """Single-"image"-track response of the standalone HI3 DiT (Stage 0)."""
 
-    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        del req
+    def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del sample
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
@@ -605,17 +570,17 @@ class Hi3T2iAdapter(ModelAdapter):
         )
         self.output_adapter = Hi3ImageOutputAdapter(self.modality)
 
-    def validate_request(self, req: RolloutReq) -> None:
-        if req.primitives.get("image") is not None:
+    def validate_request(self, sample: Sample) -> None:
+        if image_input_part(sample) is not None:
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use an image-conditioned modality instead."
             )
 
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        return self.input_adapter.build(req)
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        return self.input_adapter.build(sample)
 
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        return self.output_adapter.build(req, per_request)
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        return self.output_adapter.build(sample, per_request)
 
 
 @register_adapter("hi3_it2i")
@@ -640,15 +605,19 @@ class Hi3It2iAdapter(ModelAdapter):
         )
         self.output_adapter = Hi3ImageOutputAdapter(self.modality)
 
-    def validate_request(self, req: RolloutReq) -> None:
-        if req.primitives.get("image") is None:
-            raise ValueError(f"modality={self.modality!r} requires req.primitives['image'].")
+    def validate_request(self, sample: Sample) -> None:
+        if image_input_part(sample) is None:
+            raise ValueError(
+                f"modality={self.modality!r} requires an image input Part (Images primitive); "
+                "multi-input text+image request Samples are not wired yet "
+                "(docs/rollout-sample-refactor.md §2 non-goals)."
+            )
 
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        return self.input_adapter.build(req)
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        return self.input_adapter.build(sample)
 
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        return self.output_adapter.build(req, per_request)
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        return self.output_adapter.build(sample, per_request)
 
 
 @register_adapter("hi3_i2t")
@@ -675,15 +644,19 @@ class Hi3I2tAdapter(ModelAdapter):
         )
         self.output_adapter = Hi3TextOutputAdapter(self.modality)
 
-    def validate_request(self, req: RolloutReq) -> None:
-        if req.primitives.get("image") is None:
-            raise ValueError(f"modality={self.modality!r} requires req.primitives['image'].")
+    def validate_request(self, sample: Sample) -> None:
+        if image_input_part(sample) is None:
+            raise ValueError(
+                f"modality={self.modality!r} requires an image input Part (Images primitive); "
+                "multi-input text+image request Samples are not wired yet "
+                "(docs/rollout-sample-refactor.md §2 non-goals)."
+            )
 
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        return self.input_adapter.build(req)
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        return self.input_adapter.build(sample)
 
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        return self.output_adapter.build(req, per_request)
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        return self.output_adapter.build(sample, per_request)
 
 
 @register_adapter("hi3_t2t")
@@ -707,17 +680,17 @@ class Hi3T2tAdapter(ModelAdapter):
         )
         self.output_adapter = Hi3TextOutputAdapter(self.modality)
 
-    def validate_request(self, req: RolloutReq) -> None:
-        if req.primitives.get("image") is not None:
+    def validate_request(self, sample: Sample) -> None:
+        if image_input_part(sample) is not None:
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use modality='hi3_i2t' instead."
             )
 
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        return self.input_adapter.build(req)
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        return self.input_adapter.build(sample)
 
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        return self.output_adapter.build(req, per_request)
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        return self.output_adapter.build(sample, per_request)
 
 
 @register_adapter("hi3_ar_recaption")
@@ -750,11 +723,11 @@ class Hi3ArRecaptionAdapter(ModelAdapter):
         )
         self.output_adapter = Hi3ArRecaptionOutputAdapter(self.modality)
 
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        return self.input_adapter.build(req)
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        return self.input_adapter.build(sample)
 
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        return self.output_adapter.build(req, per_request)
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        return self.output_adapter.build(sample, per_request)
 
 
 @register_adapter("hi3_dit_recaption")
@@ -775,11 +748,11 @@ class Hi3DitRecaptionAdapter(ModelAdapter):
         self.input_adapter = Hi3DitRecaptionInputAdapter(self.modality)
         self.output_adapter = Hi3DitRecaptionOutputAdapter(self.modality)
 
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        return self.input_adapter.build(req)
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        return self.input_adapter.build(sample)
 
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        return self.output_adapter.build(req, per_request)
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        return self.output_adapter.build(sample, per_request)
 
 
 __all__ = [
