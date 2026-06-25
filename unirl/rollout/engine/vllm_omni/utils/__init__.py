@@ -10,6 +10,7 @@ from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, s
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
 from unirl.rollout.engine.vllm_omni.utils.prompts import (
     ar_gen_part,
+    cot_text_from_sample,
     diffusion_gen_part,
     image_input_part,
     pil_images_from_sample,
@@ -31,6 +32,7 @@ from unirl.rollout.engine.vllm_omni.utils.tracks import (
 __all__ = [
     "ar_gen_part",
     "assemble_sample",
+    "cot_text_from_sample",
     "build_ar_segment",
     "build_image_segment",
     "collect_dit_outputs",

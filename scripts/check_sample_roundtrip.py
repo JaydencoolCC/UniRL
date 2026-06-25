@@ -28,11 +28,12 @@ from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.rollout.engine.vllm_omni.utils import (
     ar_gen_part,
     assemble_sample,
+    cot_text_from_sample,
     diffusion_gen_part,
     image_input_part,
     texts_from_sample,
 )
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Image, Images, Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
@@ -161,12 +162,74 @@ def check_split_concat_roundtrip() -> None:
     )
 
 
+def _images(n: int) -> Images:
+    return Images.from_list([Image(pixels=torch.zeros(3, 8, 8)) for _ in range(n)])
+
+
+def check_multi_input_image_chain() -> None:
+    """IT2I-shaped multi-input ``[text, image_input, ar_gen, image_gen]`` via Part.input_child:
+    chains a valid Sample, the helpers route past the image input, conditioning() surfaces both
+    primitives, and assemble_sample fills the right gen Parts."""
+    text = Part.input(["p0", "p1"], primitive=Texts(texts=["edit the cat", "edit the dog"]))
+    image_in = text.input_child(_images(2))
+    sample = (
+        Sample.request(text, image_in)
+        .fork(1, sampling_params=ARSamplingParams())
+        .fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
+    )
+    _check(len(sample.parts) == 4, "multi-input chain has 4 parts [text, image, ar, image]")
+    _check(image_input_part(sample) is sample.parts[1], "image_input_part finds the chained image input")
+    _check(ar_gen_part(sample) is sample.parts[2], "ar_gen_part routes past the image input Part")
+    _check(diffusion_gen_part(sample) is sample.parts[3], "diffusion_gen_part routes past the image input Part")
+    _check(
+        list(texts_from_sample(sample).texts) == ["edit the cat", "edit the dog"],
+        "texts_from_sample reads the prompt head",
+    )
+    cond = sample.conditioning()
+    _check(
+        len(cond) == 2 and isinstance(cond[0], Texts) and isinstance(cond[1], Images),
+        "conditioning() returns [Texts, Images] in turn order (the empty gen shells are skipped)",
+    )
+    out = assemble_sample(
+        sample,
+        segments_for_track={"ar": SimpleNamespace(tag="ar"), "image": SimpleNamespace(tag="img")},
+        decoded_for_track={"ar": Texts(texts=["r0", "r1"]), "image": SimpleNamespace(tag="dec")},
+        conditions={"fused": SimpleNamespace(tag="cond")},
+    )
+    _check(out.parts[0] is sample.parts[0] and out.parts[1] is sample.parts[1], "input Parts pass through unchanged")
+    _check(getattr(out.parts[2].segment, "tag", None) == "ar", "ar gen Part filled by the 'ar' track")
+    _check(getattr(out.parts[3].segment, "tag", None) == "img", "image gen Part filled by the 'image' track")
+
+
+def check_cot_text_chain() -> None:
+    """dit_recaption-shaped multi-input ``[text, cot_text_input, image_gen]``: cot_text_from_sample
+    finds the chained recaption Texts and the count guard fires on mismatch."""
+    text = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))
+    cot_in = text.input_child(Texts(texts=["a fluffy ginger cat", "a happy golden dog"]))
+    sample = Sample.request(text, cot_in).fork(
+        1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256)
+    )
+    _check(
+        list(cot_text_from_sample(sample).texts) == ["a fluffy ginger cat", "a happy golden dog"],
+        "cot_text_from_sample returns the chained recaption Texts",
+    )
+    # cot count != prompt count must raise (prompts=1, cot=2; gen count matches prompts so the
+    # texts_from_sample guard passes and the cot guard is what fires)
+    bad_text = Part.input(["p0"], primitive=Texts(texts=["a cat"]))
+    bad = Sample.request(bad_text, bad_text.input_child(Texts(texts=["x", "y"]))).fork(
+        1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256)
+    )
+    _expect_raises(lambda: cot_text_from_sample(bad), ValueError, "cot/prompt count mismatch must raise")
+
+
 _CHECKS: Tuple[Callable[[], None], ...] = (
     check_part_extraction,
     check_assemble_sample,
     check_sigma_roundtrip,
     check_noise_key_lineage,
     check_split_concat_roundtrip,
+    check_multi_input_image_chain,
+    check_cot_text_chain,
 )
 
 

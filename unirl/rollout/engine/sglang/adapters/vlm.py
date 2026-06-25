@@ -74,14 +74,12 @@ class VLMAdapter(TextLMAdapter):
 
     def extract_images(self, sample: Sample, *, n_prompts: int) -> List[Any]:
         # Multi-input multimodal Sample: an image input Part (Images primitive)
-        # chained alongside the text input Part. The caller that builds chained
-        # input parts is deferred (docs/rollout-sample-refactor.md §3); until then
-        # this raises with an actionable message.
+        # chained off the prompt head (Part.input_child). Located by primitive type.
         image_part = next((p for p in sample.parts[:-1] if isinstance(p.primitive, Images)), None)
         require(
             image_part is not None,
-            f"{type(self).__name__} requires an image input Part (Images primitive); "
-            "multi-input text+image request Samples are not wired yet.",
+            f"{type(self).__name__} requires an image input Part (Images primitive) "
+            "chained off the prompt (Part.input_child); none found.",
         )
         image_prim = image_part.primitive
         require(

@@ -48,10 +48,12 @@ from unirl.rollout.engine.vllm_omni.utils import (
     assemble_sample,
     build_ar_segment,
     collect_dit_outputs,
+    cot_text_from_sample,
     decoded_text_from_ar,
     diffusion_gen_part,
     image_input_part,
     pil_images_from_sample,
+    seed_from_sample_id,
     texts_from_sample,
 )
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
@@ -311,9 +313,8 @@ class Hi3InputAdapter:
         pil_images = pil_images_from_sample(sample, n) if self.image_input else []
         if self.image_input and not pil_images:
             raise ValueError(
-                f"modality={self.modality!r} requires an image input Part (Images primitive); "
-                "multi-input text+image request Samples are not wired yet "
-                "(docs/rollout-sample-refactor.md §2 non-goals)."
+                f"modality={self.modality!r} requires an image input Part (Images primitive) "
+                "chained off the prompt (Part.input_child); none found."
             )
         if not self.image_input and image_input_part(sample) is not None:
             raise ValueError(f"modality={self.modality!r} does not accept an image input Part")
@@ -409,9 +410,10 @@ class Hi3InputAdapter:
 class Hi3DitRecaptionInputAdapter:
     """Standalone HI3 DiT request side — eats an externally-injected recaption.
 
-    The two-engine trainer puts the AR-generated recaption per sample on
-    ``req.primitives['cot_text']`` (aligned 1:1 with ``primitives['text']``).
-    Each per-prompt dict carries ``extra['ar_generated_text']`` — exactly the
+    The two-engine trainer chains the AR-generated recaption per sample as a
+    ``cot_text`` input Part (``Texts``, aligned 1:1 with the prompt Part; see
+    :func:`cot_text_from_sample`). Each per-prompt dict carries
+    ``extra['ar_generated_text']`` — exactly the
     key the upstream DiT ``forward`` reads as ``cot_text`` — plus
     ``use_system_prompt`` so the DiT rebuilds the same system prefix the AR
     used.
@@ -440,17 +442,61 @@ class Hi3DitRecaptionInputAdapter:
         self.sys_type = sys_type
 
     def build(self, sample: Sample) -> List[GenerateCall]:
-        # The externally-injected recaption rides a SECOND input primitive
-        # (the old ``req.primitives['cot_text']``), which in the Sample model is
-        # a chained ``cot_text`` input Part alongside the prompt Part — a
-        # multi-input request Sample. Chained input Parts are a deferred non-goal
-        # (docs/rollout-sample-refactor.md §2), so this standalone-DiT recaption
-        # modality is not wired yet.
-        raise NotImplementedError(
-            f"modality={self.modality!r} needs a chained cot_text input Part "
-            "(the AR-generated recaption); multi-input request Samples are not "
-            "wired yet (docs/rollout-sample-refactor.md §2 non-goals)."
-        )
+        if image_input_part(sample) is not None:
+            raise ValueError(f"modality={self.modality!r} does not accept an image input Part")
+
+        texts = texts_from_sample(sample)
+        cot = cot_text_from_sample(sample)  # the recaptions, 1:1-count-checked vs prompts
+        gen_part = diffusion_gen_part(sample)
+        diff_params = gen_part.sampling_params
+        sys_type = (sample.parts[0].control or {}).get("sys_type") or self.sys_type
+
+        base_kwargs = core_diff_kwargs(diff_params)
+        height = int(base_kwargs["height"])
+        width = int(base_kwargs["width"])
+
+        # Base extra_args: sparse SDE indices + the WHOLE batch's x_T recipe gids
+        # derived from the gen Part's lineage (OD-2; + the regen base seed —
+        # distinct from the per-image SAMPLING seed below; per-image x_T variety
+        # comes from the gid). NO init_noise_latent_shape — HI3's DiT latent shape
+        # is AR-dynamic and resolved in the worker.
+        base_extra = sde_extra_args(diff_params)
+        share = bool(getattr(diff_params, "init_same_noise", False))
+        recipe_gids = gen_part.group_ids if share else list(gen_part.sample_ids)
+        if recipe_gids:
+            base_extra["init_noise_group_ids"] = [str(g) for g in recipe_gids]
+            base_extra["init_noise_seed"] = (
+                int(diff_params.seed) if getattr(diff_params, "seed", None) is not None else 0
+            )
+
+        calls: List[GenerateCall] = []
+        for idx, (sample_id, text, recap) in enumerate(zip(gen_part.sample_ids, texts.texts, cot.texts)):
+            prompt = {
+                "prompt": text,
+                "height": height,
+                "width": width,
+                "use_system_prompt": sys_type,
+                "extra": {"ar_generated_text": recap},
+            }
+            kwargs = dict(base_kwargs)
+            kwargs["seed"] = seed_from_sample_id(sample_id)
+            extra_args = dict(base_extra)
+            # Each single-prompt generate runs with batch_size=1 in the worker,
+            # so ship ONLY this sample's x_T recipe gid.
+            gid = recipe_gids[idx] if idx < len(recipe_gids) else None
+            if gid is not None and extra_args.get("init_noise_group_ids"):
+                extra_args["init_noise_group_ids"] = [str(gid)]
+            if extra_args:
+                kwargs["extra_args"] = extra_args
+            calls.append(
+                GenerateCall(
+                    prompts=[prompt],
+                    sampling=[StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=kwargs)],
+                    # Single-prompt call: its flat output list IS the group.
+                    group_by_request_id=False,
+                )
+            )
+        return calls
 
 
 # --------------------------------------------------------------------------- #
@@ -608,9 +654,8 @@ class Hi3It2iAdapter(ModelAdapter):
     def validate_request(self, sample: Sample) -> None:
         if image_input_part(sample) is None:
             raise ValueError(
-                f"modality={self.modality!r} requires an image input Part (Images primitive); "
-                "multi-input text+image request Samples are not wired yet "
-                "(docs/rollout-sample-refactor.md §2 non-goals)."
+                f"modality={self.modality!r} requires an image input Part (Images primitive) "
+                "chained off the prompt (Part.input_child); none found."
             )
 
     def build_inputs(self, sample: Sample) -> List[GenerateCall]:
@@ -647,9 +692,8 @@ class Hi3I2tAdapter(ModelAdapter):
     def validate_request(self, sample: Sample) -> None:
         if image_input_part(sample) is None:
             raise ValueError(
-                f"modality={self.modality!r} requires an image input Part (Images primitive); "
-                "multi-input text+image request Samples are not wired yet "
-                "(docs/rollout-sample-refactor.md §2 non-goals)."
+                f"modality={self.modality!r} requires an image input Part (Images primitive) "
+                "chained off the prompt (Part.input_child); none found."
             )
 
     def build_inputs(self, sample: Sample) -> List[GenerateCall]:

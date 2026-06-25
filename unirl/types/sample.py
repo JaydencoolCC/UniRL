@@ -112,6 +112,24 @@ class Part(Batch):
             metadata=list(metadata) if metadata else [],
         )
 
+    def input_child(self, primitive: Primitive) -> "Part":
+        """A branch-1 *input* child carrying an extra conditioning modality.
+
+        Multi-input multimodal (e.g. image+text → image): a Part is
+        single-modality, so a second input rides as a chained input Part — one
+        child per parent sample (ids extended by ``/0``), ``sampling_params``
+        left None (it generates nothing). Chaining keeps only the head a root,
+        so the request stays a valid :class:`Sample` and
+        :meth:`Sample.conditioning` surfaces every input primitive in turn order
+        (root → …). See ``docs/rollout-sample-refactor.md`` §3.
+        """
+        if not self.sample_ids:
+            raise ValueError("Part.input_child: parent has no sample_ids")
+        return Part(
+            sample_ids=[child_id(pid, 0) for pid in self.sample_ids],
+            primitive=primitive,
+        )
+
     @property
     def batch_size(self) -> int:
         if self.sample_ids:
@@ -353,8 +371,17 @@ class Sample(Batch):
     @classmethod
     def request(cls, *input_parts: Part) -> "Sample":
         """A *request* — a ``Sample`` of only input Part(s), e.g.
-        ``Sample.request(Part.input(ids, seg))``. (Multi-input multimodal needs the
-        inputs chained so only the head is a root; future work, §3.)"""
+        ``Sample.request(Part.input(ids, seg))``.
+
+        Multi-input multimodal chains the extra inputs off the head via
+        :meth:`Part.input_child` so only the head is a root, e.g.::
+
+            text = Part.input(ids, primitive=Texts(...))
+            Sample.request(text, text.input_child(Images(...)))  # image+text
+
+        :meth:`Sample.conditioning` then surfaces both primitives (text, image)
+        in turn order for the gen step. See ``docs/rollout-sample-refactor.md`` §3.
+        """
         return cls(parts=list(input_parts))
 
     @property

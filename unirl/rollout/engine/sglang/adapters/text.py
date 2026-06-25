@@ -153,7 +153,7 @@ class TextLMAdapter(ModelAdapter):
         maps to ``raw[j]``. Each stage derives its field from ``(sample, prepared,
         raw)`` independently in that shared order.
         """
-        input_part, gen_part = sample.parts[0], sample.parts[-1]
+        gen_part = sample.parts[-1]
         n = int(prepared.resolved_n)
         n_prompts = len(prepared.prompt_token_ids)
         require(
@@ -172,7 +172,10 @@ class TextLMAdapter(ModelAdapter):
             primitive=self.build_decoded(sample, prepared, raw),
             conditions=self.build_conditions(sample, prepared, raw),
         )
-        return Sample(parts=[input_part, filled])
+        # Preserve every input Part: multi-input multimodal chains image / cot_text
+        # input Parts before the gen shell, so the filled gen Part's parent id must
+        # stay in the returned chain (text-only: parts[:-1] == [head], unchanged).
+        return Sample(parts=[*sample.parts[:-1], filled])
 
     def build_segment(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> TextSegment:
         """Pack the per-candidate tokens/logprobs, each row pointing at its own slot."""

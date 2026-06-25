@@ -56,14 +56,35 @@ def ar_gen_part(sample: Sample) -> Optional[Part]:
 
 
 def image_input_part(sample: Sample) -> Optional[Part]:
-    """An image *input* ``Part`` (``Images`` primitive) chained before the gen
-    shells, or None. Multi-input text+image request Samples are not wired yet
-    (docs/rollout-sample-refactor.md §2 non-goals); this returns None until the
-    caller that builds chained input Parts lands."""
+    """The image *input* ``Part`` (``Images`` primitive) chained before the gen
+    shells, or None. Multi-input requests chain a second modality off the prompt
+    head via :meth:`Part.input_child`; this locates it by primitive type."""
     for part in sample.parts[:-1]:
         if isinstance(part.primitive, Images):
             return part
     return None
+
+
+def cot_text_from_sample(sample: Sample) -> Texts:
+    """The chained cot_text input ``Part``'s ``Texts`` (the AR-generated recaption).
+
+    The two-engine DiT recaption producer takes a SECOND text input — the
+    recaption — chained after the prompt head via :meth:`Part.input_child`.
+    Scans the non-head input Parts (``parts[1:-1]``) for a ``Texts`` primitive
+    and asserts a 1:1 count with the prompts. The original read this off
+    ``req.primitives['cot_text']``.
+    """
+    prompts = texts_from_sample(sample)
+    cot_part = next((p for p in sample.parts[1:-1] if isinstance(p.primitive, Texts)), None)
+    if cot_part is None:
+        raise ValueError(
+            "cot_text_from_sample: no chained cot_text input Part (Texts primitive) found; "
+            "dit_recaption requires the recaption chained off the prompt (Part.input_child)."
+        )
+    cot = cot_part.primitive
+    if len(cot.texts) != len(prompts.texts):
+        raise ValueError(f"cot_text count {len(cot.texts)} != prompt count {len(prompts.texts)}")
+    return cot
 
 
 def pil_images_from_sample(sample: Sample, n: int) -> List[PIL.Image.Image]:
@@ -83,6 +104,7 @@ def pil_images_from_sample(sample: Sample, n: int) -> List[PIL.Image.Image]:
 
 __all__ = [
     "ar_gen_part",
+    "cot_text_from_sample",
     "diffusion_gen_part",
     "image_input_part",
     "pil_images_from_sample",
