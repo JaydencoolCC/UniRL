@@ -222,10 +222,31 @@ class Videos(Batch):
     def from_list(cls, items: List[Video]) -> "Videos":
         if not items:
             raise ValueError("Cannot build Videos from an empty list")
+        frames_list = [v.frames for v in items]
+        if any(frames is None or frames.ndim != 4 for frames in frames_list):
+            bad = [None if frames is None else tuple(frames.shape) for frames in frames_list]
+            raise ValueError(f"Videos.from_list expects per-sample frames [T, C, H, W], got {bad}")
+        channels = {int(frames.shape[1]) for frames in frames_list}
+        if len(channels) != 1:
+            raise ValueError(f"Videos.from_list requires a consistent channel count, got {sorted(channels)}")
+        # Packed videos can be ragged in time, but torch.cat still requires the
+        # non-packed C/H/W dimensions to match. Pad spatially like Images.from_list;
+        # model-specific encoders can resize to their requested resolution later.
+        if len({tuple(frames.shape[1:]) for frames in frames_list}) != 1:
+            max_h = max(int(frames.shape[-2]) for frames in frames_list)
+            max_w = max(int(frames.shape[-1]) for frames in frames_list)
+            padded = []
+            for frames in frames_list:
+                pad_h = max_h - int(frames.shape[-2])
+                pad_w = max_w - int(frames.shape[-1])
+                if pad_h or pad_w:
+                    frames = torch.nn.functional.pad(frames, (0, pad_w, 0, pad_h), mode="constant", value=0)
+                padded.append(frames)
+            frames_list = padded
         # Delegate to ``Batch.pack`` so the framework computes and
         # attaches ``_packed_cu_seqlens``. ``pack`` ``torch.cat``s the
         # per-sample frames along dim 0 internally.
-        return cls.pack(frames=[v.frames for v in items])
+        return cls.pack(frames=frames_list)
 
     def to_list(self) -> List[Video]:
         cu = self.cu_seqlens

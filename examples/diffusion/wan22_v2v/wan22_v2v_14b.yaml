@@ -5,7 +5,9 @@
 # {"prompt": "...", "media": [{"modality": "video", "role": "condition", "uri": "/path/clip.mp4"}]}
 
 num_devices: 8
-batch_size: 48
+# OOM-safe sanity geometry: 16 condition clips (LOVEU-TGVE DAVIS style subset) per
+# rollout, group size 8 for GRPO advantages -> 128 samples / 32 GPUs = 4 per GPU.
+batch_size: 16
 adv_use_global_std: true
 num_rollouts: 1000
 
@@ -47,7 +49,9 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
-    activation_checkpointing: false
+    # Primary OOM fix: recompute each WanTransformerBlock in backward instead of
+    # holding every block's activations for all replayed SDE steps at once.
+    activation_checkpointing: true
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
@@ -124,14 +128,17 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  num_inference_steps: 20
+  # OOM-safe sanity geometry. DAVIS source frames are square 480x480, so generate
+  # square; fewer steps + smaller group keep the replay graph within 80GB and make
+  # the loop fast enough to see PickScore rise within 1-2h. Scale up once stable.
+  num_inference_steps: 16
   guidance_scale: 1.0
   height: 480
-  width: 640
+  width: 480
   num_frames: 9
   strength: 0.8
   eta: 0.7
-  samples_per_prompt: 16
+  samples_per_prompt: 8
   seed: 42
   init_same_noise: false
   autocast_precision: bf16

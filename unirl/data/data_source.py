@@ -97,6 +97,12 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
         uri = selected[0].uri
         if str(uri).endswith((".pt", ".pth")):
             frames = torch.load(uri, map_location="cpu")
+        elif str(uri).endswith((".npy", ".npz")):
+            import numpy as np
+
+            loaded = np.load(uri)
+            frames = loaded["frames"] if isinstance(loaded, np.lib.npyio.NpzFile) else loaded
+            frames = torch.as_tensor(frames)
         else:
             frames, _, _ = torchvision.io.read_video(uri, pts_unit="sec", output_format="TCHW")
         if frames.numel() == 0:

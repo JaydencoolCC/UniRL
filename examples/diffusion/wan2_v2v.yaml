@@ -10,17 +10,23 @@
 # {"prompt": "make the motion cinematic", "media": [{"modality": "video", "role": "condition", "uri": "/path/in.mp4"}]}
 
 num_devices: 8
-batch_size: 32
+batch_size: 16
 adv_use_global_std: true
 num_rollouts: 1000
 
 bundle:
-  _target_: unirl.models.wan21.bundle.WAN21Bundle.from_config
+  # WAN 2.2 V2V uses the dual-transformer (high/low-noise) A14B checkpoint, so the
+  # bundle must be WAN22Bundle (it loads transformer + transformer_2); WAN21Bundle
+  # only loads a single transformer and would break the dual-transformer routing.
+  _target_: unirl.models.wan22.bundle.WAN22Bundle.from_config
   config:
     _target_: unirl.models.wan22_v2v.config.WAN22V2VPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,/apdcephfs_fsgm3/share_305110755/hunyuan/public_models/Wan2.2-T2V-A14B-Diffusers}
     model_precision: bf16
     vae_dtype: fp32
+    autocast_precision: bf16
+    trajectory_precision: fp16
+    logprob_precision: fp32
     shift: 5.0
     max_sequence_length: 512
     boundary_ratio: 0.875
@@ -49,7 +55,9 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
-    activation_checkpointing: false
+    # Primary OOM fix: recompute each WanTransformerBlock in backward instead of
+    # holding every block's activations for all replayed SDE steps at once.
+    activation_checkpointing: true
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
@@ -126,14 +134,16 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  num_inference_steps: 20
+  # OOM-safe sanity geometry (see wan22_v2v/wan22_v2v_14b.yaml). DAVIS source is
+  # square 480x480; fewer steps + smaller group keep the replay graph within 80GB.
+  num_inference_steps: 16
   guidance_scale: 1.0
   height: 480
-  width: 640
+  width: 480
   num_frames: 9
   strength: 0.8
   eta: 0.7
-  samples_per_prompt: 16
+  samples_per_prompt: 8
   seed: 42
   init_same_noise: false
   scheduler:
