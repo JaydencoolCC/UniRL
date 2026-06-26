@@ -68,6 +68,23 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             )
         del strategy  # LLM rollout has no SDE strategy
 
+        # sglang 0.5.12's ``SafeUnpickler`` (CVE-2025-10164 guard) runs in this
+        # engine process and blocks ``unirl.*`` classes when deserializing the
+        # colocate tensor weight-sync payload — the vendored ``FlattenedTensorBucket``
+        # / ``_rebuild_cuda_tensor_modified`` live under ``unirl.`` (sgl_compat).
+        # unirl's own SafeUnpickler already allows the prefix; mirror it onto
+        # sglang's server-side allowlist so ``update_weights_from_tensor`` round-trips.
+        try:
+            from sglang.srt.utils.common import SafeUnpickler as _SglSafeUnpickler
+
+            _prefixes = _SglSafeUnpickler.ALLOWED_MODULE_PREFIXES
+            if isinstance(_prefixes, (set, frozenset)):
+                _SglSafeUnpickler.ALLOWED_MODULE_PREFIXES = {*_prefixes, "unirl."}
+            else:  # tuple/list — preserve container type
+                _SglSafeUnpickler.ALLOWED_MODULE_PREFIXES = type(_prefixes)([*_prefixes, "unirl."])
+        except Exception:  # pragma: no cover - older sglang without the guard
+            logger.debug("sglang SafeUnpickler allowlist not patched", exc_info=True)
+
         self.cfg = config
         self.rank = rank
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
