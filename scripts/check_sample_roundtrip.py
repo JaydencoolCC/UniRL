@@ -33,6 +33,7 @@ from unirl.rollout.engine.vllm_omni.utils import (
     image_input_part,
     texts_from_sample,
 )
+from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Image, Images, Texts
 from unirl.types.sample import Part, Sample, _part_with_field
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
@@ -370,6 +371,58 @@ def check_disable_driver_xt_flag() -> None:
     )
 
 
+def check_noise_recipe_from_sample() -> None:
+    """``NoiseRecipe.from_sample`` keys the x_T on the gen Part's lineage
+    (sample_ids, or group_ids under ``init_same_noise``) and reads seed + shape off
+    its ``DiffusionSamplingParams`` — parity with the engines' ``_resolve_initial_noise``."""
+    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    img = inp.fork(
+        2,
+        sampling_params=DiffusionSamplingParams(
+            num_inference_steps=4, height=256, width=256, seed=7,
+            init_noise_latent_shape=[16, 32, 32], init_same_noise=False,
+        ),
+    )
+    recipe = NoiseRecipe.from_sample(Sample(parts=[inp, img]))
+    _check(recipe.noise_group_ids == list(img.sample_ids), "from_sample keys per-sample ids (init_same_noise=False)")
+    _check(recipe.base_seed == 7, "from_sample reads seed off the gen params")
+    _check(tuple(recipe.latent_shape or ()) == (16, 32, 32), "from_sample reads init_noise_latent_shape")
+    _check(recipe.initial_latents is None, "no img2img segment latents → initial_latents None")
+
+    img_shared = inp.fork(
+        2,
+        sampling_params=DiffusionSamplingParams(
+            num_inference_steps=4, height=256, width=256, seed=7,
+            init_noise_latent_shape=[16, 32, 32], init_same_noise=True,
+        ),
+    )
+    shared = NoiseRecipe.from_sample(Sample(parts=[inp, img_shared]))
+    _check(
+        shared.noise_group_ids == list(img_shared.group_ids),
+        "from_sample keys group ids when init_same_noise=True (siblings share x_T)",
+    )
+
+
+def check_generate_fills_frontier() -> None:
+    """The pipeline contract: ``generate`` fills the pre-forked frontier and returns
+    ``[input, filled-gen]`` — ids + sampling_params preserved, conditions left empty
+    (the trainside re-encode path). Mirrors the Sample reconstruction in
+    ``SD3Pipeline.generate`` / ``Qwen3Pipeline.generate`` with fake payloads."""
+    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    shell = inp.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
+    sample = Sample(parts=[inp, shell])
+    seg, dec = SimpleNamespace(tag="latent_seg"), SimpleNamespace(tag="images")
+    filled = sample.parts[-1].fill(segment=seg, primitive=dec)
+    out = Sample(parts=[*sample.parts[:-1], filled])
+    _check(len(out.parts) == 2, "generate returns [input, gen]")
+    _check(out.parts[0] is inp, "input Part passes through unchanged")
+    gen = out.parts[-1]
+    _check(gen.segment is seg and gen.primitive is dec, "frontier filled with segment + decoded")
+    _check(list(gen.sample_ids) == ["p0/0", "p1/0"], "frontier path ids preserved")
+    _check(gen.conditions == {}, "conditions left empty (replay re-encodes)")
+    _check(isinstance(gen.sampling_params, DiffusionSamplingParams), "sampling_params preserved through fill")
+
+
 _CHECKS: Tuple[Callable[[], None], ...] = (
     check_part_extraction,
     check_assemble_sample,
@@ -385,6 +438,8 @@ _CHECKS: Tuple[Callable[[], None], ...] = (
     check_advantage_group_ids_recorded,
     check_rollout_metric_naming,
     check_disable_driver_xt_flag,
+    check_noise_recipe_from_sample,
+    check_generate_fills_frontier,
 )
 
 

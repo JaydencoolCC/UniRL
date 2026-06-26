@@ -115,5 +115,31 @@ class NoiseRecipe:
             initial_latents=getattr(cond, "latents", None) if cond is not None else None,
         )
 
+    @classmethod
+    def from_sample(cls, sample) -> "NoiseRecipe":
+        """Build a recipe from a request ``Sample`` (its gen frontier part).
+
+        Sample-shaped sibling of :meth:`from_rollout_req`. The x_T key is derived
+        from the lineage path (OD-2): the parent (group) id under
+        ``init_same_noise`` so siblings share x_T, else the per-sample id —
+        matching the engines' ``_resolve_initial_noise``. ``initial_latents``
+        (img2img / i2v first-frame) rides on the gen part's ``segment``; the regen
+        shape on ``DiffusionSamplingParams.init_noise_latent_shape``. Duck-typed on
+        the part's attributes so it doesn't import Sample/Part.
+        """
+        gen = sample.parts[-1]
+        diffusion = gen.sampling_params
+        seg = gen.segment
+        share = bool(getattr(diffusion, "init_same_noise", False)) if diffusion is not None else False
+        keys = gen.group_ids if share else list(gen.sample_ids)
+        shape = getattr(diffusion, "init_noise_latent_shape", None) if diffusion is not None else None
+        seed = int(diffusion.seed) if diffusion is not None and getattr(diffusion, "seed", None) is not None else 0
+        return cls(
+            noise_group_ids=[str(k) for k in keys],
+            base_seed=seed,
+            latent_shape=tuple(shape) if shape else None,
+            initial_latents=getattr(seg, "initial_latents", None) if seg is not None else None,
+        )
+
 
 __all__ = ["NoiseRecipe"]

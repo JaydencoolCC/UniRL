@@ -1,4 +1,4 @@
-"""SD3Pipeline — RolloutReq → RolloutResp end-to-end for SD3.
+"""SD3Pipeline — ``Sample → Sample`` end-to-end for SD3.
 
 Implements the new four-tier flow::
 
@@ -11,13 +11,12 @@ the four stages with the precision policy from the config.
 σ schedule contract
 -------------------
 The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine`` /
-``VLLMOmniRolloutEngine``) pins ``req.sigmas`` via
-:func:`unirl.sde.runtime.ensure_req_sigmas` BEFORE calling
-``generate(req)``; this pipeline reads ``req.sigmas`` and uses it
-verbatim. The pipeline neither owns a σ builder nor reads model-
-specific scheduler config — both responsibilities live in
-:class:`unirl.sde.runtime.FlowMatchSchedulePolicy` which the
-engine loads once at startup.
+``VLLMOmniRolloutEngine``) pins the σ schedule onto the gen part's
+``DiffusionSamplingParams.sigmas`` BEFORE calling ``generate(sample)``; this
+pipeline reads ``params.sigmas`` and uses it verbatim. The pipeline neither owns
+a σ builder nor reads model-specific scheduler config — both responsibilities
+live in :class:`unirl.sde.runtime.FlowMatchSchedulePolicy` which the engine
+loads once at startup.
 """
 
 from __future__ import annotations
@@ -29,8 +28,7 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import CPSSDEStrategy, StepStrategy
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import SD3Bundle
@@ -42,23 +40,21 @@ from .vae import SD3VAEDecodeStage
 
 
 class SD3Pipeline(Pipeline):
-    """SD3 generate pipeline.
+    """SD3 generate pipeline: ``Sample → Sample``.
 
-    Reads from ``RolloutReq``:
+    Consumes a request ``Sample`` whose frontier (last) Part is a pre-forked
+    diffusion gen shell carrying ``DiffusionSamplingParams`` (with ``sigmas``
+    pinned by the hosting engine). Reads the prompt via ``sample.conditioning()``
+    and fills the frontier Part:
 
-    - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]: Texts`` — optional CFG negatives.
-    - ``stage_params["diffusion"]: dict`` — kwargs for
-      :class:`SD3DiffusionParams`.
-    - ``sigmas: Tensor[T+1]`` — pinned by the engine adapter (required).
+    - ``segment: LatentSegment`` — the denoising trajectory.
+    - ``primitive: Images`` — the decoded images.
 
-    Writes to ``RolloutResp`` (single ``"image"`` track):
-
-    - ``conditions["text"]: TextEmbedCondition``; plus
-      ``conditions["negative_text"]: TextEmbedCondition`` when negative prompts
-      were supplied.
-    - ``segment: LatentSegment``.
-    - ``decoded: Images``.
+    ``Part.conditions`` is left empty on this (trainside) path: replay re-encodes
+    from ``sample.conditioning()`` via :meth:`_conditions_for`, so rollout and
+    replay build conditions through one shared path. User-supplied negative
+    prompts are deferred (single-input request); CFG uses a synthesized empty
+    negative.
     """
 
     def __init__(
@@ -127,79 +123,79 @@ class SD3Pipeline(Pipeline):
             logprob_precision=config.logprob_precision,
         )
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run SD3 t2i end-to-end. Requires ``req.sigmas`` to be pinned by
-        the hosting engine adapter."""
-        if req.sigmas is None:
-            raise ValueError(
-                "SD3Pipeline.generate: req.sigmas is None. The hosting engine "
-                "(Trainside / SGLang / VLLMOmni) must call "
-                "unirl.sde.runtime.ensure_req_sigmas(req, policy) before "
-                "invoking pipeline.generate; see the σ ownership note in "
-                "unirl.models.types.pipeline."
+    def _conditions_for(self, texts: Texts, params: DiffusionSamplingParams) -> SD3Conditions:
+        """Encode prompts → :class:`SD3Conditions`. Shared by rollout-``generate``
+        and trainer-side replay (re-encode), so both build conditions identically.
+
+        CFG empty negative: SD3 upstream (diffusers v0.37.1
+        ``pipeline_stable_diffusion_3.py:466-467``) auto-defaults to ``""`` (empty
+        string) when CFG is enabled and no negative is passed. Without this default
+        the SD3 diffusion step would fall back to a zero-init negative-condition
+        path that doesn't match what the model was trained against; the
+        rollout/replay log-prob ratio drifts away from 1.0 in GRPO.
+
+        SD3's three text encoders (CLIP + CLIP + T5) tokenize ``""`` cleanly —
+        unlike Qwen-Image, there's no chat-template + prefix-strip that would
+        degenerate the embedding. Hence ``""`` here vs Qwen's ``" "``; both are the
+        model's canonical empty-negative per its upstream pipeline. (User-supplied
+        negatives are deferred — a single-input request carries only the positive.)
+        """
+        text_cond = self.text_embed.embed(texts)
+        negatives = Texts(texts=[""] * len(texts.texts)) if float(params.guidance_scale) > 1.0 else None
+        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        return SD3Conditions(text=text_cond, negative_text=negative_text_cond)
+
+    def generate(self, sample: Sample) -> Sample:
+        """Run SD3 t2i end-to-end, filling the frontier (pre-forked) gen Part.
+
+        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
+        by the hosting engine (e.g. ``TrainsideRolloutEngine._ensure_sample_sigmas``)
+        before the call; see the σ ownership note in ``unirl.models.types.pipeline``.
+        """
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise TypeError(
+                f"SD3Pipeline.generate: frontier gen Part must carry DiffusionSamplingParams, "
+                f"got {type(params).__name__ if params is not None else 'None'}"
             )
-        texts = req.primitives.get("text")
+        if params.sigmas is None:
+            raise ValueError(
+                "SD3Pipeline.generate: gen part sampling_params.sigmas is None. The hosting "
+                "engine must pin σ before invoking pipeline.generate; see the σ ownership note "
+                "in unirl.models.types.pipeline."
+            )
+
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
         if not isinstance(texts, Texts):
             raise TypeError(
-                f"SD3Pipeline.generate: req.primitives['text'] must be Texts, "
+                f"SD3Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
-        negatives_raw = req.primitives.get("negative_text")
-        negatives = negatives_raw if isinstance(negatives_raw, Texts) else None
-        if negatives is not None and len(negatives.texts) != len(texts.texts):
-            raise ValueError(
-                f"SD3Pipeline.generate: negative_text length {len(negatives.texts)} != text length {len(texts.texts)}"
-            )
 
-        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-        # init_same_noise shares the initial latent within each prompt group. The
-        # group key is the per-sample group id, which rides on the (already-sliced)
-        # req — surface it to the noise sampler when the driver didn't pre-ship
+        # init_same_noise shares the initial latent within each prompt group; surface
+        # the gen part's group ids to the noise sampler when the driver didn't pre-ship
         # noise_group_ids on sampling_params (a shared_field that isn't batch-sliced).
         if bool(params.init_same_noise) and not params.noise_group_ids:
-            params = dataclasses.replace(params, noise_group_ids=list(req.group_ids))
+            params = dataclasses.replace(params, noise_group_ids=list(frontier.group_ids))
 
-        text_cond = self.text_embed.embed(texts)
-        # CFG empty negative: SD3 upstream (diffusers v0.37.1
-        # ``pipeline_stable_diffusion_3.py:466-467``) auto-defaults to
-        # ``""`` (empty string) when CFG is enabled and no negative is
-        # passed. Without this default the SD3 diffusion step would fall
-        # back to a zero-init negative-condition path that doesn't match
-        # what the model was trained against; the rollout/replay log-prob
-        # ratio drifts away from 1.0 in GRPO.
-        #
-        # SD3's three text encoders (CLIP + CLIP + T5) tokenize ``""``
-        # cleanly — unlike Qwen-Image, there's no chat-template +
-        # prefix-strip that would degenerate the embedding. Hence the
-        # value ``""`` here vs Qwen's ``" "``; both are the model's
-        # canonical empty-negative per its upstream pipeline.
-        if negatives is None and float(params.guidance_scale) > 1.0:
-            negatives = Texts(texts=[""] * len(texts.texts))
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
-        sd3_conds = SD3Conditions(text=text_cond, negative_text=negative_text_cond)
-
-        schedule = req.sigmas.to(self.bundle.device)
+        sd3_conds = self._conditions_for(texts, params)
+        schedule = params.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
         # pre-shipped initial_latents tensor (img2img / i2v first-frame) still wins.
-        initial_latents = NoiseRecipe.from_rollout_req(req).resolve()
+        initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(
             sd3_conds, schedule=schedule, params=params, initial_latents=initial_latents
         )
         images = self.vae_decode.decode(latent_seg)
 
-        return RolloutResp(
-            tracks={
-                "image": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=sd3_conds.to_dict(),
-                    segment=latent_seg,
-                    decoded=images,
-                ),
-            }
-        )
+        # Fill the frontier shell; conditions left empty (replay re-encodes via
+        # _conditions_for, so rollout and replay share one encode path).
+        filled = frontier.fill(segment=latent_seg, primitive=images)
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
 __all__ = ["SD3Pipeline"]

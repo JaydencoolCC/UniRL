@@ -1,4 +1,4 @@
-"""Qwen3Pipeline — RolloutReq → RolloutResp end-to-end for Qwen3.
+"""Qwen3Pipeline — ``Sample → Sample`` end-to-end for Qwen3.
 
 Implements the AR-only two-tier flow::
 
@@ -17,10 +17,8 @@ stages.
 
 No σ schedule
 -------------
-Qwen3 is a pure causal LM with no diffusion side. ``generate()`` never
-reads ``req.sigmas`` — the hosting engine's
-:func:`unirl.sde.runtime.ensure_req_sigmas` call is a no-op
-upstream for AR-only pipelines.
+Qwen3 is a pure causal LM with no diffusion side; ``generate()`` reads no σ
+schedule — the hosting engine's σ-pinning is a no-op for AR-only pipelines.
 """
 
 from __future__ import annotations
@@ -30,8 +28,7 @@ from typing import Any, Dict, Optional
 from unirl.models.types.ar import ARSamplingParams
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 
 from .ar import Qwen3ARParams, Qwen3ARStage
 from .bundle import Qwen3Bundle
@@ -41,26 +38,19 @@ from .config import Qwen3PipelineConfig
 
 
 class Qwen3Pipeline(Pipeline):
-    """Qwen3 AR generate pipeline.
+    """Qwen3 AR generate pipeline: ``Sample → Sample``.
 
-    Reads from ``RolloutReq``:
+    Consumes a request ``Sample`` whose frontier (last) Part is a pre-forked AR
+    gen shell carrying ``ARSamplingParams``. Reads the prompt via
+    ``sample.conditioning()`` (an optional ``{"system_instruction": str}`` override
+    rides on the input Part's ``control["chat"]``) and fills the frontier Part:
 
-    - ``primitives["text"]: Texts`` — required prompts.
-    - ``stage_params["ar"]: dict`` — kwargs for :class:`Qwen3ARParams`
-      (``max_tokens`` / ``temperature`` / ``top_p`` / ``top_k`` /
-      ``stop_token_ids``).
-    - ``stage_params["chat"]: dict`` — optional
-      ``{"system_instruction": str}`` override for the chat-template
-      stage; when absent the stage's compose-time ``system_instruction``
-      is used.
+    - ``segment: TextSegment`` — the generated tokens + full-softmax log-probs.
+    - ``primitive: Texts`` — detokenized response strings.
 
-    Writes ``RolloutResp.tracks["ar"]`` (one :class:`RolloutTrack`):
-
-    - ``conditions["prompt"]: TextTokenCondition`` — the chat-template
-      output (``input_ids`` + ``attention_mask``).
-    - ``segment: TextSegment`` — the generated tokens +
-      full-softmax log-probs.
-    - ``decoded: Texts`` — detokenized response strings.
+    ``Part.conditions`` is left empty on this (trainside) path: replay re-tokenizes
+    from ``sample.conditioning()`` via :meth:`_conditions_for`, so rollout and
+    replay build the prompt conditions through one shared path.
     """
 
     def __init__(
@@ -136,17 +126,16 @@ class Qwen3Pipeline(Pipeline):
         )
         return cls(bundle=bundle, chat_template=chat_template, ar=ar)
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run Qwen3 AR generation end-to-end."""
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"Qwen3Pipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
+    def _conditions_for(self, texts: Texts, control: Optional[Dict[str, Any]] = None) -> Qwen3ARConditions:
+        """Chat-template + tokenize prompts → :class:`Qwen3ARConditions`. Shared by
+        rollout-``generate`` and trainer-side replay (re-tokenize), so both build the
+        prompt conditions through one path — the re-tokenization must be
+        byte-identical to rollout, which routing through this single path guarantees.
 
-        # Optional per-request system-instruction override.
-        chat_overrides: Dict[str, Any] = dict(req.stage_config.get("chat") or {})
+        An optional per-request ``system_instruction`` override rides on the input
+        Part's ``control["chat"]`` (was ``RolloutReq.stage_config["chat"]``).
+        """
+        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = Qwen3ChatTemplateStage(
                 self.bundle,
@@ -156,21 +145,36 @@ class Qwen3Pipeline(Pipeline):
             )
         else:
             chat_stage = self.chat_template
+        return chat_stage.embed(texts)
 
-        conds: Qwen3ARConditions = chat_stage.embed(texts)
-
-        # Extract typed AR sampling params from the request.
-        ar = req.sampling_params.get("ar")
-        if ar is not None:
-            params = Qwen3ARParams(
-                max_tokens=ar.max_new_tokens,
-                temperature=ar.temperature,
-                top_p=ar.top_p,
-                top_k=ar.top_k,
+    def generate(self, sample: Sample) -> Sample:
+        """Run Qwen3 AR generation end-to-end, filling the frontier (pre-forked) gen Part."""
+        frontier = sample.parts[-1]
+        ar = frontier.sampling_params
+        if not isinstance(ar, ARSamplingParams):
+            raise TypeError(
+                f"Qwen3Pipeline.generate: frontier gen Part must carry ARSamplingParams, "
+                f"got {type(ar).__name__ if ar is not None else 'None'}"
             )
-        else:
-            params = Qwen3ARParams()
 
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
+        if not isinstance(texts, Texts):
+            raise TypeError(
+                f"Qwen3Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
+                f"got {type(texts).__name__ if texts is not None else 'None'}"
+            )
+
+        conds = self._conditions_for(texts, sample.parts[0].control)
+
+        # Normalize the gen shell's ARSamplingParams through Qwen3ARParams (parity
+        # with the prior req-sourced path: stop_token_id reset, types coerced).
+        params = Qwen3ARParams(
+            max_tokens=ar.max_new_tokens,
+            temperature=ar.temperature,
+            top_p=ar.top_p,
+            top_k=ar.top_k,
+        )
         sampling_params = ARSamplingParams(
             max_new_tokens=int(params.max_tokens),
             temperature=float(params.temperature),
@@ -180,20 +184,12 @@ class Qwen3Pipeline(Pipeline):
         )
 
         segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
-
         decoded = self._detokenize(segment)
 
-        return RolloutResp(
-            tracks={
-                "ar": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=conds.to_dict(),
-                    segment=segment,
-                    decoded=decoded,
-                ),
-            }
-        )
+        # Fill the frontier shell; conditions left empty (replay re-tokenizes via
+        # _conditions_for, so rollout and replay share one encode path).
+        filled = frontier.fill(segment=segment, primitive=decoded)
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
     def _detokenize(self, segment) -> Texts:
         """Decode each per-sample varlen token chunk via the bundle tokenizer."""
