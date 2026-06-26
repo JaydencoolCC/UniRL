@@ -192,9 +192,10 @@ class SD3Pipeline(Pipeline):
         )
         images = self.vae_decode.decode(latent_seg)
 
-        # Fill the frontier shell; conditions left empty (replay re-encodes via
-        # _conditions_for, so rollout and replay share one encode path).
-        filled = frontier.fill(segment=latent_seg, primitive=images)
+        # Fill the frontier shell, carrying the encoded conditions for trainer-side
+        # replay: Part.conditions is the train stack's source in prepare_segment
+        # (matches every sibling pipeline + the SD3 sglang_diffusion adapter).
+        filled = frontier.fill(segment=latent_seg, primitive=images, conditions=sd3_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
