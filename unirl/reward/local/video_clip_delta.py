@@ -53,6 +53,9 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
 
     def __init__(self, *, config: "VideoCLIPDeltaSpec", base_device: str) -> None:
         self.lambda_source = float(getattr(config, "lambda_source", 1.0))
+        # Score K evenly-spaced frames (not just the first) so the edit reward
+        # reflects the whole clip rather than a single-frame proxy.
+        self.num_score_frames = max(1, int(getattr(config, "num_score_frames", 3)))
         super().__init__(config=config, base_device=base_device)
 
     # ------------------------------------------------------------------
@@ -60,22 +63,31 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _first_frame_pil(video: "Video") -> "Image.Image":
-        """First frame of a per-sample ``Video`` (frames ``[T, C, H, W]``)."""
+    def _sample_frames_pil(video: "Video", k: int) -> list["Image.Image"]:
+        """K evenly-spaced frames of a per-sample ``Video`` (frames ``[T, C, H, W]``).
+
+        Always returns exactly ``k`` frames (indices repeat when ``T < k``) so the
+        batch flattens to a fixed ``n * k`` layout for the per-video mean.
+        """
         frames = video.frames
         if frames is None or frames.ndim != 4:
             raise ValueError(
                 "VideoCLIPDeltaScorer: expected per-sample frames [T, C, H, W], got "
                 f"{None if frames is None else tuple(frames.shape)}"
             )
-        frame = frames[0].detach().cpu()
-        if not frame.is_floating_point():
-            frame = frame.float() / 255.0
-        elif frame.numel() > 0 and frame.max() > 1.0:
-            frame = (frame / 255.0).clamp(0.0, 1.0)
-        else:
-            frame = frame.clamp(0.0, 1.0)
-        return tensor_frame_to_pil(frame)
+        total = int(frames.shape[0])
+        idx = torch.linspace(0, total - 1, steps=int(k)).round().long().clamp_(0, total - 1).tolist()
+        pils: list["Image.Image"] = []
+        for j in idx:
+            frame = frames[j].detach().cpu()
+            if not frame.is_floating_point():
+                frame = frame.float() / 255.0
+            elif frame.numel() > 0 and frame.max() > 1.0:
+                frame = (frame / 255.0).clamp(0.0, 1.0)
+            else:
+                frame = frame.clamp(0.0, 1.0)
+            pils.append(tensor_frame_to_pil(frame))
+        return pils
 
     def _embed_images(self, pil_images: List["Image.Image"]) -> torch.Tensor:
         inputs = self.processor(images=pil_images, padding=True, truncation=True, max_length=77, return_tensors="pt")
@@ -116,26 +128,31 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
                 f"prompts={len(prompts)}."
             )
 
-        edited_frames = [self._first_frame_pil(v) for v in edited_videos]
-        source_frames = [self._first_frame_pil(v) for v in source_videos]
+        k = self.num_score_frames
+        # Flatten to n*k frames so each video contributes exactly k frames.
+        edited_frames = [f for v in edited_videos for f in self._sample_frames_pil(v, k)]
+        source_frames = [f for v in source_videos for f in self._sample_frames_pil(v, k)]
 
         rewards: List[float] = []
         with torch.no_grad():
-            logit_scale = self.model.logit_scale.exp()
-            for i in range(0, n, self.batch_size):
-                e = edited_frames[i : i + self.batch_size]
-                s = source_frames[i : i + self.batch_size]
-                p = prompts[i : i + self.batch_size]
+            # Both terms use the SAME PickScore scaling (logit_scale / 26), so
+            # lambda_source is a pure, scale-invariant relative weight between
+            # "match the target text" and "stop looking like the source".
+            scale = self.model.logit_scale.exp() / 26.0
+            for v_lo in range(0, n, self.batch_size):
+                v_hi = min(v_lo + self.batch_size, n)
+                nb = v_hi - v_lo
+                e = edited_frames[v_lo * k : v_hi * k]
+                s = source_frames[v_lo * k : v_hi * k]
+                p = prompts[v_lo:v_hi]
 
-                edited_emb = self._embed_images(e)
-                source_emb = self._embed_images(s)
-                text_emb = self._embed_texts(p)
+                edited_emb = self._embed_images(e)  # [nb*k, d]
+                source_emb = self._embed_images(s)  # [nb*k, d]
+                text_emb = self._embed_texts(p).repeat_interleave(k, dim=0)  # [nb*k, d]
 
-                # Same PickScore scaling for the on-target term; raw CLIP cosine
-                # for the source-similarity penalty (the two land in a similar
-                # ~0.8 range, so lambda_source=1.0 nets ~0 on an un-edited output).
-                text_align = (logit_scale * (text_emb * edited_emb).sum(dim=-1)) / 26
-                source_sim = (edited_emb * source_emb).sum(dim=-1)
+                # Per-frame cosines, averaged over the k frames of each video.
+                text_align = (scale * (text_emb * edited_emb).sum(dim=-1)).view(nb, k).mean(dim=1)
+                source_sim = (scale * (edited_emb * source_emb).sum(dim=-1)).view(nb, k).mean(dim=1)
 
                 reward = text_align - self.lambda_source * source_sim
                 rewards.extend(reward.float().cpu().tolist())
@@ -156,3 +173,4 @@ class VideoCLIPDeltaSpec(BaseRewardComponentSpec):
     processor_id: str = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
     model_id: str = "yuvalkirstain/PickScore_v1"
     lambda_source: float = 1.0
+    num_score_frames: int = 3

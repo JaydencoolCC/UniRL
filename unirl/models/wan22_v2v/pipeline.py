@@ -64,6 +64,26 @@ class WAN22V2VPipeline(Pipeline):
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else WAN21VAEDecodeStage(bundle)
 
+    @staticmethod
+    def _sde_indices_in_trimmed_frame(sde_indices: Any, *, t_full: int, t_eff: int) -> list:
+        """Remap SDE step indices from the full-schedule frame to the trimmed V2V frame.
+
+        ``params.sde_indices`` is resolved by the trainer over the *full*
+        ``num_inference_steps`` (``AllSDEScheduler(num_timesteps=num_inference_steps)``),
+        but V2V only denoises the trimmed tail of ``t_eff`` steps. So a
+        ``timestep_fraction`` window must be re-expressed in the trimmed frame,
+        otherwise it lands on the wrong steps (the old code reinterpreted
+        full-frame indices as trimmed-frame ones, which only happened to work when
+        the fraction started at 0). Map each index by its fractional position
+        ``round(i * t_eff / t_full)`` so "first 20% of denoising" stays "first 20%
+        of the *denoised* tail" for any fraction. Empty in -> empty out (the
+        deterministic forward-process path).
+        """
+        if not sde_indices or int(t_full) <= 0:
+            return []
+        remapped = {min(int(t_eff) - 1, max(0, round(int(i) * int(t_eff) / int(t_full)))) for i in sde_indices}
+        return sorted(remapped)
+
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         height = int(sampling_spec.height)
@@ -185,7 +205,7 @@ class WAN22V2VPipeline(Pipeline):
             )
 
         x_start = (1.0 - sigma_start) * video_latents + sigma_start * noise
-        sde_indices = [int(i) for i in (params.sde_indices or []) if int(i) < t_eff]
+        sde_indices = self._sde_indices_in_trimmed_frame(params.sde_indices, t_full=t_full, t_eff=t_eff)
         v2v_params = dataclasses.replace(params, num_inference_steps=t_eff, sde_indices=sde_indices)
 
         latent_seg = self.diffusion.diffuse(

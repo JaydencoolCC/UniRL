@@ -96,7 +96,9 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
 
         uri = selected[0].uri
         if str(uri).endswith((".pt", ".pth")):
-            frames = torch.load(uri, map_location="cpu")
+            # weights_only=True blocks arbitrary code execution from a crafted
+            # manifest pointing at an untrusted .pt (condition videos are plain tensors).
+            frames = torch.load(uri, map_location="cpu", weights_only=True)
         elif str(uri).endswith((".npy", ".npz")):
             import numpy as np
 

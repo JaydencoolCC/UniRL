@@ -230,19 +230,20 @@ class Videos(Batch):
         if len(channels) != 1:
             raise ValueError(f"Videos.from_list requires a consistent channel count, got {sorted(channels)}")
         # Packed videos can be ragged in time, but torch.cat still requires the
-        # non-packed C/H/W dimensions to match. Pad spatially like Images.from_list;
-        # model-specific encoders can resize to their requested resolution later.
+        # non-packed C/H/W dimensions to match. Resize (not zero-pad) ragged clips
+        # to the batch-max H/W so mixed-resolution inputs don't get black borders;
+        # model-specific encoders still resize to their requested resolution later.
         if len({tuple(frames.shape[1:]) for frames in frames_list}) != 1:
             max_h = max(int(frames.shape[-2]) for frames in frames_list)
             max_w = max(int(frames.shape[-1]) for frames in frames_list)
-            padded = []
+            resized = []
             for frames in frames_list:
-                pad_h = max_h - int(frames.shape[-2])
-                pad_w = max_w - int(frames.shape[-1])
-                if pad_h or pad_w:
-                    frames = torch.nn.functional.pad(frames, (0, pad_w, 0, pad_h), mode="constant", value=0)
-                padded.append(frames)
-            frames_list = padded
+                if int(frames.shape[-2]) != max_h or int(frames.shape[-1]) != max_w:
+                    frames = torch.nn.functional.interpolate(
+                        frames.float(), size=(max_h, max_w), mode="bilinear", align_corners=False
+                    ).to(frames.dtype)
+                resized.append(frames)
+            frames_list = resized
         # Delegate to ``Batch.pack`` so the framework computes and
         # attaches ``_packed_cu_seqlens``. ``pack`` ``torch.cat``s the
         # per-sample frames along dim 0 internally.
