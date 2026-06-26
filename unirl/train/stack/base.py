@@ -52,7 +52,7 @@ from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, _positive_int
-from unirl.types.rollout_resp import RolloutTrack
+from unirl.types.sample import Part
 from unirl.utils.misc import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
@@ -97,7 +97,7 @@ def _aggregate_update_results(results: List["TrainStepResult"]) -> "TrainStepRes
     )
 
 
-def _align_track_to_model(resp_track: RolloutTrack, *, device: torch.device) -> None:
+def _align_track_to_model(part: Part, *, device: torch.device) -> None:
     """Move a track's training inputs onto the model's device — SGLang returns them
     on CPU via Ray IPC. Uses :meth:`Batch.to_device` (recursive; carries
     framework-managed ``_packed_cu_seqlens`` and tensors nested in tuples/dicts) on
@@ -111,11 +111,11 @@ def _align_track_to_model(resp_track: RolloutTrack, *, device: torch.device) -> 
     per-sample ``FieldKind.CONCAT`` lists of tensors (Qwen2.5-VL's ``pixel_values``
     / ``image_grid_thw``), which have no ``.to_device`` of their own — ``_move_value``
     handles Batch / tensor / list / dict / None uniformly."""
-    if resp_track.segment is not None:
-        resp_track.segment = resp_track.segment.to_device(device)
-    resp_track.conditions = {k: _move_value(v, device) for k, v in resp_track.conditions.items()}
-    if resp_track.advantages is not None:
-        resp_track.advantages = resp_track.advantages.to(device=device)
+    if part.segment is not None:
+        part.segment = part.segment.to_device(device)
+    part.conditions = {k: _move_value(v, device) for k, v in part.conditions.items()}
+    if part.advantages is not None:
+        part.advantages = part.advantages.to(device=device)
 
 
 class TrainStack(Remote):
@@ -168,7 +168,7 @@ class TrainStack(Remote):
         self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
         self.micro_planner.validate(algorithm)
 
-    def prepare_segment(self, resp_track: RolloutTrack, *, plans: Plan) -> None:
+    def prepare_segment(self, part: Part, *, plans: Plan) -> None:
         """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop.
 
         No-op if ``segment`` is None. If the algorithm does NOT replay the anchor
@@ -188,19 +188,19 @@ class TrainStack(Remote):
         the shard in order, the per-micro field chunks reassemble with a plain
         ordered ``cat``.
         """
-        if resp_track.segment is None:
+        if part.segment is None:
             return
         algorithm = self.algorithm
         if not algorithm.recomputes_anchor():
-            algorithm.prepare_segment(conditions=resp_track.conditions, segment=resp_track.segment)
+            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
             return
         micro_slices = [r for update in plans for r in update]
         if len(micro_slices) == 1:
-            algorithm.prepare_segment(conditions=resp_track.conditions, segment=resp_track.segment)
+            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
             return
         collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
         for start, end in micro_slices:
-            micro = resp_track.slice(start, end)
+            micro = part.slice(start, end)
             algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
             for field in collected:
                 value = getattr(micro.segment, field, None)
@@ -211,11 +211,11 @@ class TrainStack(Remote):
                     )
                 collected[field].append(value)
         for field, parts in collected.items():
-            setattr(resp_track.segment, field, torch.cat(parts, dim=0))
+            setattr(part.segment, field, torch.cat(parts, dim=0))
 
     def _run_update(
         self,
-        resp_track: RolloutTrack,
+        part: Part,
         *,
         micros: UpdatePlan,
         training_progress: float,
@@ -226,15 +226,15 @@ class TrainStack(Remote):
         :meth:`~unirl.train.stack.planner.MicroPlanner.arrange` so the forward
         geometry matches the π_old anchor frozen by :meth:`prepare_segment`.
         """
-        if resp_track.advantages is None:
+        if part.advantages is None:
             raise ValueError(
-                f"{type(self).__name__}._run_update: resp_track.advantages is None; "
+                f"{type(self).__name__}._run_update: part.advantages is None; "
                 "upstream advantage pipeline must populate it before training."
             )
         if not micros:
             raise ValueError(f"{type(self).__name__}._run_update: empty micros.")
 
-        bs = int(resp_track.batch_size)
+        bs = int(part.batch_size)
         self.fsdp_backend.zero_grad()
 
         update_total = sum(end - start for start, end in micros)
@@ -249,7 +249,7 @@ class TrainStack(Remote):
             # it runs once per optimizer step instead of once per micro-batch (no-op
             # unless defer_grad_sync + ZeRO-2). Must precede the backward.
             self.fsdp_backend.set_grad_sync(i == last_micro)
-            micro_track = resp_track if single_micro else resp_track.slice(start, end)
+            micro_track = part if single_micro else part.slice(start, end)
             # Sample-share weighting: the algorithm's micro loss is a MEAN over the
             # micro's sequences (seq-mean agg modes), so the update gradient equals
             # the whole-update mean only when each micro is weighted by its share of
@@ -319,7 +319,7 @@ class TrainStack(Remote):
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def train_track(
         self,
-        resp_track: RolloutTrack,
+        part: Part,
         *,
         training_progress: float,
     ) -> TrainStepResult:
@@ -328,7 +328,7 @@ class TrainStack(Remote):
         Combines the steps so worker-side mutations (``segment.sde_logp`` populated
         by ``prepare_segment``) flow into the subsequent update(s) without
         round-tripping through the driver. Dispatched ``DP_SCATTER`` so each DP
-        worker receives its shard of ``resp_track``; per-shard loss/grad_norm/metrics
+        worker receives its shard of ``part``; per-shard loss/grad_norm/metrics
         merge back via ``pytree_merge``.
 
         ``arrange`` reorders the shard (if packing) and builds the contiguous plan;
@@ -336,23 +336,23 @@ class TrainStack(Remote):
         ``num_updates_per_batch`` optimizer steps run over disjoint updates, and
         ``on_rollout_end`` runs once — see :meth:`_run_updates`.
         """
-        self._align_track_inputs(resp_track)
+        self._align_track_inputs(part)
         # Arrange once: reorder the track so packed micros are contiguous (no-op for
         # CountPlanner) and produce the plan. The SAME (track, plans) feed both the
         # anchor freeze and the train loop so both run the exact same geometry.
-        resp_track, plans = self.micro_planner.arrange(
-            resp_track,
+        part, plans = self.micro_planner.arrange(
+            part,
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
         )
-        self.prepare_segment(resp_track, plans=plans)
-        result = self._run_updates(resp_track, plans=plans, training_progress=float(training_progress))
+        self.prepare_segment(part, plans=plans)
+        result = self._run_updates(part, plans=plans, training_progress=float(training_progress))
         self.on_rollout_end()
         return result
 
     def _run_updates(
         self,
-        resp_track: RolloutTrack,
+        part: Part,
         *,
         plans: Plan,
         training_progress: float,
@@ -369,7 +369,7 @@ class TrainStack(Remote):
         each update's own metrics are attached on ``per_update`` (see
         :func:`_aggregate_update_results`).
         """
-        results = [self._run_update(resp_track, micros=micros, training_progress=training_progress) for micros in plans]
+        results = [self._run_update(part, micros=micros, training_progress=training_progress) for micros in plans]
         if len(results) == 1:
             return results[0]
         aggregated = _aggregate_update_results(results)
@@ -384,10 +384,10 @@ class TrainStack(Remote):
         )
         return replace(aggregated, per_update=per_update)
 
-    def _align_track_inputs(self, resp_track: RolloutTrack) -> None:
+    def _align_track_inputs(self, part: Part) -> None:
         """Move the track onto the model's device; see :func:`_align_track_to_model`."""
         device = next(self.fsdp_backend.trainable_module().parameters()).device
-        _align_track_to_model(resp_track, device=device)
+        _align_track_to_model(part, device=device)
 
     def _current_lr(self) -> float:
         optimizer = self.fsdp_backend.optimizer

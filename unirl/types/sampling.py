@@ -98,6 +98,11 @@ class DiffusionSamplingParams(BaseSamplingParams):
     # x_T noise recipe: the per-sample latent shape each engine regenerates a
     # byte-identical initial noise into (pairs with init_same_noise + seed).
     init_noise_latent_shape: Optional[List[int]] = None
+    # Driver-x_T opt-out (debug escape hatch). When True the trainer is NOT
+    # authoring x_T: the engine adapter skips the init_noise_group_ids recipe and
+    # each engine falls back to its own RNG. Per-request so the unified DiT path
+    # honors it just like DiffusionTrainer's DISABLE_DRIVER_XT env.
+    disable_driver_xt: bool = False
     # Resolved σ schedule for this rollout, pinned by the rollout-engine adapter
     # before generation (single source of truth). The engine echoes it back on
     # ``LatentSegment.sigmas`` and ``sigma_verify`` asserts the two match.

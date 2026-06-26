@@ -14,7 +14,7 @@ from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.prompts import RolloutInputs
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Part, Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -66,7 +66,7 @@ class DiffusionTrainer(BaseTrainer):
         # default; only safe (and only set true) for layout=="colocate" with a
         # SEPARATE engine rollout under GRPO — gated again in train_step.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
-        # FlowDPPO advantage parity: when True, RolloutTrack.compute_advantages
+        # FlowDPPO advantage parity: when True, Part.compute_advantages
         # keeps the per-group mean but divides by ONE batch-wide std (the v1
         # ``use_global_std=True`` scale) instead of each prompt's own std. Off by
         # default → unchanged per-group GRPO normalization for every other recipe.
@@ -84,10 +84,10 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
         # Per-request routing metadata pinned by the recipe (e.g. {"task": "it2i"}),
-        # forwarded onto every RolloutReq. Pinning the task makes a dataset that is
-        # MISSING source images fail loudly in the pipeline (it2i requires an input
-        # image) instead of silently degrading to t2i. Empty ⇒ the pipeline infers
-        # the task as before (unchanged for every other recipe).
+        # forwarded onto every request Part's ``control``. Pinning the task makes a
+        # dataset that is MISSING source images fail loudly in the pipeline (it2i
+        # requires an input image) instead of silently degrading to t2i. Empty ⇒ the
+        # pipeline infers the task as before (unchanged for every other recipe).
         self._stage_config: Dict[str, Any] = dict(stage_config) if stage_config else {}
         # Set in _build_rollout: True when the rollout is the trainside
         # direct-sampling engine (it reuses the train model → must NOT offload).
@@ -103,7 +103,7 @@ class DiffusionTrainer(BaseTrainer):
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
         # Per-sample latent shape for the driver-authored x_T recipe (see
-        # _build_req), resolved ONCE here via the pipeline's framework-level
+        # _build_request_sample), resolved ONCE here via the pipeline's framework-level
         # ``latent_shape`` classmethod — each model contributes its OWN geometry
         # instead of a hardcoded SD3 shape.
         #
@@ -275,38 +275,48 @@ class DiffusionTrainer(BaseTrainer):
             return None
         return [int(x) for x in shape]
 
-    def _build_req(
-        self, inputs: RolloutInputs, rollout_id: int, *, base_sampling: Optional[Dict[str, BaseSamplingParams]] = None
-    ) -> RolloutReq:
-        """Turn a data source batch into a typed :class:`RolloutReq`.
+    def _build_request_sample(
+        self,
+        inputs: RolloutInputs,
+        rollout_id: int,
+        *,
+        sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+    ) -> Sample:
+        """Turn a data source batch into a request :class:`Sample`.
 
-        Expands ``inputs`` by ``total_samples_per_prompt(sampling_params)`` so
-        each prompt produces an N-sample GRPO group (sibling samples consecutive,
-        sample IDs ``prompt:<gid>:sample:<j>``).
+        The ``P`` prompts become a root text input Part — ids rollout-keyed
+        (``r{rollout_id}:…``) so each rollout is its own provenance — and
+        ``Part.fork`` fans out the diffusion gen shell to the ``N``-sample GRPO
+        group (replacing the old ``inputs.expand``; siblings stay consecutive). An
+        it2i recipe chains the source image off the prompt via ``Part.input_child``.
 
-        ``rollout_id`` keys the SDE step scheduler (``get_sde_indices``): the
+        ``rollout_id`` keys the SDE step scheduler (``resolve_sde_indices``): the
         resolved indices are stamped onto a per-request copy of the diffusion
-        sampling params, and the schedule config itself is nulled so only the
-        resolved ``sde_indices`` ride to the engine.
+        sampling params (which rides on the gen Part), the schedule config itself
+        is nulled so only the resolved ``sde_indices`` ride to the engine, and the
+        pipeline's own latent geometry (``self._noise_latent_shape``) is pinned for
+        the engine-side x_T recipe.
 
-        ``base_sampling`` overrides the modality-keyed sampling dict (``evaluate``
-        passes its own deterministic params); ``None`` uses ``self.sampling_params``.
+        ``sampling`` overrides the modality-keyed sampling dict (``evaluate`` passes
+        its own deterministic params); ``None`` uses ``self.sampling_params``.
         """
-        base = base_sampling if base_sampling is not None else self.sampling_params
-        inputs = inputs.expand(total_samples_per_prompt(base))
-        diffusion = base.get("diffusion")
+        sp = sampling if sampling is not None else self.sampling_params
+        diffusion = sp.get("diffusion")
         sde_indices = diffusion.resolve_sde_indices(rollout_id)
-        diffusion = dataclasses.replace(diffusion, sde_indices=sde_indices, scheduler=None)
-        sampling_params = {**base, "diffusion": diffusion}
-        # Driver-authoritative x_T, shipped as a deterministic RECIPE. The driver
-        # is the single source of initial noise: it authors per-sample noise group
-        # ids keyed on (rollout_id, STABLE sample/group id); base_seed rides on
-        # sampling_params.seed and the latent shape is the pipeline's own geometry
-        # (self._noise_latent_shape, resolved once in __init__). Each engine
-        # regenerates the BYTE-IDENTICAL x_T from this recipe via regen_initial_noise
-        # (generate_shared_noise pinned to CPU-fp32, then moved to the engine device
-        # — CPU randn is bit-stable across machines for a fixed torch version, which
-        # is what makes trainside / vllm / sglang agree to the byte; verified across
+        diffusion = dataclasses.replace(
+            diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=self._noise_latent_shape
+        )
+        # Driver-authoritative x_T, shipped as a deterministic RECIPE. The driver is
+        # the single source of initial noise: the engine derives the per-rollout
+        # x_T noise key from the gen Part's ``sample_ids``, so the rollout salt MUST
+        # live in those ids — hence ``r{rollout_id}:{sample_id}`` roots, fanned out
+        # by ``fork`` so every gen sample inherits the rollout-keyed lineage.
+        # base_seed rides on ``sampling_params.seed`` and the latent shape is the
+        # pipeline's own geometry (``self._noise_latent_shape``, resolved once in
+        # __init__, pinned above). Each engine regenerates the BYTE-IDENTICAL x_T
+        # from this recipe (CPU-fp32 randn, then moved to the engine device — CPU
+        # randn is bit-stable across machines for a fixed torch version, which is
+        # what makes trainside / vllm / sglang agree to the byte; verified across
         # nodes+clusters on torch 2.11.0).
         # So x_T is:
         #   - per-rollout-VARYING (rollout_id in the key) → genuine exploration,
@@ -314,32 +324,27 @@ class DiffusionTrainer(BaseTrainer):
         #   - IDENTICAL across engines for a given (seed, rollout) → curves align,
         #   - reproducible under resume / re-shard / re-batch (ids are STABLE, not a
         #     positional batch index, so a sample keeps its x_T wherever it lands).
-        # ``init_same_noise=True`` keys by prompt group instead (siblings share).
-        # Root cause this fixes: each engine used to draw its OWN x_T from independent
-        # RNG → divergent reward curves; a single driver-authored x_T removes that.
-        # Opt out with DISABLE_DRIVER_XT=1 (resolved in __init__ → shape None here).
-        init_noise_group_ids: list = []
-        init_noise_latent_shape = self._noise_latent_shape
-        if init_noise_latent_shape is not None:
-            if bool(getattr(base.get("diffusion"), "init_same_noise", False)):
-                init_noise_group_ids = [f"r{rollout_id}:{g}" for g in inputs.group_ids]
-            else:
-                init_noise_group_ids = [f"r{rollout_id}:{s}" for s in inputs.sample_ids]
-        return RolloutReq(
-            sample_ids=list(inputs.sample_ids),
-            group_ids=list(inputs.group_ids),
-            primitives=dict(inputs.primitives),
-            request_conditions={},
-            stage_config=dict(self._stage_config),
-            sampling_params=sampling_params,
-            metadata=list(inputs.metadata) if inputs.metadata else [],
-            init_noise_group_ids=init_noise_group_ids,
-            init_noise_latent_shape=init_noise_latent_shape,
+        # ``init_same_noise=True`` (read off the params engine-side) keys by prompt
+        # group instead (siblings share). Root cause this fixes: each engine used to
+        # draw its OWN x_T from independent RNG → divergent reward curves; a single
+        # driver-authored x_T removes that. Opt out with DISABLE_DRIVER_XT=1
+        # (resolved in __init__ → shape None here).
+        root_ids = [f"r{rollout_id}:{sid}" for sid in inputs.sample_ids]
+        text = Part.input(
+            root_ids,
+            primitive=inputs.primitives["text"],
+            control=dict(self._stage_config),
+            metadata=list(inputs.metadata) if inputs.metadata else None,
         )
+        input_parts = [text]
+        image_prim = inputs.primitives.get("image")
+        if image_prim is not None:
+            input_parts.append(text.input_child(image_prim))  # it2i source image
+        return Sample.request(*input_parts).fork(total_samples_per_prompt(sp), sampling_params=diffusion)
 
     def train_step(
         self,
-        req: RolloutReq,
+        sample: Sample,
         *,
         training_progress: float = 0.0,
         sync_weights: bool = False,
@@ -357,7 +362,7 @@ class DiffusionTrainer(BaseTrainer):
         ``generate`` already using the fresh adapter.
 
         Returns ``(train_result, mean_reward)`` — the mean unnormalized
-        per-sample reward of the single track (0.0 if none), for the log line.
+        per-sample reward of the frontier gen Part (0.0 if none), for the log line.
         """
         t0 = time.perf_counter()
         self.rollout.wake_up()
@@ -389,35 +394,30 @@ class DiffusionTrainer(BaseTrainer):
         _inproc_ema_swap = self._uses_ema and self._rollout_is_trainside
         if _inproc_ema_swap:
             self.backend.apply_eval_ema()
-        resp = self.rollout.generate(req)
+        sample = self.rollout.generate(sample)
         if _inproc_ema_swap:
             self.backend.restore_from_eval()
         self.rollout.sleep()
         if _do_fsdp_offload:
             self.backend.onload()
 
-        for name, track in list(resp.tracks.items()):
-            if track.segment is not None:
-                resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
+        # Score the frontier gen Part (Sample -> Sample; the reward service is
+        # migrated alongside on its own branch — see the LIN-480 plan).
+        sample = self.reward.score_and_attach(sample)
 
+        part = sample.parts[-1]
         mean_reward = 0.0
-        for track in resp.tracks.values():
-            if track.rewards is None:
-                continue
+        if part.rewards is not None:
             # Hydrate in place so the wandb reward/advantage stats reuse this
             # fetch instead of re-pulling the TensorRef from the worker.
-            track.rewards = hydrate(track.rewards)
-            mean_reward = float(track.rewards.to(torch.float32).mean().item())
-            break  # single-track for now; revisit if multi-track lands
+            part.rewards = hydrate(part.rewards)
+            mean_reward = float(part.rewards.to(torch.float32).mean().item())
+            part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
+            sample = sample.with_parts([*sample.parts[:-1], part])
 
-        for name, track in list(resp.tracks.items()):
-            if track.rewards is not None:
-                resp.tracks[name] = track.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
-
-        self._drop_decoded(req, resp, rollout_id=rollout_id)
-        (track,) = resp.tracks.values()
-        result = self.stack.train_track(track, training_progress=float(training_progress))
-        self.wandb_logger.log_rollout_step(rollout_id, result, resp, step_time_s=time.perf_counter() - t0)
+        self._drop_decoded(sample, rollout_id=rollout_id)
+        result = self.stack.train_track(sample.parts[-1], training_progress=float(training_progress))
+        self.wandb_logger.log_rollout_step(rollout_id, result, sample, step_time_s=time.perf_counter() - t0)
         return result, mean_reward
 
     def evaluate(self, step: int) -> float:
@@ -449,17 +449,14 @@ class DiffusionTrainer(BaseTrainer):
             self.weight_sync.sync()
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
-            req = self._build_req(sub, step, base_sampling=eval_sp)
-            resp = self.rollout.generate(req)
-            for name, track in list(resp.tracks.items()):
-                if track.segment is not None:
-                    resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
-            for track in resp.tracks.values():
-                if track.rewards is not None:
-                    rewards = hydrate(track.rewards).to(torch.float32)
-                    reward_sum += float(rewards.sum().item())
-                    reward_n += int(rewards.numel())
-                    break  # single-track for now; revisit if multi-track lands
+            req = self._build_request_sample(sub, step, sampling=eval_sp)
+            sample = self.rollout.generate(req)
+            sample = self.reward.score_and_attach(sample)
+            part = sample.parts[-1]
+            if part.rewards is not None:
+                rewards = hydrate(part.rewards).to(torch.float32)
+                reward_sum += float(rewards.sum().item())
+                reward_n += int(rewards.numel())
         self.rollout.sleep()
         mean_reward = reward_sum / max(1, reward_n)
         logger.info(
@@ -512,7 +509,7 @@ class DiffusionTrainer(BaseTrainer):
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
-                req = self._build_req(inputs, rollout_id)
+                sample = self._build_request_sample(inputs, rollout_id)
                 # Sync before generate; skip step 0 (nothing trained yet). On
                 # resume, force the first sync — the engine booted with fresh
                 # weights and needs the restored adapter before generate.
@@ -520,7 +517,7 @@ class DiffusionTrainer(BaseTrainer):
                     resumed and rollout_id == start_rollout
                 )
                 result, mean_reward = self.train_step(
-                    req,
+                    sample,
                     training_progress=training_progress,
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,

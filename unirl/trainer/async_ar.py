@@ -25,7 +25,7 @@ thread, no locks. Draining all in-flight generations before each weight sync is
 **mandatory** (the engine corrupts an in-flight generation when weights + KV
 cache update mid-flight); this is the single-threaded ``_drain_all`` quiesce.
 
-Subclasses ``ARTrainer`` to reuse ``_build_req``/``evaluate`` and ``BaseTrainer``
+Subclasses ``ARTrainer`` to reuse ``_build_request_sample``/``evaluate`` and ``BaseTrainer``
 plumbing, but ``__init__`` calls ``BaseTrainer.__init__`` **directly** (the parent
 opens the colocate ``placement(fraction=1.0)`` block we replace with two slabs).
 """
@@ -47,8 +47,7 @@ from unirl.distributed.tensor.pytree import infer_batch_size
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -58,18 +57,19 @@ logger = logging.getLogger(__name__)
 class _RolloutBuffer:
     """Group-keyed rollout buffer (single-threaded; no lock needed).
 
-    Each entry is one prompt's GRPO group — a ``RolloutTrack`` of
-    ``samples_per_prompt`` already-scored samples — stamped with the
-    ``weight_version`` it was generated under and a monotonic ``gen_id`` for
-    freshness ordering. Groups are always complete (the whole ``generate``
-    finished before they are ``put``), so there is no partial-group bookkeeping.
+    Each entry is one prompt's GRPO group — a tree-complete ``Sample`` (one
+    root prompt + its ``samples_per_prompt`` already-scored gen samples, from
+    :meth:`Sample.split`) — stamped with the ``weight_version`` it was generated
+    under and a monotonic ``gen_id`` for freshness ordering. Groups are always
+    complete (the whole ``generate`` finished before they are ``put``), so there
+    is no partial-group bookkeeping.
     """
 
     def __init__(self) -> None:
-        self._items: List[Tuple[RolloutTrack, int, int]] = []  # (group, weight_version, gen_id)
+        self._items: List[Tuple[Sample, int, int]] = []  # (group, weight_version, gen_id)
 
-    def put(self, track: RolloutTrack, *, weight_version: int, gen_id: int) -> None:
-        self._items.append((track, int(weight_version), int(gen_id)))
+    def put(self, sample: Sample, *, weight_version: int, gen_id: int) -> None:
+        self._items.append((sample, int(weight_version), int(gen_id)))
 
     def size(self) -> int:
         return len(self._items)
@@ -80,7 +80,7 @@ class _RolloutBuffer:
         *,
         current_version: Optional[int] = None,
         max_staleness: Optional[int] = None,
-    ) -> Optional[List[Tuple[RolloutTrack, int, int]]]:
+    ) -> Optional[List[Tuple[Sample, int, int]]]:
         """Pop the ``n`` freshest complete groups, carrying leftovers forward.
 
         Returns ``None`` if fewer than ``n`` groups remain after eviction. When
@@ -163,13 +163,22 @@ class AsyncARTrainer(ARTrainer):
         # BOTH slabs (training over the train slab, generation over the rollout
         # slab). Fail early with a clear message rather than mid-run in dispatch.
         self._rollout_devices = self.num_devices - self._train_devices
-        total = int(self.batch_size) * total_samples_per_prompt(self.sampling_params)
-        for slab_name, slab in (("train", self._train_devices), ("rollout", self._rollout_devices)):
-            if total % slab != 0:
-                raise ValueError(
-                    f"batch_size * samples_per_prompt = {total} is not divisible by the "
-                    f"{slab_name} slab size {slab}; adjust batch_size / samples_per_prompt / train_fraction."
-                )
+        # DP_SCATTER divisibility differs per slab in the Sample model:
+        #   * training shards the gen Part (P*N samples) over the train slab;
+        #   * generation shards the REQUEST Sample by its root (P prompts =
+        #     Sample.batch_size; each prompt-tree stays whole) over the rollout slab.
+        prompts = int(self.batch_size)  # P
+        total = prompts * total_samples_per_prompt(self.sampling_params)  # P*N
+        if total % self._train_devices != 0:
+            raise ValueError(
+                f"batch_size * samples_per_prompt = {total} is not divisible by the train "
+                f"slab size {self._train_devices}; adjust batch_size / samples_per_prompt / train_fraction."
+            )
+        if prompts % self._rollout_devices != 0:
+            raise ValueError(
+                f"batch_size = {prompts} prompts is not divisible by the rollout slab size "
+                f"{self._rollout_devices} (each prompt-tree DP-scatters whole); adjust batch_size / train_fraction."
+            )
 
         # ---- two disjoint top-level slabs (diffusion.py:115-129 template) ----
         # The train scope must FULLY EXIT before the rollout scope opens, else a
@@ -226,7 +235,7 @@ class AsyncARTrainer(ARTrainer):
     # Non-blocking generate seam (faithful split of handle.py:271-300 at ray.get)
     # ------------------------------------------------------------------
 
-    def _generate_async(self, req: RolloutReq):
+    def _generate_async(self, sample: Sample):
         """Launch ``generate`` non-blocking; return (refs, worker_local).
 
         ``refs`` is a flat list of ObjectRefs, one per rollout worker. This runs
@@ -236,19 +245,19 @@ class AsyncARTrainer(ARTrainer):
         """
         r = self.rollout
         dispatch_fn = DISPATCH_MODE_REGISTRY[Dispatch.DP_SCATTER]["dispatch_fn"]
-        bs = infer_batch_size((req,), {})
+        bs = infer_batch_size((sample,), {})
         if bs is not None and bs % r.dp_size != 0:
-            raise ValueError(f"req batch_size={bs} not divisible by rollout dp_size={r.dp_size}")
-        shards = dispatch_fn(r, (req,), {}, bs)
+            raise ValueError(f"request Sample batch_size={bs} not divisible by rollout dp_size={r.dp_size}")
+        shards = dispatch_fn(r, (sample,), {}, bs)
         worker_local = issubclass(r.pool.transport_cls, WorkerLocalTransport)
         shards = r.pool.transport_cls.localize(shards, r.pool, r.device_ids, r.worker_ids)
         refs = r._execute_all("generate", shards, grad_mode=False, call_id=None)
         return refs, worker_local
 
-    def _collect_resp(self, refs, worker_local) -> RolloutResp:
-        """Join a completed generate (handle.py:291,297,300) → full RolloutResp.
+    def _collect_resp(self, refs, worker_local) -> Sample:
+        """Join a completed generate (handle.py:291,297,300) → the filled ``Sample``.
 
-        Byte-identical to ``self.rollout.generate(req)``; blocks in ``ray.get``
+        Byte-identical to ``self.rollout.generate(sample)``; blocks in ``ray.get``
         (instant for an already-ready generation).
         """
         r = self.rollout
@@ -269,31 +278,28 @@ class AsyncARTrainer(ARTrainer):
 
     def _launch(self, gen_id: int) -> None:
         """Build a request and launch one non-blocking generation."""
-        req = self._build_req(self.data_source.get_samples(self.batch_size), gen_id)
-        refs, worker_local = self._generate_async(req)
+        sample = self._build_request_sample(self.data_source.get_samples(self.batch_size), gen_id)
+        refs, worker_local = self._generate_async(sample)
         self._inflight.append(
             {
                 "refs": refs,
                 "worker_local": worker_local,
-                "req": req,
                 "gen_id": gen_id,
                 "weight_version": self._weight_version,
             }
         )
 
-    def _score_into_buffer(self, rec: Dict[str, Any], resp: RolloutResp) -> None:
-        """Score a completed generation and split its groups into the buffer.
+    def _score_into_buffer(self, rec: Dict[str, Any], sample: Sample) -> None:
+        """Score a completed generation and split its per-prompt trees into the buffer.
 
-        Scoring must precede ``_drop_decoded`` (the reward reads ``decoded``).
-        Keyed by ``gen_id`` so media panels behave like the old pipeline path.
+        Scoring must precede ``_drop_decoded`` (the reward reads the decoded
+        primitive). Keyed by ``gen_id`` so media panels behave like the old path.
+        The filled ``Sample`` is self-contained (it carries its input Parts), so
+        no request handle is kept on the in-flight record.
         """
-        req = rec["req"]
-        for name, track in list(resp.tracks.items()):
-            if track.segment is not None:
-                resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
-        self._drop_decoded(req, resp, rollout_id=rec["gen_id"])
-        (track,) = resp.tracks.values()
-        for group in track.split():
+        sample = self.reward.score_and_attach(sample)
+        self._drop_decoded(sample, rollout_id=rec["gen_id"])
+        for group in sample.split():
             self._buffer.put(group, weight_version=rec["weight_version"], gen_id=rec["gen_id"])
 
     def _reap_ready(self) -> None:
@@ -323,30 +329,30 @@ class AsyncARTrainer(ARTrainer):
 
     def _advantage_and_train(
         self,
-        track: RolloutTrack,
-        resp: RolloutResp,
+        sample: Sample,
         *,
         training_progress: float,
         rollout_id: int,
         t0: Optional[float] = None,
     ) -> Tuple[TrainStepResult, float]:
-        """Advantage + optimizer step for a SCORED track (rewards already attached)."""
+        """Advantage + optimizer step for a SCORED ``Sample`` (rewards already attached)."""
         if t0 is None:
             t0 = time.perf_counter()
+        part = sample.parts[-1]
         mean_reward = 0.0
-        if track.rewards is not None:
-            track.rewards = hydrate(track.rewards)
-            mean_reward = float(track.rewards.to(torch.float32).mean().item())
-        track = track.compute_advantages(normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope)
-        (name,) = resp.tracks.keys()  # single-track for now; revisit if multi-track lands
-        resp.tracks[name] = track
+        if part.rewards is not None:
+            part.rewards = hydrate(part.rewards)
+            mean_reward = float(part.rewards.to(torch.float32).mean().item())
+        part = part.compute_advantages(normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope)
+        sample = sample.with_parts([*sample.parts[:-1], part])
+        train_part = part
         if self.balance_shards:
-            track = track.balance_shards(self._train_devices)  # over the TRAIN slab DP size
-        result = self.stack.train_track(track, training_progress=float(training_progress))
+            train_part = part.balance_shards(self._train_devices)  # over the TRAIN slab DP size
+        result = self.stack.train_track(train_part, training_progress=float(training_progress))
         self.wandb_logger.log_rollout_step(
             rollout_id,
             result,
-            resp,
+            sample,
             step_time_s=time.perf_counter() - t0,
             trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
         )
@@ -405,11 +411,12 @@ class AsyncARTrainer(ARTrainer):
             for rollout_id in range(start_rollout, num_rollouts):
                 t0 = time.perf_counter()
                 picked = self._next_batch(rollout_id, interval, M, stale, num_rollouts)
-                track = RolloutTrack.concat([p[0] for p in picked])
-                resp = RolloutResp(tracks={"ar": track})
+                # Reassemble the drained per-prompt group Samples into one batched
+                # Sample [input(P), gen(P*N)] — the inverse of Sample.split.
+                sample = Sample.concat([p[0] for p in picked])
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 result, mean_reward = self._advantage_and_train(
-                    track, resp, training_progress=training_progress, rollout_id=rollout_id, t0=t0
+                    sample, training_progress=training_progress, rollout_id=rollout_id, t0=t0
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
 

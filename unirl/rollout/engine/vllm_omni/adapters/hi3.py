@@ -463,7 +463,10 @@ class Hi3DitRecaptionInputAdapter:
         base_extra = sde_extra_args(diff_params)
         share = bool(getattr(diff_params, "init_same_noise", False))
         recipe_gids = gen_part.group_ids if share else list(gen_part.sample_ids)
-        if recipe_gids:
+        # Driver-x_T opt-out: when disable_driver_xt is set the trainer is not
+        # authoring x_T, so skip the recipe and let the engine use its own RNG
+        # (the per-sample gid slice below is gated on this key being present).
+        if recipe_gids and not bool(getattr(diff_params, "disable_driver_xt", False)):
             base_extra["init_noise_group_ids"] = [str(g) for g in recipe_gids]
             base_extra["init_noise_seed"] = (
                 int(diff_params.seed) if getattr(diff_params, "seed", None) is not None else 0

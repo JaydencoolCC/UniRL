@@ -34,7 +34,7 @@ from unirl.rollout.engine.vllm_omni.utils import (
     texts_from_sample,
 )
 from unirl.types.primitives import Image, Images, Texts
-from unirl.types.sample import Part, Sample
+from unirl.types.sample import Part, Sample, _part_with_field
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
 
@@ -222,6 +222,154 @@ def check_cot_text_chain() -> None:
     _expect_raises(lambda: cot_text_from_sample(bad), ValueError, "cot/prompt count mismatch must raise")
 
 
+def check_root_group_ids() -> None:
+    """``Sample.root_group_ids(i)`` climbs each sample of ``parts[i]`` to its root
+    prompt — coarser than ``Part.group_ids`` (immediate parent). The PE/unified
+    ``compute_track_advantages(group_key="root")`` replacement; the labels stay
+    group-by-parent contiguous for ``Part.compute_advantages(group_ids=...)``."""
+    # P=2 prompts, N=2 AR children each, M=1 image each → [input, ar(4), image(4)].
+    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))
+    ar = inp.fork(2, sampling_params=ARSamplingParams())
+    img = ar.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
+    sample = Sample(parts=[inp, ar, img])
+
+    _check(list(img.sample_ids) == ["p0/0/0", "p0/1/0", "p1/0/0", "p1/1/0"], "image fan-out ids")
+    _check(sample.root_group_ids(2) == ["p0", "p0", "p1", "p1"], "image part grouped by ROOT prompt")
+    _check(img.group_ids == ["p0/0", "p0/1", "p1/0", "p1/1"], "Part.group_ids stays immediate-parent (4 groups)")
+    _check(sample.root_group_ids(0) == ["p0", "p1"], "root part: each prompt is its own group")
+    _check(sample.root_group_ids(1) == ["p0", "p0", "p1", "p1"], "ar part grouped by root prompt")
+
+
+def check_gen_part_accessors() -> None:
+    """``Sample.gen_parts``/``gen_part``/``gen_part_index`` locate stages by
+    ``sampling_params`` TYPE (the migration's part-location convention; mirrors
+    the engine-side ``ar_gen_part``/``diffusion_gen_part``). ``with_parts`` swaps
+    parts while preserving ``reward_compute_s``."""
+    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))
+    ar = inp.fork(2, sampling_params=ARSamplingParams())
+    img = ar.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
+    sample = Sample(parts=[inp, ar, img], reward_compute_s=1.5)
+
+    gps = sample.gen_parts()
+    _check(len(gps) == 2 and gps[0] is ar and gps[1] is img, "gen_parts skips the input Part")
+    _check(sample.gen_part(ARSamplingParams) is ar, "gen_part locates the AR stage by type")
+    _check(sample.gen_part(DiffusionSamplingParams) is img, "gen_part locates the diffusion stage by type")
+    _check(sample.gen_part_index(ARSamplingParams) == 1, "gen_part_index: AR at position 1")
+    _check(sample.gen_part_index(DiffusionSamplingParams) == 2, "gen_part_index: diffusion at position 2")
+
+    # A request with no diffusion stage → clear ValueError, not a bare StopIteration.
+    try:
+        Sample(parts=[inp, ar]).gen_part(DiffusionSamplingParams)
+        raised = False
+    except ValueError:
+        raised = True
+    _check(raised, "gen_part raises ValueError when the stage type is absent")
+
+    # with_parts swaps the parts list but carries reward_compute_s forward.
+    swapped = sample.with_parts([inp, ar])
+    _check(len(swapped.parts) == 2 and swapped.parts[1] is ar, "with_parts replaces the parts list")
+    _check(swapped.reward_compute_s == 1.5, "with_parts preserves reward_compute_s")
+
+
+def check_sample_dp_chunk() -> None:
+    """``Sample.chunk``/``slice``/``select`` shard by whole prompt-TREE (the dp>1
+    rollout-request fix), not by the ``parts`` list — the inherited ``Batch.slice``
+    would slice the length-3 parts list and hand every DP rank the full Sample.
+    Reuses the tree-correct ``split``/``concat``."""
+    inp = Part.input([f"p{i}" for i in range(4)], primitive=Texts(texts=[f"prompt {i}" for i in range(4)]))
+    ar = inp.fork(2, sampling_params=ARSamplingParams())
+    img = ar.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
+    sample = Sample(parts=[inp, ar, img], reward_compute_s=2.0)
+
+    shards = sample.chunk(2)
+    _check(len(shards) == 2, "chunk(2) yields 2 shards")
+    _check([s.parts[0].batch_size for s in shards] == [2, 2], "each shard holds 2 prompt-trees (not the whole batch)")
+    _check([s.parts[1].batch_size for s in shards] == [4, 4], "each shard ar part = 2*N")
+    _check([s.parts[2].batch_size for s in shards] == [4, 4], "each shard image part = 2*N*M")
+    _check(list(shards[0].parts[0].sample_ids) == ["p0", "p1"], "shard 0 = prompts 0,1")
+    _check(
+        list(shards[1].parts[2].sample_ids) == ["p2/0/0", "p2/1/0", "p3/0/0", "p3/1/0"],
+        "image part is tree-sharded (not list-sliced to the whole part)",
+    )
+    rt = Sample.concat(shards)
+    _check(list(rt.parts[2].sample_ids) == list(sample.parts[2].sample_ids), "chunk -> concat round-trips ids")
+    _check(rt.reward_compute_s == 2.0, "chunk -> concat preserves reward_compute_s")
+    _check(list(sample.slice(0, 2).parts[0].sample_ids) == ["p0", "p1"], "slice(0,2) = first 2 trees")
+    _check(
+        list(sample.select(torch.tensor([0, 2])).parts[0].sample_ids) == ["p0", "p2"],
+        "select gathers whole trees by index",
+    )
+
+
+def check_unified_dit_noise_ids_unique() -> None:
+    """The unified DiT sub-request re-roots from the globally-unique image-shell
+    lineage (flatten ``/``), so the engine-derived x_T key stays unique across dp>1
+    replicas; the replica-local ``d{k}`` scheme collides (each shard restarts at 0)."""
+    inp = Part.input([f"r0:p{i}" for i in range(4)], primitive=Texts(texts=[f"prompt {i}" for i in range(4)]))
+    ar = inp.fork(2, sampling_params=ARSamplingParams())
+    img = ar.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
+    shards = Sample(parts=[inp, ar, img]).chunk(2)  # dp=2 — what run_rollout does
+
+    fixed = [sid.replace("/", "_") for s in shards for sid in s.gen_part(DiffusionSamplingParams).sample_ids]
+    _check(len(fixed) == len(set(fixed)), "lineage-derived DiT ids are globally unique across dp shards")
+    old = [f"r0:d{k}" for s in shards for k in range(s.gen_part(DiffusionSamplingParams).batch_size)]
+    _check(len(old) != len(set(old)), "sanity: the old replica-local d{k} scheme DOES collide")
+
+
+def check_advantage_group_ids_recorded() -> None:
+    """``Part.compute_advantages`` records the grouping it used (``advantage_group_ids``)
+    so zero-std metrics bucket by the actual GRPO baseline — including a coarser
+    root-prompt override (PE ``diffusion_group_scope='prompt'``)."""
+    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    ar = inp.fork(2, sampling_params=ARSamplingParams())
+    img = ar.fork(2, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
+    sample = Sample(parts=[inp, ar, img])
+    image = _part_with_field(sample.parts[2], "rewards", torch.arange(8, dtype=torch.float32))  # 8 = P*N*M
+
+    a_def = image.compute_advantages(normalize=True)
+    _check(a_def.advantage_group_ids == list(image.group_ids), "records the immediate-parent grouping by default")
+    root = sample.root_group_ids(2)
+    a_root = image.compute_advantages(normalize=True, group_ids=root)
+    _check(a_root.advantage_group_ids == root, "records the root-scope override grouping")
+    _check(a_root.advantage_group_ids != list(image.group_ids), "root grouping is coarser than immediate group_ids")
+
+
+def check_rollout_metric_naming() -> None:
+    """Multi-stage rollout metrics name the diffusion stage ``diffusion`` (matching
+    the train-side track key), not ``image`` — so PE's ``rollout/*`` and ``train/*``
+    panels correlate."""
+    from unirl.utils.wandb_metrics import compute_rollout_sample_metrics
+
+    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    ar = _part_with_field(inp.fork(2, sampling_params=ARSamplingParams()), "rewards", torch.arange(4, dtype=torch.float32))
+    img = _part_with_field(
+        ar.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256)),
+        "rewards",
+        torch.arange(4, dtype=torch.float32),
+    )
+    m = compute_rollout_sample_metrics(sample=Sample(parts=[inp, ar, img]))
+    _check(any(k.startswith("diffusion_") for k in m), "diffusion stage logs under the 'diffusion_' prefix")
+    _check(not any(k.startswith("image_") for k in m), "no stale 'image_' prefix")
+
+
+def check_disable_driver_xt_flag() -> None:
+    """``DiffusionSamplingParams`` carries the ``disable_driver_xt`` opt-out (default
+    off), settable per-recipe and via ``dataclasses.replace`` (how the unified trainer
+    stamps the env onto the params)."""
+    import dataclasses
+
+    d = DiffusionSamplingParams(num_inference_steps=4, height=256, width=256)
+    _check(d.disable_driver_xt is False, "disable_driver_xt defaults to False")
+    _check(dataclasses.replace(d, disable_driver_xt=True).disable_driver_xt is True, "replace sets the flag")
+    _check(
+        DiffusionSamplingParams(
+            num_inference_steps=4, height=256, width=256, disable_driver_xt=True
+        ).disable_driver_xt
+        is True,
+        "recipe can construct with the flag set",
+    )
+
+
 _CHECKS: Tuple[Callable[[], None], ...] = (
     check_part_extraction,
     check_assemble_sample,
@@ -230,6 +378,13 @@ _CHECKS: Tuple[Callable[[], None], ...] = (
     check_split_concat_roundtrip,
     check_multi_input_image_chain,
     check_cot_text_chain,
+    check_root_group_ids,
+    check_gen_part_accessors,
+    check_sample_dp_chunk,
+    check_unified_dit_noise_ids_unique,
+    check_advantage_group_ids_recorded,
+    check_rollout_metric_naming,
+    check_disable_driver_xt_flag,
 )
 
 

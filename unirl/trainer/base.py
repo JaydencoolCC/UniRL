@@ -2,7 +2,7 @@ import functools
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 def build_sampling_dict(sampling_cfg: DictConfig) -> Dict[str, BaseSamplingParams]:
     """Instantiate a Hydra ``sampling`` config into the modality-keyed runtime dict.
 
-    ``RolloutReq.sampling_params`` is a ``Dict[str, BaseSamplingParams]`` keyed by
-    modality. Two config shapes are accepted so the flat single-modality recipes
-    need no rewrite:
+    The trainer's ``sampling_params`` is a ``Dict[str, BaseSamplingParams]`` keyed
+    by modality (each modality's params ride on its gen Part at request build).
+    Two config shapes are accepted so the flat single-modality recipes need no rewrite:
 
     - **Flat** (``sampling: {_target_: …DiffusionSamplingParams, …}``) — one
       params object, wrapped under its modality key (``"ar"`` for
@@ -222,55 +222,62 @@ class BaseTrainer:
 
     def _drop_decoded(
         self,
-        req: Any,
-        resp: Any,
+        sample: Any,
         *,
         rollout_id: int,
-        media_prompts: Optional[Dict[str, List[str]]] = None,
     ) -> None:
-        """Upload media previews (if due this rollout) then free ``decoded``.
+        """Upload media previews (if due this rollout) then free decoded payloads.
 
         Two jobs at the single pre-train chokepoint every trainer hits — and
-        both FINISH here, so no preview payload (PIL images / raw video
-        tensors) ever rides into the ``train_track`` dispatch (the track is
+        both FINISH here, so no decoded payload (PIL images / raw video tensors)
+        ever rides into the ``train_track`` dispatch (each gen ``Part`` is
         DP_SCATTER-serialized to the training workers right after this call):
 
         1. **Media logging (driver-side).** When the logger wants media this
-           rollout (``UniRLWandBLogger.should_log_media``), take each track's
-           inbound ``media_preview`` (populated upstream by an actor-side
-           collector — none exist today) or build one from the still-live
-           ``decoded`` (``build_media_preview_for_track`` hydrates a single DP
-           shard), cap to ``media_max_items``, and upload it immediately at the
-           same ``rollout/step`` value :meth:`UniRLWandBLogger.log_rollout_step`
-           uses, so the panels align. ``media_prompts`` supplies per-track,
-           sample-aligned captions for multi-track recipes whose ``req`` text is
-           shorter than the expanded track.
-        2. **Free the per-rollout payloads.** ``decoded`` (generated
-           Images/Videos/Texts) is consumed upstream by
-           ``reward.score_and_attach`` and never read by training (which uses
-           only segment/conditions/advantages); ``media_preview`` was just
-           uploaded (or skipped — off-cadence rollouts drop it unlogged).
-           Nulling both on the driver ``resp`` before ``train_track`` releases
-           the driver-held TensorStore handles before the optimizer-step memory
-           peak and keeps the training dispatch free of logging payloads.
+           rollout (``UniRLWandBLogger.should_log_media``), take each gen Part's
+           inbound ``media_preview`` or build one from the still-live
+           ``primitive`` (``build_media_preview_for_part`` hydrates a single DP
+           shard), cap to ``media_max_items``, and upload it at the same
+           ``rollout/step`` value :meth:`UniRLWandBLogger.log_rollout_step` uses,
+           so the panels align. Captions default to the frontier-aligned prompt
+           texts (``Sample.conditioning``).
+        2. **Free the per-rollout payloads.** ``primitive`` (generated
+           Images/Videos/Texts) is consumed upstream by reward scoring and never
+           read by training (which uses only segment/conditions/advantages);
+           ``media_preview`` was just uploaded (or skipped off-cadence). Nulling
+           both on each gen Part before ``train_track`` releases the driver-held
+           TensorStore handles before the optimizer-step memory peak.
 
         Call after scoring / advantages (and any decoded-reading debug dump),
         immediately before dispatching to ``train_track``.
         """
+        from unirl.types.primitives import Images, Texts
+
+        gen_parts = sample.gen_parts()
         wb = self.wandb_logger
         if wb is not None and wb.should_log_media(rollout_id):
-            from unirl.types.media_preview import build_media_preview_for_track
+            from unirl.types.media_preview import build_media_preview_for_part
 
-            prompts_by_track = media_prompts or {}
-            multi = len(resp.tracks) > 1
-            for name, track in resp.tracks.items():
-                preview = track.media_preview
-                if preview is None and track.decoded is not None:
-                    preview = build_media_preview_for_track(
-                        req=req,
-                        track=track,
+            multi = len(gen_parts) > 1
+            # Frontier-aligned conditioning: captions (the prompt Texts) + the
+            # it2i source image (the chained image input Part), row-aligned 1:1
+            # with the frontier gen samples — exactly what the preview pairs.
+            cond = sample.conditioning()
+            default_prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), None)
+            input_image = next((c for c in cond if isinstance(c, Images)), None)
+            for part in gen_parts:
+                name = "ar" if isinstance(part.sampling_params, ARSamplingParams) else "diffusion"
+                preview = part.media_preview
+                if preview is None and part.primitive is not None:
+                    # default_prompts is frontier-aligned (Sample.conditioning), so caption
+                    # only the frontier gen Part; a non-frontier image Part (none today — the
+                    # non-frontier AR Part is text → returns None) would otherwise be paired
+                    # with the wrong-length caption list.
+                    preview = build_media_preview_for_part(
+                        part=part,
                         max_items=wb.media_max_items,
-                        prompts=prompts_by_track.get(name),
+                        prompts=default_prompts if part is sample.parts[-1] else None,
+                        input_image=input_image,
                     )
                 if preview is None:
                     continue
@@ -279,9 +286,9 @@ class BaseTrainer:
                 key = f"rollout/{name}/generated_media" if multi else "rollout/generated_media"
                 wb.log_generated_media(rollout_id + 1, preview, key=key)
 
-        for track in resp.tracks.values():
-            track.decoded = None
-            track.media_preview = None
+        for part in gen_parts:
+            part.primitive = None
+            part.media_preview = None
 
     def _finish_wandb(self) -> None:
         """Close the wandb run if one is open."""

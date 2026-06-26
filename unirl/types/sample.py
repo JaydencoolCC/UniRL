@@ -73,6 +73,11 @@ class Part(Batch):
     rewards: Optional[torch.Tensor] = concat_field(default=None)
     component_rewards: Optional[Dict[str, torch.Tensor]] = concat_field(default=None)
     advantages: Optional[torch.Tensor] = concat_field(default=None)
+    # Per-sample grouping labels the GRPO advantages were computed under (recorded
+    # by :meth:`compute_advantages`). May be COARSER than ``group_ids`` (e.g. a
+    # root-prompt scope passes ``Sample.root_group_ids``), so metrics that bucket
+    # by the advantage baseline must read this, not the immediate-parent ``group_ids``.
+    advantage_group_ids: Optional[List[str]] = concat_field(default=None)
     status: Optional[torch.Tensor] = concat_field(default=None)
 
     metadata: List[Dict[str, Any]] = concat_field(default_factory=list)
@@ -313,7 +318,11 @@ class Part(Batch):
             adv = (reshaped - mean) / std
         else:
             adv = reshaped - mean
-        return _part_with_field(self, "advantages", adv.flatten())
+        # Record the grouping the advantages were computed under so reward/zero-std
+        # metrics bucket by the actual GRPO baseline (which may be coarser than
+        # ``group_ids`` when a ``group_ids`` override is passed, e.g. root scope).
+        result = _part_with_field(self, "advantages", adv.flatten())
+        return _part_with_field(result, "advantage_group_ids", list(group_labels))
 
 
 def _part_with_field(part: Part, field_name: str, value: Any) -> Part:
@@ -405,23 +414,21 @@ class Sample(Batch):
         if not root_gids:
             return [self]
 
-        # Root-group label per sample, propagated forward along the chain (parent =
-        # preceding part): head is its own group; each child inherits its parent's
-        # label, located by parent id (position-independent).
-        per_part_root_groups: List[List[str]] = []
-        for i, part in enumerate(self.parts):
-            if part.is_root:
-                per_part_root_groups.append(list(part.group_ids))
-            else:
-                prev_part = self.parts[i - 1]
-                sid_to_grp = dict(zip(prev_part.sample_ids, per_part_root_groups[-1]))
-                per_part_root_groups.append([sid_to_grp[parent_id(sid)] for sid in part.sample_ids])
+        per_part_root_groups = self._root_groups_per_part()
+        # One pass per part: bucket sample indices by root-group label (was an
+        # O(num_groups x batch) rescan of each part's labels for every group).
+        per_part_buckets: List[Dict[str, List[int]]] = []
+        for labels in per_part_root_groups:
+            buckets: Dict[str, List[int]] = {}
+            for k, rg in enumerate(labels):
+                buckets.setdefault(rg, []).append(k)
+            per_part_buckets.append(buckets)
 
         results: List["Sample"] = []
         for rgid in dict.fromkeys(root_gids):
             shard_parts: List[Part] = []
             for i, part in enumerate(self.parts):
-                indices = [k for k, rg in enumerate(per_part_root_groups[i]) if rg == rgid]
+                indices = per_part_buckets[i].get(rgid)
                 if not indices:
                     raise RuntimeError(
                         f"Sample.split: part {i} has no samples in root group {rgid!r}; lineage tree is malformed."
@@ -429,6 +436,89 @@ class Sample(Batch):
                 shard_parts.append(part.select(torch.tensor(indices, dtype=torch.long)))
             results.append(type(self)(parts=shard_parts))
         return results
+
+    def _root_groups_per_part(self) -> List[List[str]]:
+        """Root-prompt group label for every sample of every part.
+
+        Propagated forward along the chain (parent = preceding part): the head is
+        its own group; each child inherits its parent's label, located by parent id
+        (position-independent). Assumes a unique root head — the chain invariant
+        :meth:`__post_init__` enforces."""
+        per_part: List[List[str]] = []
+        for i, part in enumerate(self.parts):
+            if part.is_root:
+                per_part.append(list(part.group_ids))
+            else:
+                prev_part = self.parts[i - 1]
+                sid_to_grp = dict(zip(prev_part.sample_ids, per_part[-1]))
+                per_part.append([sid_to_grp[parent_id(sid)] for sid in part.sample_ids])
+        return per_part
+
+    def root_group_ids(self, part_index: int) -> List[str]:
+        """Root-prompt group label per sample of ``parts[part_index]`` — its lineage
+        climbed to the root part.
+
+        Groups a descendant Part by the prompt it descends from (coarser than its
+        immediate parent) for GRPO — the replacement for the old
+        ``RolloutResp.compute_track_advantages(group_key="root")``. The labels stay
+        group-by-parent contiguous (the lineage keeps a prompt's samples
+        consecutive), as :meth:`Part.compute_advantages` ``group_ids`` requires."""
+        if not self.parts:
+            return []
+        return self._root_groups_per_part()[part_index]
+
+    def gen_parts(self) -> List[Part]:
+        """The generated (non-input) Parts — those carrying ``sampling_params``.
+        Input Parts (the prompt head and any :meth:`Part.input_child`) have
+        ``sampling_params is None`` and are skipped."""
+        return [p for p in self.parts if p.sampling_params is not None]
+
+    def gen_part(self, params_type: type) -> Part:
+        """The first gen Part whose ``sampling_params`` is an instance of
+        ``params_type`` (e.g. ``ARSamplingParams`` / ``DiffusionSamplingParams``)
+        — locating a stage by TYPE, not position (the migration's convention;
+        mirrors the engine-side ``ar_gen_part`` / ``diffusion_gen_part`` readers)."""
+        for p in self.parts:
+            if isinstance(p.sampling_params, params_type):
+                return p
+        raise ValueError(f"Sample.gen_part: no Part with sampling_params of type {params_type.__name__}")
+
+    def gen_part_index(self, params_type: type) -> int:
+        """Index of :meth:`gen_part` — for write-back (e.g. replacing a Part with
+        its advantage-filled version via :meth:`with_parts`)."""
+        for i, p in enumerate(self.parts):
+            if isinstance(p.sampling_params, params_type):
+                return i
+        raise ValueError(f"Sample.gen_part_index: no Part with sampling_params of type {params_type.__name__}")
+
+    def with_parts(self, parts: List[Part]) -> "Sample":
+        """A copy carrying replacement ``parts`` but the same ``reward_compute_s``
+        — the idiom for swapping in advantage-filled Parts without dropping the
+        accumulated reward-compute time."""
+        return type(self)(parts=list(parts), reward_compute_s=self.reward_compute_s)
+
+    def slice(self, start: int, end: int) -> "Sample":
+        """Shard ``[start, end)`` along the batch dim (the P root prompts) by whole
+        prompt-TREE, not by the ``parts`` list.
+
+        A ``Sample``'s batch dim is its P root prompts, but its only CONCAT field
+        is ``parts`` (length = #stages, 2-3) — so the inherited ``Batch.slice``
+        would wrongly slice the parts list and hand every shard the full Sample.
+        Route through :meth:`split`/:meth:`concat` so each shard holds whole prompt
+        subtrees across all parts. This is the hook ``@distributed(DP_SCATTER)``
+        (via ``Batch.chunk`` -> ``slice``) and trainside micro-batching rely on."""
+        picked = self.split()[start:end]
+        parts = Sample.concat(picked).parts if picked else []
+        return type(self)(parts=parts, reward_compute_s=self.reward_compute_s)
+
+    def select(self, indices: "torch.Tensor") -> "Sample":
+        """Gather whole root prompt-trees by index (shuffle / subsample), mirroring
+        :meth:`slice`'s tree-sharding rather than the inherited parts-list select."""
+        groups = self.split()
+        idx = indices.tolist() if hasattr(indices, "tolist") else list(indices)
+        picked = [groups[int(i)] for i in idx]
+        parts = Sample.concat(picked).parts if picked else []
+        return type(self)(parts=parts, reward_compute_s=self.reward_compute_s)
 
     def fork(
         self,

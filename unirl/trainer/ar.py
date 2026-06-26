@@ -12,7 +12,7 @@ from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.prompts import RolloutInputs
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Part, Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -105,28 +105,40 @@ class ARTrainer(BaseTrainer):
             if sync_cfg is not None:
                 self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
 
-    def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
-        """Turn a data source batch into a typed :class:`RolloutReq`.
+    def _build_request_sample(
+        self,
+        inputs: RolloutInputs,
+        rollout_id: int,
+        *,
+        sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+    ) -> Sample:
+        """Turn a data source batch into a request :class:`Sample`.
 
-        Expands ``inputs`` by ``total_samples_per_prompt(sampling_params)`` so
-        each prompt produces an N-sample GRPO group (sibling samples consecutive).
-        AR sampling params ride to the engine untouched — there is no SDE step
-        schedule to resolve (that is the diffusion trainer's job).
+        The ``P`` prompts become a root text input Part — ids rollout-keyed
+        (``r{rollout_id}:…``) so each rollout is its own provenance — and
+        ``Part.fork`` fans out the AR gen shell to the ``N``-sample GRPO group
+        (replacing the old ``inputs.expand``; siblings stay consecutive). A VLM
+        recipe chains the image input off the prompt via ``Part.input_child``.
+        AR params ride on the gen Part — no SDE schedule to resolve (that is the
+        diffusion trainer's job). ``sampling`` overrides the dict (``evaluate``
+        passes its own); ``None`` uses ``self.sampling_params``.
         """
-        inputs = inputs.expand(total_samples_per_prompt(self.sampling_params))
-        req = RolloutReq(
-            sample_ids=list(inputs.sample_ids),
-            group_ids=list(inputs.group_ids),
-            primitives=dict(inputs.primitives),
-            request_conditions={},
-            sampling_params=self.sampling_params,
-            metadata=list(inputs.metadata) if inputs.metadata else [],
+        sp = sampling if sampling is not None else self.sampling_params
+        root_ids = [f"r{rollout_id}:{sid}" for sid in inputs.sample_ids]
+        text = Part.input(
+            root_ids,
+            primitive=inputs.primitives["text"],
+            metadata=list(inputs.metadata) if inputs.metadata else None,
         )
-        return req
+        input_parts = [text]
+        image_prim = inputs.primitives.get("image")
+        if image_prim is not None:
+            input_parts.append(text.input_child(image_prim))
+        return Sample.request(*input_parts).fork(total_samples_per_prompt(sp), sampling_params=sp.get("ar"))
 
     def train_step(
         self,
-        req: RolloutReq,
+        sample: Sample,
         *,
         training_progress: float = 0.0,
         sync_weights: bool = False,
@@ -135,48 +147,44 @@ class ARTrainer(BaseTrainer):
         """One ``rollout → reward → advantage → optimizer step`` pass.
 
         Returns ``(train_result, mean_reward)`` — the mean unnormalized
-        per-sample reward of the single track (0.0 if none), for the log line.
-        ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
+        per-sample reward of the frontier gen Part (0.0 if none), for the log
+        line. ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
         self.rollout.wake_up()
         if sync_weights and self.weight_sync is not None:
             self.weight_sync.sync()
-        resp = self.rollout.generate(req)
+        sample = self.rollout.generate(sample)
         self.rollout.sleep()
 
-        for name, track in list(resp.tracks.items()):
-            if track.segment is not None:
-                resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
+        # Score the frontier gen Part (Sample -> Sample; the reward service is
+        # migrated alongside on its own branch — see the LIN-480 plan).
+        sample = self.reward.score_and_attach(sample)
 
+        part = sample.parts[-1]
         mean_reward = 0.0
-        for track in resp.tracks.values():
-            if track.rewards is None:
-                continue
+        if part.rewards is not None:
             # Hydrate in place so the wandb reward/advantage stats reuse this
             # fetch instead of re-pulling the TensorRef from the worker.
-            track.rewards = hydrate(track.rewards)
-            mean_reward = float(track.rewards.to(torch.float32).mean().item())
-            break  # single-track for now; revisit if multi-track lands
+            part.rewards = hydrate(part.rewards)
+            mean_reward = float(part.rewards.to(torch.float32).mean().item())
+            part = part.compute_advantages(
+                normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope
+            )
+            sample = sample.with_parts([*sample.parts[:-1], part])
 
-        for name, track in list(resp.tracks.items()):
-            if track.rewards is not None:
-                resp.tracks[name] = track.compute_advantages(
-                    normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope
-                )
-
-        self._dump_rollout_samples(req, resp, rollout_id)
-        self._drop_decoded(req, resp, rollout_id=rollout_id)
-        (track,) = resp.tracks.values()
+        self._dump_rollout_samples(sample, rollout_id)
+        self._drop_decoded(sample, rollout_id=rollout_id)
+        train_part = sample.parts[-1]
         # verl balance_batch parity: reorder so each DP shard gets a near-equal
         # token load before DP_SCATTER (no-op when already balanced).
         if self.balance_shards:
-            track = track.balance_shards(int(self.num_devices))
-        result = self.stack.train_track(track, training_progress=float(training_progress))
+            train_part = train_part.balance_shards(int(self.num_devices))
+        result = self.stack.train_track(train_part, training_progress=float(training_progress))
         self.wandb_logger.log_rollout_step(
             rollout_id,
             result,
-            resp,
+            sample,
             step_time_s=time.perf_counter() - t0,
             trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
         )
@@ -194,35 +202,25 @@ class ARTrainer(BaseTrainer):
         import dataclasses
 
         eval_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
-        inputs = eval_inputs.expand(self.eval_samples_per_prompt)
         eval_ar = dataclasses.replace(
             self.sampling_params.get("ar"),
             samples_per_prompt=self.eval_samples_per_prompt,
             temperature=self.eval_temperature,
         )
         eval_sp = {**self.sampling_params, "ar": eval_ar}
-        req = RolloutReq(
-            sample_ids=list(inputs.sample_ids),
-            group_ids=list(inputs.group_ids),
-            primitives=dict(inputs.primitives),
-            request_conditions={},
-            sampling_params=eval_sp,
-            metadata=list(inputs.metadata) if inputs.metadata else [],
-        )
+        sample = self._build_request_sample(eval_inputs, rollout_id, sampling=eval_sp)
         self.rollout.wake_up()
         if self.weight_sync is not None:
             self.weight_sync.sync()
-        resp = self.rollout.generate(req)
+        sample = self.rollout.generate(sample)
         self.rollout.sleep()
 
+        sample = self.reward.score_and_attach(sample)
+        part = sample.parts[-1]
         acc = 0.0
-        for track in resp.tracks.values():
-            if track.segment is not None:
-                track = self.reward.score_and_attach(req=req, track=track)
-            if track.rewards is not None:
-                track.rewards = hydrate(track.rewards)
-                acc = float(track.rewards.to(torch.float32).mean().item())
-                break  # single-track for now; revisit if multi-track lands
+        if part.rewards is not None:
+            part.rewards = hydrate(part.rewards)
+            acc = float(part.rewards.to(torch.float32).mean().item())
         logger.info(
             "EVAL rollout %d  eval_acc(avg@%d over %d prompts)=%.4f",
             rollout_id + 1,
@@ -233,7 +231,7 @@ class ARTrainer(BaseTrainer):
         self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc})
         return acc
 
-    def _dump_rollout_samples(self, req, resp, rollout_id: int) -> None:
+    def _dump_rollout_samples(self, sample, rollout_id: int) -> None:
         """Debug dump of the first N (prompt, output, reward) triples per rollout.
 
         Off unless ``ROLLOUT_DUMP_DIR`` is set (driver-side env). Writes one
@@ -249,11 +247,16 @@ class ARTrainer(BaseTrainer):
         if not out_dir:
             return
         try:
+            from unirl.types.primitives import Texts
+
             n = int(os.environ.get("ROLLOUT_DUMP_N", "4"))
-            prompts = getattr(req.primitives.get("text"), "texts", None) or []
-            (track,) = resp.tracks.values()
-            outputs = getattr(track.decoded, "texts", None) or []
-            rewards = track.rewards.to(torch.float32).tolist() if track.rewards is not None else []
+            # Prompts row-aligned to the frontier samples (the lineage walk
+            # expands the P prompts to the P*N gen samples).
+            cond = sample.conditioning()
+            prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), [])
+            part = sample.parts[-1]
+            outputs = getattr(part.primitive, "texts", None) or []
+            rewards = part.rewards.to(torch.float32).tolist() if part.rewards is not None else []
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"rollout_{int(rollout_id):04d}.jsonl")
             with open(path, "w", encoding="utf-8") as f:
@@ -317,7 +320,7 @@ class ARTrainer(BaseTrainer):
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
-                req = self._build_req(inputs, rollout_id)
+                sample = self._build_request_sample(inputs, rollout_id)
                 # Sync before generate; skip step 0 (nothing trained yet). On
                 # resume, force the first sync — the engine booted with fresh
                 # weights and needs the restored adapter before generate.
@@ -325,7 +328,7 @@ class ARTrainer(BaseTrainer):
                     resumed and rollout_id == start_rollout
                 )
                 result, mean_reward = self.train_step(
-                    req,
+                    sample,
                     training_progress=training_progress,
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,
