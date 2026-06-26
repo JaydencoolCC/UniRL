@@ -64,11 +64,16 @@ class TensorWeightSync(FullWeightSync):
         """
         import torch
 
-        from unirl.distributed.weight_sync.transfer.sgl_compat import (
-            FlattenedTensorBucket,
-            MultiprocessingSerializer,
-            monkey_patch_torch_reductions,
-        )
+        # Use sglang's NATIVE serializer (not unirl's vendored sgl_compat copy):
+        # sglang 0.5.12's SafeUnpickler (CVE-2025-10164 guard) runs in the SRT
+        # scheduler subprocess and allowlists only its own classes, so a payload
+        # referencing unirl.* (vendored FlattenedTensorBucket / rebuild_cuda_tensor)
+        # is rejected at update_weights_from_tensor. sglang's native classes carry
+        # the same device-UUID IPC mapping and are on its allowlist. Mirrors what
+        # the sglang_diffusion engine already does (LIN-365 _patches).
+        from sglang.srt.utils.common import MultiprocessingSerializer
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
         monkey_patch_torch_reductions()
 
