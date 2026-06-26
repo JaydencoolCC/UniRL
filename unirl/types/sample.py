@@ -467,6 +467,24 @@ class Sample(Batch):
             return []
         return self._root_groups_per_part()[part_index]
 
+    def root_metadata(self, part_index: int = -1) -> List[Optional[Dict[str, Any]]]:
+        """Root Part's per-sample metadata aligned to ``parts[part_index]`` rows.
+
+        Input metadata (e.g. geneval specs) is authored once on the prompt — the
+        root input Part's ``metadata`` — so scoring a descendant Part needs it
+        projected onto that Part's samples. Walks the lineage exactly like
+        :meth:`root_group_ids` (a root group label *is* the root sample id), then
+        looks the root row up by id. Returns ``[None] * batch_size`` when the root
+        carries no metadata."""
+        if not self.parts:
+            return []
+        n = self.parts[part_index].batch_size
+        root = self.parts[0]
+        if not root.metadata:
+            return [None] * n
+        by_root_id = dict(zip(root.sample_ids, root.metadata))
+        return [by_root_id.get(rgid) for rgid in self.root_group_ids(part_index)]
+
     def gen_parts(self) -> List[Part]:
         """The generated (non-input) Parts — those carrying ``sampling_params``.
         Input Parts (the prompt head and any :meth:`Part.input_child`) have

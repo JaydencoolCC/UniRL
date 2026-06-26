@@ -292,6 +292,26 @@ def _cumsum(values: List[int]) -> List[int]:
     return out
 
 
+def primitive_modality_key(prim: Texts | Images | Videos | Audios) -> str:
+    """Map a batched primitive to its modality slot key.
+
+    ``Texts -> "text"``, ``Images -> "image"``, ``Videos -> "video"``,
+    ``Audios -> "audio"`` — the keying convention shared by
+    ``RewardRequest.primitives`` / ``generated`` and the slots
+    :meth:`Sample.conditioning` surfaces. Inverse of a backend's
+    ``preferred_input_kind``.
+    """
+    if isinstance(prim, Texts):
+        return "text"
+    if isinstance(prim, Images):
+        return "image"
+    if isinstance(prim, Videos):
+        return "video"
+    if isinstance(prim, Audios):
+        return "audio"
+    raise TypeError(f"primitive_modality_key: unknown primitive type {type(prim).__name__!r}")
+
+
 __all__ = [
     "Audio",
     "Audios",
@@ -304,4 +324,5 @@ __all__ = [
     "Texts",
     "Video",
     "Videos",
+    "primitive_modality_key",
 ]

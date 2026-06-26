@@ -22,15 +22,15 @@ class RewardType(Enum):
 class RewardRequest:
     """Request for reward computation.
 
-    Two typed primitive dicts mirror the ``RolloutReq`` contract:
+    Two typed primitive dicts describe one scoring unit:
 
     ``primitives``
-        Input context — what was fed to the model.  Copied from
-        ``RolloutReq.primitives``.  Typical keys: ``"text"`` (prompt
-        ``Texts``), ``"image"`` (conditioning ``Images``).
+        Input context — what was fed to the model. From the scored
+        ``Sample``'s conditioning (its ancestor input Parts). Typical keys:
+        ``"text"`` (prompt ``Texts``), ``"image"`` (conditioning ``Images``).
 
     ``generated``
-        Model output being scored — from ``RolloutTrack.decoded``.
+        Model output being scored — the frontier ``Part``'s ``primitive``.
         Typical keys: ``"image"`` (generated ``Images``), ``"video"``
         (generated ``Videos``), ``"text"`` (generated ``Texts``).
 
