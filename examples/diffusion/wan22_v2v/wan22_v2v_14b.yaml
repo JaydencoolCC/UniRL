@@ -165,6 +165,9 @@ logging:
   run_name: ${oc.env:WANDB_RUN_NAME,wan22_v2v}
   entity: ${oc.env:WANDB_ENTITY,null}
   tags: ["wan22", "wan2", "v2v", "grpo", "video", "pickscore", "dual-transformer", "trainside"]
-  log_media: false
-  media_max_items: 8
-  media_log_interval: 1
+  # Log a couple of generated clips to W&B so RL progress is eyeballable, while
+  # keeping storage tiny: 2 short videos every 25 rollouts (raise interval / lower
+  # max_items for less, or interval=1 to see every rollout).
+  log_media: true
+  media_max_items: 2
+  media_log_interval: 25
