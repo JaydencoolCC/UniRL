@@ -21,11 +21,14 @@ from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
 
 def texts_from_sample(sample: Sample) -> Texts:
-    """The input ``Part``'s prompt ``Texts``, asserted to match the gen count.
+    """The input ``Part``'s prompt ``Texts``, tiled to the gen-sample count.
 
-    ``vllm_omni`` runs ``num_outputs_per_prompt=1`` (the caller pre-expands),
-    so the frontier gen shell holds one sample per prompt — the same count as
-    the input primitive.
+    ``vllm_omni`` runs ``num_outputs_per_prompt=1`` — one engine output per gen
+    sample — so the prompts must align 1:1 with the frontier gen shell. The
+    request keeps the input ``Part`` un-fanned (one prompt per group); the gen
+    shell fans out ``samples_per_prompt`` via :meth:`Sample.fork`, group-by-parent
+    contiguous. So tile each prompt across its gen siblings here. A request that
+    is already 1:1 (no fan-out) is returned unchanged.
     """
     texts = sample.parts[0].primitive
     if not isinstance(texts, Texts):
@@ -33,10 +36,16 @@ def texts_from_sample(sample: Sample) -> Texts:
             f"input Part.primitive must be Texts; got "
             f"{type(texts).__name__ if texts is not None else 'None'}"
         )
+    n_prompt = len(texts.texts)
     n_gen = len(sample.parts[-1].sample_ids)
-    if len(texts.texts) != n_gen:
-        raise ValueError(f"prompt count {len(texts.texts)} != gen sample count {n_gen}")
-    return texts
+    if n_prompt == n_gen:
+        return texts
+    if n_prompt == 0 or n_gen % n_prompt != 0:
+        raise ValueError(
+            f"prompt count {n_prompt} does not evenly tile to gen sample count {n_gen}"
+        )
+    branch = n_gen // n_prompt
+    return Texts(texts=[t for t in texts.texts for _ in range(branch)])
 
 
 def diffusion_gen_part(sample: Sample) -> Optional[Part]:
