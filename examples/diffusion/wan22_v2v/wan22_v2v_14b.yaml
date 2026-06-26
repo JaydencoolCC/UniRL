@@ -102,7 +102,11 @@ reward:
       device: auto
       processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
       model_id: yuvalkirstain/PickScore_v1
-      lambda_source: 1.0
+      # text-vs-source terms share the PickScore scale, so lambda_source is a
+      # scale-invariant weight; 0.25 keeps target-alignment dominant. source_sim_floor
+      # caps the "diverge from source" reward to curb reward-hacking/instability.
+      lambda_source: 0.25
+      source_sim_floor: 0.3
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO

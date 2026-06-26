@@ -52,10 +52,17 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
     input_kind = "video"
 
     def __init__(self, *, config: "VideoCLIPDeltaSpec", base_device: str) -> None:
-        self.lambda_source = float(getattr(config, "lambda_source", 1.0))
+        self.lambda_source = float(getattr(config, "lambda_source", 0.25))
         # Score K evenly-spaced frames (not just the first) so the edit reward
         # reflects the whole clip rather than a single-frame proxy.
         self.num_score_frames = max(1, int(getattr(config, "num_score_frames", 3)))
+        # Cap on the source-divergence reward: clamp the edited-vs-source CLIP
+        # cosine to this floor so once a frame is "different enough" there is no
+        # further reward for diverging more. This bounds the penalty's
+        # contribution and zeroes its gradient past the floor, which stops the
+        # reward-hacking failure mode where the policy destroys content just to
+        # look maximally unlike the source.
+        self.source_sim_floor = float(getattr(config, "source_sim_floor", 0.3))
         super().__init__(config=config, base_device=base_device)
 
     # ------------------------------------------------------------------
@@ -151,8 +158,12 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
                 text_emb = self._embed_texts(p).repeat_interleave(k, dim=0)  # [nb*k, d]
 
                 # Per-frame cosines, averaged over the k frames of each video.
-                text_align = (scale * (text_emb * edited_emb).sum(dim=-1)).view(nb, k).mean(dim=1)
-                source_sim = (scale * (edited_emb * source_emb).sum(dim=-1)).view(nb, k).mean(dim=1)
+                text_cos = (text_emb * edited_emb).sum(dim=-1)
+                # Cap the source-divergence reward: clamp the cosine from below so
+                # diverging past the floor earns nothing more (and gets no gradient).
+                source_cos = (edited_emb * source_emb).sum(dim=-1).clamp(min=self.source_sim_floor)
+                text_align = (scale * text_cos).view(nb, k).mean(dim=1)
+                source_sim = (scale * source_cos).view(nb, k).mean(dim=1)
 
                 reward = text_align - self.lambda_source * source_sim
                 rewards.extend(reward.float().cpu().tolist())
@@ -163,14 +174,21 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
 class VideoCLIPDeltaSpec(BaseRewardComponentSpec):
     """Typed config for the VideoCLIPDelta reward component.
 
-    Mirrors ``VideoPickScoreSpec`` plus ``lambda_source`` — the weight on the
-    "still looks like the source" penalty. Higher pushes the policy to change
-    more from the condition video; lower keeps it closer to the source.
+    Mirrors ``VideoPickScoreSpec`` plus the edit-delta knobs:
+
+    - ``lambda_source`` — weight on the "still looks like the source" penalty
+      (both terms share the PickScore scale, so this is scale-invariant). Higher
+      pushes the policy to change more from the condition video; lower keeps it
+      closer to the source.
+    - ``source_sim_floor`` — floor on the edited-vs-source CLIP cosine; diverging
+      past it earns no extra reward (caps the penalty / kills its runaway gradient).
+    - ``num_score_frames`` — number of evenly-spaced frames scored per clip.
     """
 
     batch_size: int = 8
     device: str = "auto"
     processor_id: str = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
     model_id: str = "yuvalkirstain/PickScore_v1"
-    lambda_source: float = 1.0
+    lambda_source: float = 0.25
+    source_sim_floor: float = 0.3
     num_score_frames: int = 3
