@@ -1,4 +1,4 @@
-"""BagelPipeline — RolloutReq → RolloutResp end-to-end for BAGEL-7B-MoT (T2I / it2i).
+"""BagelPipeline — ``Sample → Sample`` end-to-end for BAGEL-7B-MoT (T2I / it2i).
 
 Four-tier flow, per-sample (navit ``bs=1``)::
 
@@ -7,11 +7,11 @@ Four-tier flow, per-sample (navit ``bs=1``)::
 Also serves the text-out modes (t2t / i2t / it2t, via :class:`BagelARStage`) and
 the composed **t2ti** (native think-then-generate: the AR und path plans a
 ``<think>`` caption, then diffusion generates conditioned on it — one bundle, two
-linked tracks).
+linked gen Parts).
 
-Task routing (``_resolve_task``): explicit ``req.stage_config["task"]`` wins;
-else both ``ar`` + ``diffusion`` sampling entries ⇒ ``t2ti``; ``ar`` only ⇒
-text-out; an ``Images`` input ⇒ ``it2i`` (editing), else ``t2i``.
+Task routing (``_resolve_task``): explicit ``sample.parts[0].control["task"]`` wins;
+else both ``ar`` + ``diffusion`` gen Parts ⇒ ``t2ti``; an ``ar`` gen Part only ⇒
+text-out; a chained ``Images`` input ⇒ ``it2i`` (editing), else ``t2i``.
 
 Per prompt the pipeline builds the three KV-cache contexts the sampler needs
 (mirroring ``InterleaveInferencer.interleave_inference``, ``think=False``;
@@ -27,9 +27,9 @@ into one batched ``LatentSegment``, decodes them, and packs one ``"image"`` trac
 
 Central-runtime contract (same as SD3 — NOT a flow_grpo port):
 
-- **σ schedule**: the hosting engine pins ``req.sigmas`` via
-  :func:`unirl.sde.runtime.ensure_req_sigmas` (built from :meth:`build_schedule_policy`)
-  BEFORE ``generate``; this pipeline reads it verbatim and passes it to ``diffuse``.
+- **σ schedule**: the hosting engine pins the σ schedule onto the diffusion gen
+  Part's ``DiffusionSamplingParams.sigmas`` (built from :meth:`build_schedule_policy`)
+  BEFORE ``generate``; this pipeline reads ``params.sigmas`` verbatim and passes it to ``diffuse``.
 - **initial noise x_T**: driver-authored via :class:`NoiseRecipe` (per-sample,
   ``r{rollout_id}:{sample_id}``-keyed, byte-identical across engines). The pipeline
   resolves it from the request and hands each sample its slice; :meth:`latent_shape`
@@ -54,8 +54,8 @@ from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
 from unirl.sde.runtime import FlowMatchSchedulePolicy
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
+from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 from unirl.types.segments.latent import LatentSegment
 from unirl.types.segments.text import TextSegment
 
@@ -142,9 +142,10 @@ class BagelPipeline(Pipeline):
     def build_schedule_policy(self) -> FlowMatchSchedulePolicy:
         """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting).
 
-        The hosting engine calls this once and pins ``req.sigmas`` via
-        ``ensure_req_sigmas``; ``get_sigma_schedule(num_inference_steps, shift)`` then
-        produces the byte-identical schedule the (former) ``bagel_timesteps`` did.
+        The hosting engine calls this once and pins the gen Part's
+        ``DiffusionSamplingParams.sigmas``; ``get_sigma_schedule(num_inference_steps,
+        shift)`` then produces the byte-identical schedule the (former)
+        ``bagel_timesteps`` did.
         """
         return FlowMatchSchedulePolicy.static_only(float(self.shift))
 
@@ -177,17 +178,18 @@ class BagelPipeline(Pipeline):
 
         return self.bundle.vae_transform.resize_transform(pil_img2rgb(image))
 
-    def _extract_input_images(self, req: RolloutReq, task: str, *, n_prompts: Optional[int]) -> List[Any]:
+    def _extract_input_images(self, conditioning: List[Any], task: str, *, n_prompts: Optional[int]) -> List[Any]:
         """Validated per-sample input PILs for image-input tasks (it2i / i2t / it2t).
 
-        Requires an ``Images`` primitive, a ViT-loaded bundle (``enable_vit``),
-        and — when prompts are present — a matching per-sample count.
+        Requires an ``Images`` primitive in the conditioning chain, a ViT-loaded
+        bundle (``enable_vit``), and — when prompts are present — a matching
+        per-sample count.
         """
-        images_prim = req.primitives.get("image")
+        images_prim = next((c for c in conditioning if isinstance(c, Images)), None)
         if not isinstance(images_prim, Images):
             raise TypeError(
-                f"BagelPipeline.generate ({task}): req.primitives['image'] must be Images, "
-                f"got {type(images_prim).__name__ if images_prim is not None else 'None'}"
+                f"BagelPipeline.generate ({task}): expected an Images input in sample.conditioning(), "
+                f"found none"
             )
         if getattr(self.bundle.model, "vit_model", None) is None:
             raise ValueError(
@@ -267,58 +269,61 @@ class BagelPipeline(Pipeline):
         return gen, cfg_text, cfg_img
 
     @staticmethod
-    def _resolve_task(req: RolloutReq) -> str:
-        """Resolve the task mode: explicit ``stage_config["task"]`` wins, else infer.
+    def _resolve_task(sample: Sample) -> str:
+        """Resolve the task mode: explicit ``parts[0].control["task"]`` wins, else infer.
 
-        Inference from the modality-keyed ``sampling_params`` dict: both
-        ``"ar"`` + ``"diffusion"`` ⇒ ``t2ti`` (think-then-generate); ``"ar"``
-        only ⇒ text-out (``it2t`` with an ``Images`` input, else ``t2t``; pure
-        ``i2t`` — image, no prompt — must be explicit); ``"diffusion"`` only ⇒
-        image-out (``it2i`` with an ``Images`` input, else ``t2i``).
+        Inference from the pre-forked gen Parts + chained inputs: both an ``ar`` +
+        a ``diffusion`` gen Part ⇒ ``t2ti`` (think-then-generate); an ``ar`` gen
+        Part only ⇒ text-out (``it2t`` with an ``Images`` input, else ``t2t``; pure
+        ``i2t`` — image, no prompt — must be explicit); a ``diffusion`` gen Part
+        only ⇒ image-out (``it2i`` with an ``Images`` input, else ``t2i``).
         """
-        task = req.stage_config.get("task")
+        task = (sample.parts[0].control or {}).get("task")
         if task is not None:
             return str(task)
-        sp = req.sampling_params
-        if "ar" in sp and "diffusion" in sp:
+        has_ar = any(isinstance(p.sampling_params, ARSamplingParams) for p in sample.parts)
+        has_diff = any(isinstance(p.sampling_params, DiffusionSamplingParams) for p in sample.parts)
+        has_image = any(isinstance(p.primitive, Images) for p in sample.parts[:-1])
+        if has_ar and has_diff:
             return "t2ti"
-        has_image = isinstance(req.primitives.get("image"), Images)
-        if "ar" in sp:
+        if has_ar:
             return "it2t" if has_image else "t2t"
         return "it2i" if has_image else "t2i"
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Dispatch on the resolved task and pack one track per request."""
-        task = self._resolve_task(req)
+    def generate(self, sample: Sample) -> Sample:
+        """Dispatch on the resolved task and fill the gen Part(s)."""
+        task = self._resolve_task(sample)
         if task in ("t2i", "it2i"):
-            return self._generate_image(req, task)
+            return self._generate_image(sample, task)
         if task in ("t2t", "i2t", "it2t"):
-            return self._generate_text(req, task)
+            return self._generate_text(sample, task)
         if task == "t2ti":
-            return self._generate_t2ti(req)
+            return self._generate_t2ti(sample)
         raise ValueError(
             f"BagelPipeline.generate: unsupported task {task!r}; "
             "expected one of 't2i', 'it2i', 't2t', 'i2t', 'it2t', 't2ti'."
         )
 
-    def _generate_image(self, req: RolloutReq, task: str) -> RolloutResp:
-        """Run BAGEL image-out (t2i / it2i) per-sample and pack one ``"image"`` track."""
-        if req.sigmas is None:
-            raise ValueError(
-                "BagelPipeline.generate: req.sigmas is None. The hosting engine must call "
-                "unirl.sde.runtime.ensure_req_sigmas(req, policy) before generate "
-                "(policy = pipeline.build_schedule_policy())."
-            )
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"BagelPipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
-        params = req.sampling_params.get("diffusion")
+    def _generate_image(self, sample: Sample, task: str) -> Sample:
+        """Run BAGEL image-out (t2i / it2i) per-sample and fill the diffusion gen Part."""
+        frontier = sample.gen_part(DiffusionSamplingParams)
+        params = frontier.sampling_params
         if not isinstance(params, BagelDiffusionParams):
             raise TypeError(
-                f"BagelPipeline.generate: sampling_params must be BagelDiffusionParams, got {type(params).__name__}"
+                f"BagelPipeline.generate: gen Part sampling_params must be BagelDiffusionParams, "
+                f"got {type(params).__name__}"
+            )
+        if params.sigmas is None:
+            raise ValueError(
+                "BagelPipeline.generate: gen part sampling_params.sigmas is None. The hosting engine must "
+                "pin σ (policy = pipeline.build_schedule_policy()) before generate."
+            )
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
+        if not isinstance(texts, Texts):
+            raise TypeError(
+                f"BagelPipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
+                f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
         prompts = list(texts.texts)
@@ -327,9 +332,8 @@ class BagelPipeline(Pipeline):
         # it2i: per-sample input images — editing prefills the input image
         # through BOTH the VAE branch (pixel fidelity) and the ViT branch
         # (semantics) in _build_contexts.
-        pil_images = self._extract_input_images(req, task, n_prompts=n) if task == "it2i" else None
+        pil_images = self._extract_input_images(conditioning, task, n_prompts=n) if task == "it2i" else None
 
-        sample_ids = list(req.sample_ids) if req.sample_ids else [f"s{i}" for i in range(n)]
         image_shape = (int(params.height), int(params.width))
 
         contexts = [
@@ -337,41 +341,33 @@ class BagelPipeline(Pipeline):
             for i, prompt in enumerate(prompts)
         ]
         segment, conditions, images = self._diffuse_and_decode(
-            contexts, params=params, req=req, image_shape=image_shape
+            contexts, params=params, sample=sample, image_shape=image_shape
         )
 
-        return RolloutResp(
-            tracks={
-                "image": RolloutTrack(
-                    sample_ids=sample_ids,
-                    parent_ids=list(req.group_ids) if req.group_ids else None,
-                    conditions=conditions.to_dict(),
-                    segment=segment,
-                    decoded=images,
-                ),
-            }
-        )
+        filled = frontier.fill(segment=segment, primitive=images, conditions=conditions.to_dict())
+        return sample.with_parts([*sample.parts[:-1], filled])
 
     def _diffuse_and_decode(
         self,
         contexts: List[Tuple[Any, Any, Any]],
         *,
         params: BagelDiffusionParams,
-        req: RolloutReq,
+        sample: Sample,
         image_shape: Tuple[int, int],
     ) -> Tuple[LatentSegment, BagelDiffusionConditions, Images]:
         """Diffuse per-sample over prebuilt ``(gen, cfg_text, cfg_img)`` contexts,
         batch the latents, build the ``BagelDiffusionConditions``, and VAE-decode.
 
         Shared by image-out (t2i / it2i) and think-then-generate (t2ti). x_T is
-        driver-authored per-sample via :class:`NoiseRecipe` (keyed on the request's
+        driver-authored per-sample via :class:`NoiseRecipe` (keyed on the gen Part's
         sample ids — engine draws its own when no driver recipe is present); the
         three CFG contexts ride verbatim into the stored conditions for
-        frozen-context replay.
+        frozen-context replay. σ is read off the diffusion gen Part's pinned
+        ``DiffusionSamplingParams.sigmas``.
         """
         device = torch.device(self.bundle.device)
-        schedule = req.sigmas.to(device)
-        initial = NoiseRecipe.from_rollout_req(req).resolve(device=device, dtype=torch.float32)
+        schedule = params.sigmas.to(device)
+        initial = NoiseRecipe.from_sample(sample).resolve(device=device, dtype=torch.float32)
 
         gen_list: List[Any] = []
         cfg_text_list: List[Any] = []
@@ -432,35 +428,35 @@ class BagelPipeline(Pipeline):
     # Text-out (t2t / i2t / it2t)
     # ------------------------------------------------------------------
 
-    def _generate_text(self, req: RolloutReq, task: str) -> RolloutResp:
-        """Run BAGEL text-out per-sample and pack one ``"ar"`` track.
+    def _generate_text(self, sample: Sample, task: str) -> Sample:
+        """Run BAGEL text-out per-sample and fill the AR gen Part.
 
         Builds per-sample RAW prompt splits (see :class:`BagelARConditions`)
         mirroring the vendored understanding flow (inferencer.py:242-260,
         ``understanding_output=True``): image ingested ViT-only, then the
         prompt text; ``BagelARStage`` owns prefill + decode + replay.
         """
-        ar_params = req.sampling_params.get("ar")
+        frontier = sample.gen_part(ARSamplingParams)
+        ar_params = frontier.sampling_params
         if ar_params is None:
-            raise TypeError(
-                f"BagelPipeline.generate ({task}): sampling_params must carry ARSamplingParams, "
-                f"got {type(req.sampling_params).__name__}"
-            )
+            raise TypeError(f"BagelPipeline.generate ({task}): gen Part must carry ARSamplingParams")
 
-        texts = req.primitives.get("text")
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
         prompts: Optional[List[str]] = list(texts.texts) if isinstance(texts, Texts) else None
         if task in ("t2t", "it2t") and prompts is None:
             raise TypeError(
-                f"BagelPipeline.generate ({task}): req.primitives['text'] must be Texts, "
+                f"BagelPipeline.generate ({task}): expected a Texts prompt from sample.conditioning()[0], "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
         pil_images: Optional[List[Any]] = None
         if task in ("i2t", "it2t"):
-            pil_images = self._extract_input_images(req, task, n_prompts=len(prompts) if prompts is not None else None)
+            pil_images = self._extract_input_images(
+                conditioning, task, n_prompts=len(prompts) if prompts is not None else None
+            )
 
         n = len(prompts) if prompts is not None else len(pil_images)
-        sample_ids = list(req.sample_ids) if req.sample_ids else [f"s{i}" for i in range(n)]
         ntk = self.bundle.new_token_ids
         tokenizer = self.bundle.tokenizer
 
@@ -484,17 +480,8 @@ class BagelPipeline(Pipeline):
         segment = self.ar.autoregress(conditions, sampling_params=ar_params)
         decoded = self._detokenize(segment)
 
-        return RolloutResp(
-            tracks={
-                "ar": RolloutTrack(
-                    sample_ids=sample_ids,
-                    parent_ids=list(req.group_ids) if req.group_ids else None,
-                    conditions=conditions.to_dict(),
-                    segment=segment,
-                    decoded=decoded,
-                ),
-            }
-        )
+        filled = frontier.fill(segment=segment, primitive=decoded, conditions=conditions.to_dict())
+        return sample.with_parts([*sample.parts[:-1], filled])
 
     def _detokenize(self, segment: TextSegment) -> Texts:
         """Decode packed response tokens to strings, stripped at ``<|im_end|>``.
@@ -543,32 +530,35 @@ class BagelPipeline(Pipeline):
             gen = inf.update_context_text(think_text, gen)
         return gen, cfg_text, cfg_img
 
-    def _generate_t2ti(self, req: RolloutReq) -> RolloutResp:
+    def _generate_t2ti(self, sample: Sample) -> Sample:
         """BAGEL native think-then-generate (t2ti).
 
         The AR und path plans a ``<think>`` caption from ``[system + prompt]``,
         then diffusion generates the image conditioned on ``[system + prompt +
-        think]`` — one bundle, two stages. Emits two linked tracks: ``"ar"`` (the
-        planning text, grouped by prompt) and ``"image"`` (``parent_track="ar"``
-        → grouped by the rewrite, mirroring the PE composition's lineage). The
-        request carries both ``ar`` + ``diffusion`` sampling entries.
+        think]`` — one bundle, two stages. Fills two linked gen Parts: the ``ar``
+        gen Part (the planning text, grouped by prompt) and the ``diffusion`` gen
+        Part (grouped by the rewrite, mirroring the PE composition's lineage). The
+        request carries both an ``ar`` and a ``diffusion`` gen Part.
         """
-        if req.sigmas is None:
-            raise ValueError(
-                "BagelPipeline.generate (t2ti): req.sigmas is None — the hosting engine must call "
-                "ensure_req_sigmas(req, pipeline.build_schedule_policy()) before generate."
-            )
-        ar_params = req.sampling_params.get("ar")
-        diff_params = req.sampling_params.get("diffusion")
-        if ar_params is None or not isinstance(diff_params, BagelDiffusionParams):
+        ar_part = sample.gen_part(ARSamplingParams)
+        image_part = sample.gen_part(DiffusionSamplingParams)
+        ar_params = ar_part.sampling_params
+        diff_params = image_part.sampling_params
+        if not isinstance(diff_params, BagelDiffusionParams):
             raise TypeError(
-                "BagelPipeline.generate (t2ti): sampling_params must carry both an 'ar' (ARSamplingParams) "
-                f"and a 'diffusion' (BagelDiffusionParams) entry; got keys {sorted(req.sampling_params)}."
+                "BagelPipeline.generate (t2ti): the diffusion gen Part must carry BagelDiffusionParams; "
+                f"got {type(diff_params).__name__}"
             )
-        texts = req.primitives.get("text")
+        if diff_params.sigmas is None:
+            raise ValueError(
+                "BagelPipeline.generate (t2ti): diffusion gen part sigmas is None — the hosting engine must "
+                "pin σ (policy = pipeline.build_schedule_policy()) before generate."
+            )
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
         if not isinstance(texts, Texts):
             raise TypeError(
-                f"BagelPipeline.generate (t2ti): req.primitives['text'] must be Texts, "
+                f"BagelPipeline.generate (t2ti): expected a Texts prompt from sample.conditioning()[0], "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
@@ -577,8 +567,6 @@ class BagelPipeline(Pipeline):
 
         prompts = list(texts.texts)
         n = len(prompts)
-        sample_ids = list(req.sample_ids) if req.sample_ids else [f"s{i}" for i in range(n)]
-        ar_sample_ids = [f"{sid}#think" for sid in sample_ids]
         image_shape = (int(diff_params.height), int(diff_params.width))
         ntk = self.bundle.new_token_ids
         tokenizer = self.bundle.tokenizer
@@ -604,28 +592,16 @@ class BagelPipeline(Pipeline):
             self._build_think_contexts(GEN_THINK_SYSTEM_PROMPT, prompts[i], think_texts.texts[i]) for i in range(n)
         ]
         segment, conditions, images = self._diffuse_and_decode(
-            contexts, params=diff_params, req=req, image_shape=image_shape
+            contexts, params=diff_params, sample=sample, image_shape=image_shape
         )
 
-        return RolloutResp(
-            tracks={
-                "ar": RolloutTrack(
-                    sample_ids=ar_sample_ids,
-                    parent_ids=list(req.group_ids) if req.group_ids else None,
-                    conditions=ar_conditions.to_dict(),
-                    segment=ar_segment,
-                    decoded=think_texts,
-                ),
-                "image": RolloutTrack(
-                    sample_ids=sample_ids,
-                    parent_track="ar",
-                    parent_ids=ar_sample_ids,
-                    conditions=conditions.to_dict(),
-                    segment=segment,
-                    decoded=images,
-                ),
-            }
-        )
+        # Fill both gen Parts in their lineage positions (ar precedes diffusion).
+        ar_idx = sample.gen_part_index(ARSamplingParams)
+        image_idx = sample.gen_part_index(DiffusionSamplingParams)
+        new_parts = list(sample.parts)
+        new_parts[ar_idx] = ar_part.fill(segment=ar_segment, primitive=think_texts, conditions=ar_conditions.to_dict())
+        new_parts[image_idx] = image_part.fill(segment=segment, primitive=images, conditions=conditions.to_dict())
+        return sample.with_parts(new_parts)
 
 
 __all__ = ["BagelPipeline"]

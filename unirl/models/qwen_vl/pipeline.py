@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from unirl.models.types.ar import ARSamplingParams
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 
 from .ar import QwenVLARParams, QwenVLARStage
 from .bundle import QwenVLBundle
@@ -16,6 +15,21 @@ from .config import QwenVLPipelineConfig
 
 
 class QwenVLPipeline(Pipeline):
+    """Qwen-VL AR (understanding) generate pipeline: ``Sample → Sample``.
+
+    Consumes a request ``Sample`` whose frontier (last) Part is a pre-forked AR gen
+    shell carrying ``ARSamplingParams``. Reads the prompt — and, for image-input
+    tasks, the chained image — via ``sample.conditioning()`` (an optional
+    ``{"system_instruction": str}`` override rides on the input Part's
+    ``control["chat"]``) and fills the frontier Part:
+
+    - ``segment: TextSegment`` — the generated tokens + full-softmax log-probs.
+    - ``primitive: Texts`` — detokenized response strings.
+
+    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``).conditioning()`` via :meth:`_conditions_for`, so rollout and
+    replay build the prompt conditions through one shared path.
+    """
+
     def __init__(
         self,
         *,
@@ -62,20 +76,21 @@ class QwenVLPipeline(Pipeline):
         bundle = QwenVLBundle.from_config(config)
         return cls.from_bundle(bundle, max_prompt_length=config.max_prompt_length)
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"QwenVLPipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
+    def _conditions_for(
+        self,
+        texts: Texts,
+        images: Optional[Images] = None,
+        control: Optional[Dict[str, Any]] = None,
+    ) -> QwenVLARConditions:
+        """Chat-template + tokenize prompts (+ optional images) → :class:`QwenVLARConditions`.
+        Shared by rollout-``generate`` and trainer-side replay (re-tokenize), so both
+        build the prompt conditions through one path — the re-tokenization must be
+        byte-identical to rollout, which routing through this single path guarantees.
 
-        pil_images = None
-        images_prim = req.primitives.get("image")
-        if images_prim is not None and isinstance(images_prim, Images):
-            pil_images = images_prim.to_pils()
-
-        chat_overrides: Dict[str, Any] = dict(req.stage_config.get("chat") or {})
+        An optional per-request ``system_instruction`` override rides on the input
+        Part's ``control["chat"]``.
+        """
+        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = QwenVLChatTemplateStage(
                 self.bundle,
@@ -84,20 +99,40 @@ class QwenVLPipeline(Pipeline):
             )
         else:
             chat_stage = self.chat_template
+        pil_images = images.to_pils() if isinstance(images, Images) else None
+        return chat_stage.embed(texts, images=pil_images)
 
-        conds: QwenVLARConditions = chat_stage.embed(texts, images=pil_images)
-
-        ar = req.sampling_params.get("ar")
-        if ar is not None:
-            params = QwenVLARParams(
-                max_tokens=ar.max_new_tokens,
-                temperature=ar.temperature,
-                top_p=ar.top_p,
-                top_k=ar.top_k,
+    def generate(self, sample: Sample) -> Sample:
+        """Run Qwen-VL AR generation end-to-end, filling the frontier (pre-forked) gen Part."""
+        frontier = sample.parts[-1]
+        ar = frontier.sampling_params
+        if not isinstance(ar, ARSamplingParams):
+            raise TypeError(
+                f"QwenVLPipeline.generate: frontier gen Part must carry ARSamplingParams, "
+                f"got {type(ar).__name__ if ar is not None else 'None'}"
             )
-        else:
-            params = QwenVLARParams()
 
+        # conditioning() surfaces [text, image?] in turn order — an image-input task
+        # chains the image off the prompt head via Part.input_child.
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
+        if not isinstance(texts, Texts):
+            raise TypeError(
+                f"QwenVLPipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
+                f"got {type(texts).__name__ if texts is not None else 'None'}"
+            )
+        images = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
+
+        conds = self._conditions_for(texts, images, sample.parts[0].control)
+
+        # Normalize the gen shell's ARSamplingParams through QwenVLARParams (parity
+        # with the prior req-sourced path: stop_token_id reset, types coerced).
+        params = QwenVLARParams(
+            max_tokens=ar.max_new_tokens,
+            temperature=ar.temperature,
+            top_p=ar.top_p,
+            top_k=ar.top_k,
+        )
         sampling_params = ARSamplingParams(
             max_new_tokens=int(params.max_tokens),
             temperature=float(params.temperature),
@@ -109,17 +144,11 @@ class QwenVLPipeline(Pipeline):
         segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
         decoded = self._detokenize(segment)
 
-        return RolloutResp(
-            tracks={
-                "ar": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=conds.to_dict(),
-                    segment=segment,
-                    decoded=decoded,
-                ),
-            }
-        )
+        # Fill the frontier shell, carrying the encoded conditions for trainer-side
+        # replay: Part.conditions is the train stack's source (GRPO re-types them via
+        # conditions_cls.from_dict in compute_loss_and_backward).
+        filled = frontier.fill(segment=segment, primitive=decoded, conditions=conds.to_dict())
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
     def _detokenize(self, segment) -> Texts:
         if segment.tokens is None or segment.cu_seqlens is None:

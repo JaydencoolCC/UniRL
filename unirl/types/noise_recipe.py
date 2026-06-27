@@ -2,11 +2,11 @@
 
 Every diffusion model gets a driver-authoritative initial latent (x_T) from the
 SAME four-element recipe — ``(noise_group_ids, base_seed, latent_shape,
-initial_latents)`` — regardless of which request class carries it (the driver's
-:class:`~unirl.types.rollout_req.RolloutReq`, or a worker-side engine
+initial_latents)`` — regardless of which carrier holds it (the request
+:class:`~unirl.types.sample.Sample`'s gen frontier Part, or a worker-side engine
 request whose recipe rode in via ``extra_args``). The recipe is the lightweight
 payload the driver ships (per-sample id strings + seed; NO noise tensor on the
-wire); each engine reconstructs a ``NoiseRecipe`` from its own request type and
+wire); each engine reconstructs a ``NoiseRecipe`` from its own carrier and
 calls :meth:`resolve`.
 
 Resolution precedence (one place, all engines):
@@ -41,8 +41,9 @@ class NoiseRecipe:
     noise_group_ids: List[str] = field(default_factory=list)
     base_seed: int = 0
     # None until the latent shape is known. Models with a request-time-known
-    # shape fill it via ``from_rollout_req``; dynamic-shape models fill it at the
-    # engine point where the shape resolves.
+    # shape fill it via ``from_sample`` (the gen Part's
+    # ``init_noise_latent_shape``); dynamic-shape models fill it at the engine
+    # point where the shape resolves.
     latent_shape: Optional[Tuple[int, ...]] = None
     # Path 1: genuine latent DATA (img2img / i2v first-frame), shipped verbatim.
     initial_latents: Optional[torch.Tensor] = None
@@ -97,29 +98,10 @@ class NoiseRecipe:
         )
 
     @classmethod
-    def from_rollout_req(cls, req) -> "NoiseRecipe":
-        """Build a recipe from a driver-side ``RolloutReq`` (request-time).
-
-        Used by trainside/sglang model pipelines, where the latent shape is
-        already known (fixed-shape models populate ``req.init_noise_latent_shape``).
-        Duck-typed on the req's attributes so it doesn't import RolloutReq.
-        """
-        cond = (getattr(req, "request_conditions", None) or {}).get("initial_latents")
-        diffusion = (getattr(req, "sampling_params", None) or {}).get("diffusion")
-        seed = int(diffusion.seed) if diffusion is not None and getattr(diffusion, "seed", None) is not None else 0
-        shape = getattr(req, "init_noise_latent_shape", None)
-        return cls(
-            noise_group_ids=list(getattr(req, "init_noise_group_ids", None) or []),
-            base_seed=seed,
-            latent_shape=tuple(shape) if shape else None,
-            initial_latents=getattr(cond, "latents", None) if cond is not None else None,
-        )
-
-    @classmethod
     def from_sample(cls, sample) -> "NoiseRecipe":
         """Build a recipe from a request ``Sample`` (its gen frontier part).
 
-        Sample-shaped sibling of :meth:`from_rollout_req`. The x_T key is derived
+        Sample-shaped builder. The x_T key is derived
         from the lineage path (OD-2): the parent (group) id under
         ``init_same_noise`` so siblings share x_T, else the per-sample id —
         matching the engines' ``_resolve_initial_noise``. ``initial_latents``

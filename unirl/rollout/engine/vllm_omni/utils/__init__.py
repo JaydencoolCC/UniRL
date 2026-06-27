@@ -8,14 +8,6 @@ input/output sub-adapters; these are the mechanics they lean on.
 
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
-from unirl.rollout.engine.vllm_omni.utils.prompts import (
-    ar_gen_part,
-    cot_text_from_sample,
-    diffusion_gen_part,
-    image_input_part,
-    pil_images_from_sample,
-    texts_from_sample,
-)
 from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_diffusion
 from unirl.rollout.engine.vllm_omni.utils.tracks import (
     assemble_sample,
@@ -27,6 +19,18 @@ from unirl.rollout.engine.vllm_omni.utils.tracks import (
     pick_stage_output,
     pils_to_images,
     seed_from_sample_id,
+)
+
+# Request-side Sample readers now live in unirl.types.sample_ops (lifted out of the
+# rollout layer so model pipelines can import them too); re-exported here for the
+# vllm_omni adapters that already import them from this package.
+from unirl.types.sample_ops import (
+    ar_gen_part,
+    cot_text_from_sample,
+    diffusion_gen_part,
+    image_input_part,
+    pil_images_from_sample,
+    texts_from_sample,
 )
 
 __all__ = [

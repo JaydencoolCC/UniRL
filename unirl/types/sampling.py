@@ -35,7 +35,7 @@ def _is_param_dict(sampling: Any) -> bool:
     """True iff ``sampling`` is a modality-keyed mapping (``"diffusion"`` / ``"ar"``)
     rather than a single sampling-params object.
 
-    ``RolloutReq.sampling_params`` is a ``Dict[str, BaseSamplingParams]``. A bare
+    the gen Part's ``sampling_params`` is a ``Dict[str, BaseSamplingParams]``. A bare
     ``DiffusionSamplingParams`` (or its raw OmegaConf node from a flat
     ``cfg.sampling``) is NOT a param dict — :func:`total_samples_per_prompt` then
     treats it as a single modality.

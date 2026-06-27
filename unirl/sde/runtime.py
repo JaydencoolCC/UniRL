@@ -23,8 +23,8 @@ Three layers, all owned by this module:
    is what lets sglang / vllm-omni engines compute σ without holding the
    model in memory.
 
-3. **Glue** — :func:`ensure_req_sigmas` validates a ``RolloutReq`` and pins
-   ``policy.compute_sigma(...)`` onto ``RolloutReq.sigmas`` (every rollout
+3. **Glue** — :func:`ensure_req_sigmas` validates a request and pins the gen Part's
+   ``policy.compute_sigma(...)`` σ onto the gen Part's ``DiffusionSamplingParams.sigmas`` (every rollout
    engine calls it at the top of its ``generate``).
 
 Naming convention (a symbol's name tells you its layer):
@@ -34,15 +34,15 @@ Naming convention (a symbol's name tells you its layer):
   per-model μ; ``compute_sigma`` → the full per-request σ).
 - free ``get_sigma_schedule`` / ``calculate_dynamic_mu`` are **stateless
   math primitives** — fully-resolved scalars in, no policy state.
-- ``ensure_req_sigmas`` is **request glue** — it operates on a RolloutReq.
+- ``ensure_req_sigmas`` is **request glue** — it operates on a request-shaped object (duck-typed).
 
 Ownership map (kept explicit so reading the code doesn't require
 following six getattr chains)::
 
     Policy        owned by  MODEL CHECKPOINT (scheduler/transformer/vae JSONs)
-    Params (T,H,W) owned by REQUEST (RolloutReq.sampling_params.diffusion)
+    Params (T,H,W) owned by REQUEST (the gen Part's DiffusionSamplingParams)
     σ computation owned by THIS MODULE (pure function)
-    σ flow        carried by RolloutReq.sigmas (set by engine, read by
+    σ flow        carried by the gen Part's sigmas (set by engine, read by
                   pipeline / worker / replay; verified end-to-end by
                   unirl.rollout.engine.sigma_verify)
 """
@@ -465,7 +465,7 @@ class FlowMatchSchedulePolicy:
 
 
 # ===========================================================================
-# Layer 3 — request glue (pin σ onto a RolloutReq)
+# Layer 3 — request glue (pin σ onto a request-shaped object)
 # ===========================================================================
 
 

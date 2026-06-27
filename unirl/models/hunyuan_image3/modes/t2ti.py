@@ -35,8 +35,7 @@ from typing import TYPE_CHECKING, Any, Dict, List
 from unirl.config.require import require
 from unirl.models.types.ar import ARSamplingParams
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from ..ar import HunyuanImage3ARParams
@@ -99,40 +98,38 @@ def _cot_stop_tokens(bundle, bot_task: str) -> List[int]:
     return stop_ids
 
 
-def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
+def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """t2ti — AR CoT phase, then diffusion conditioned on the CoT."""
-    texts = req.primitives.get("text")
-    require(
-        isinstance(texts, Texts),
-        f"HunyuanImage3Pipeline.generate (t2ti): input must be Texts, got {type(texts).__name__ if texts is not None else 'None'}",
-    )
-    require(
-        req.primitives.get("negative_text") is None,
-        "HunyuanImage3Pipeline.generate (t2ti): negative_text is not supported — "
-        "the HI3 tokenizer never consumes negative-prompt text; CFG is derived from "
-        "guidance_scale > 1.0 (the unconditional branch is built internally from <cfg> tokens).",
-    )
-
-    ar_sp = req.sampling_params.get("ar")
-    require(
-        ar_sp is not None,
-        "HunyuanImage3Pipeline.generate (t2ti): AR sampling params missing — t2ti needs "
-        "a sampling dict with both 'ar' (ARSamplingParams) and 'diffusion' (DiffusionSamplingParams) entries.",
-    )
-    diff_sp = req.sampling_params.get("diffusion")
+    ar_part = sample.gen_part(ARSamplingParams)
+    image_part = sample.gen_part(DiffusionSamplingParams)
+    ar_sp = ar_part.sampling_params
+    diff_sp = image_part.sampling_params
     require(
         isinstance(diff_sp, DiffusionSamplingParams),
-        "HunyuanImage3Pipeline.generate (t2ti): diffusion sampling params missing or mistyped — t2ti needs "
-        "a sampling dict with both 'ar' (ARSamplingParams) and 'diffusion' (DiffusionSamplingParams) entries.",
+        "HunyuanImage3Pipeline.generate (t2ti): the diffusion gen Part must carry DiffusionSamplingParams.",
+    )
+    if diff_sp.sigmas is None:
+        raise ValueError(
+            "HunyuanImage3 t2ti: diffusion gen part sigmas is None. The hosting engine must "
+            "pin σ before pipeline.generate."
+        )
+
+    conditioning = sample.conditioning()
+    texts = conditioning[0] if conditioning else None
+    require(
+        isinstance(texts, Texts),
+        f"HunyuanImage3Pipeline.generate (t2ti): prompt from sample.conditioning()[0] must be Texts, "
+        f"got {type(texts).__name__ if texts is not None else 'None'}",
     )
 
-    ar_cfg: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
+    control = sample.parts[0].control or {}
+    ar_cfg: Dict[str, Any] = dict(control.get("ar") or {})
     require(
         "bot_task" not in ar_cfg,
-        "HunyuanImage3Pipeline.generate (t2ti): set the single top-level stage_config['bot_task'] "
-        "(the chain is one semantic mode); stage_config['ar']['bot_task'] is not read.",
+        "HunyuanImage3Pipeline.generate (t2ti): set the single top-level control['bot_task'] "
+        "(the chain is one semantic mode); control['ar']['bot_task'] is not read.",
     )
-    bot_task = str(req.stage_config.get("bot_task", "think_recaption"))
+    bot_task = str(control.get("bot_task", "think_recaption"))
     tok_bot_task = _tokenizer_bot_task(bot_task)
     batch = len(texts.texts)
 
@@ -190,12 +187,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     cots = [_normalize_cot_text(_truncate_at_cot_end(t)) for t in raw.texts]
 
     # ---- diffusion phase: condition on prompt + CoT -------------------
-    if req.sigmas is None:
-        raise ValueError(
-            "HunyuanImage3 t2ti: req.sigmas is None. Engine adapter must call "
-            "unirl.sde.runtime.ensure_req_sigmas before pipeline.generate."
-        )
-    schedule = req.sigmas.to(pipeline.bundle.device)
+    schedule = diff_sp.sigmas.to(pipeline.bundle.device)
 
     mm2 = pipeline.text_embed.embed_for_gen_image(
         texts,
@@ -214,26 +206,12 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     latent_seg = pipeline.diffusion.diffuse(diff_conds, schedule=schedule, params=diff_sp)
     images = pipeline.vae_decode.decode(latent_seg)
 
-    # Two-track lineage: "ar" is the root (sample_ids = the request's,
-    # parent_ids = group_ids — same convention as t2t, so engine-side
-    # prompt replication keeps GRPO grouping intact); "image" forks 1:1
-    # off the CoT with hierarchical ids.
-    return RolloutResp(
-        tracks={
-            "ar": RolloutTrack(
-                sample_ids=list(req.sample_ids),
-                parent_ids=list(req.group_ids),
-                conditions=ar_conds.to_dict(),
-                segment=text_seg,
-                decoded=Texts(texts=cots),
-            ),
-            "image": RolloutTrack(
-                sample_ids=[f"{sid}/i0" for sid in req.sample_ids],
-                parent_ids=list(req.sample_ids),
-                parent_track="ar",
-                conditions=diff_conds.to_dict(),
-                segment=latent_seg,
-                decoded=images,
-            ),
-        }
-    )
+    # Fill both gen Parts in their lineage positions (ar precedes diffusion):
+    # the ar Part carries the CoT TextSegment + normalized cot Texts; the image
+    # Part the LatentSegment + decoded images.
+    ar_idx = sample.gen_part_index(ARSamplingParams)
+    image_idx = sample.gen_part_index(DiffusionSamplingParams)
+    new_parts = list(sample.parts)
+    new_parts[ar_idx] = ar_part.fill(segment=text_seg, primitive=Texts(texts=cots), conditions=ar_conds.to_dict())
+    new_parts[image_idx] = image_part.fill(segment=latent_seg, primitive=images, conditions=diff_conds.to_dict())
+    return sample.with_parts(new_parts)

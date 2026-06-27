@@ -48,7 +48,7 @@ class LatentSegment(Segment):
     dataclass fields; a ``ClassVar`` modality wouldn't appear in the
     field set and the rebuilt instance would silently revert to the
     class default ``Modality.IMAGE``. That regression would break
-    downstream modality-aware dispatch (e.g. `RolloutResp.split()` calls
+    downstream modality-aware dispatch (e.g. `Sample.split()` calls
     ``select`` per group; the resulting per-group segments must keep
     their video / audio modality). The ``shared_field`` declaration
     makes modality batch-shared metadata — every sample in a segment

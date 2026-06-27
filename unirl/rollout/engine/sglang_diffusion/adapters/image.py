@@ -42,7 +42,7 @@ def _prompts_per_sample(sample: Sample) -> List[str]:
 class ImageAdapter(ModelAdapter):
     """Conversion for image-output families (SD3, FLUX, …). Default path end-to-end."""
 
-    #: RolloutResp track key the segment/decoded/conditions are stored under.
+    #: Part's output slot key the segment/decoded/conditions are stored under.
     track_name: str = "image"
     #: Segment factory (modality). A video adapter would pass ``make_video_segment``.
     segment_factory = staticmethod(make_image_segment)

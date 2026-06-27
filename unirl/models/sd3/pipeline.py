@@ -50,8 +50,7 @@ class SD3Pipeline(Pipeline):
     - ``segment: LatentSegment`` — the denoising trajectory.
     - ``primitive: Images`` — the decoded images.
 
-    ``Part.conditions`` is left empty on this (trainside) path: replay re-encodes
-    from ``sample.conditioning()`` via :meth:`_conditions_for`, so rollout and
+    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``).conditioning()`` via :meth:`_conditions_for`, so rollout and
     replay build conditions through one shared path. User-supplied negative
     prompts are deferred (single-input request); CFG uses a synthesized empty
     negative.

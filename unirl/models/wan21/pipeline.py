@@ -1,4 +1,4 @@
-"""WAN21Pipeline — RolloutReq → RolloutResp end-to-end for WAN 2.1 T2V.
+"""WAN21Pipeline — ``Sample → Sample`` end-to-end for WAN 2.1 T2V/I2V.
 
 Implements the new four-tier flow::
 
@@ -30,8 +30,7 @@ from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import WAN21Bundle
@@ -45,22 +44,18 @@ from .vae import WAN21VAEDecodeStage
 
 
 class WAN21Pipeline(Pipeline):
-    """WAN 2.1 T2V generate pipeline.
+    """WAN 2.1 T2V/I2V generate pipeline: ``Sample → Sample``.
 
-    Reads from ``RolloutReq``:
+    Consumes a request ``Sample`` whose frontier Part is a pre-forked diffusion gen
+    shell carrying ``DiffusionSamplingParams`` (with ``sigmas`` pinned by the
+    hosting engine). Reads the prompt — and, for I2V, the chained first-frame image
+    — via ``sample.conditioning()`` and fills the frontier Part:
 
-    - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]: Texts`` — optional CFG negatives.
-    - ``stage_params["diffusion"]: dict`` — kwargs for
-      :class:`WAN21DiffusionParams`.
+    - ``segment: LatentSegment`` — the denoising trajectory.
+    - ``primitive: Videos`` — the decoded videos.
 
-    Writes to ``RolloutResp``:
-
-    - ``conditions["text"]: TextEmbedCondition``; plus
-      ``conditions["negative_text"]: TextEmbedCondition`` when negative
-      prompts were supplied.
-    - ``tracks["video"].segment: LatentSegment``.
-    - ``tracks["video"].decoded: Videos``.
+    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied text negatives are
+    deferred; CFG uses a synthesized empty negative.
     """
 
     def __init__(
@@ -157,45 +152,34 @@ class WAN21Pipeline(Pipeline):
             shift=float(config.shift),
         )
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run WAN 2.1 T2V end-to-end."""
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"WAN21Pipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
-        negatives_raw = req.primitives.get("negative_text")
-        negatives = negatives_raw if isinstance(negatives_raw, Texts) else None
-        if negatives is not None and len(negatives.texts) != len(texts.texts):
-            raise ValueError(
-                f"WAN21Pipeline.generate: negative_text length {len(negatives.texts)} != text length {len(texts.texts)}"
-            )
+    def _conditions_for(
+        self, texts: Texts, params: DiffusionSamplingParams, images_prim: Optional[Images] = None
+    ) -> WAN21Conditions:
+        """Encode prompts (+ optional i2v first-frame image) → :class:`WAN21Conditions`.
+        Shared by rollout-``generate`` and trainer-side replay (re-encode), so both
+        build conditions identically.
 
-        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-
+        CFG negative encoding: WAN's training-time convention encodes
+        an empty-string negative when none is provided (legacy
+        ``models/wan21.py::encode_inputs`` does ``[""] * len(prompts)``
+        — and so does diffusers' upstream WAN pipeline). Without this,
+        falling back to ``torch.zeros_like(prompt_embeds)`` in
+        ``WAN21DiffusionStep.predict_noise`` would silently use a
+        different unconditional embedding than what the model was
+        trained against, shifting the distribution and making the
+        rollout / replay log-prob ratio drift away from 1.0 in GRPO.
+        Encoding ``[""] * B`` explicitly here keeps both sides aligned.
+        """
         text_cond = self.text_embed.embed(texts)
-        # CFG negative encoding: WAN's training-time convention encodes
-        # an empty-string negative when none is provided (legacy
-        # ``models/wan21.py::encode_inputs`` does ``[""] * len(prompts)``
-        # — and so does diffusers' upstream WAN pipeline). Without this,
-        # falling back to ``torch.zeros_like(prompt_embeds)`` in
-        # ``WAN21DiffusionStep.predict_noise`` would silently use a
-        # different unconditional embedding than what the model was
-        # trained against, shifting the distribution and making the
-        # rollout / replay log-prob ratio drift away from 1.0 in GRPO.
-        # Encoding ``[""] * B`` explicitly here keeps both sides aligned.
-        if negatives is None and float(params.guidance_scale) > 1.0:
-            negatives = Texts(texts=[""] * len(texts.texts))
+        negatives = Texts(texts=[""] * len(texts.texts)) if float(params.guidance_scale) > 1.0 else None
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
 
         image_latent_cond: Optional[ImageLatentCondition] = None
         image_embed_cond: Optional[ImageEmbedCondition] = None
-        images_prim = req.primitives.get("image")
         if images_prim is not None:
             if not isinstance(images_prim, Images):
                 raise TypeError(
-                    f"WAN21Pipeline.generate: req.primitives['image'] must be Images, got {type(images_prim).__name__}"
+                    f"WAN21Pipeline.generate: i2v image must be Images, got {type(images_prim).__name__}"
                 )
             if int(images_prim.pixels.shape[0]) != len(texts.texts):
                 raise ValueError(
@@ -215,41 +199,61 @@ class WAN21Pipeline(Pipeline):
             if self.bundle.uses_clip_vision:
                 image_embed_cond = WAN21CLIPVisionEncodeStage(self.bundle).encode(images_prim)
 
-        wan_conds = WAN21Conditions(
+        return WAN21Conditions(
             text=text_cond,
             negative_text=negative_text_cond,
             image_latent=image_latent_cond,
             image_embed=image_embed_cond,
         )
 
-        if req.sigmas is None:
-            raise ValueError(
-                "WAN21Pipeline.generate: req.sigmas is None. Engine adapter "
-                "must call unirl.sde.runtime.ensure_req_sigmas before "
-                "pipeline.generate."
+    def generate(self, sample: Sample) -> Sample:
+        """Run WAN 2.1 T2V (or I2V) end-to-end, filling the frontier (pre-forked) gen Part.
+
+        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
+        by the hosting engine before the call; see the σ ownership note in
+        ``unirl.models.types.pipeline``.
+        """
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise TypeError(
+                f"WAN21Pipeline.generate: frontier gen Part must carry DiffusionSamplingParams, "
+                f"got {type(params).__name__ if params is not None else 'None'}"
             )
-        schedule = req.sigmas.to(self.bundle.device)
+        if params.sigmas is None:
+            raise ValueError(
+                "WAN21Pipeline.generate: gen part sampling_params.sigmas is None. The hosting "
+                "engine must pin σ before invoking pipeline.generate; see the σ ownership note "
+                "in unirl.models.types.pipeline."
+            )
+
+        # conditioning() surfaces [text, image?] in turn order — the i2v first-frame
+        # rides as a chained input Part (Part.input_child) on the request.
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
+        if not isinstance(texts, Texts):
+            raise TypeError(
+                f"WAN21Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
+                f"got {type(texts).__name__ if texts is not None else 'None'}"
+            )
+        images_prim = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
+
+        wan_conds = self._conditions_for(texts, params, images_prim)
+        schedule = params.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
         # pre-shipped initial_latents tensor (img2img / i2v first-frame) still wins.
-        initial_latents = NoiseRecipe.from_rollout_req(req).resolve()
+        initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(
             wan_conds, schedule=schedule, params=params, initial_latents=initial_latents
         )
         videos = self.vae_decode.decode(latent_seg)
 
-        return RolloutResp(
-            tracks={
-                "video": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=wan_conds.to_dict(),
-                    segment=latent_seg,
-                    decoded=videos,
-                ),
-            }
-        )
+        # Fill the frontier shell, carrying the encoded conditions for trainer-side
+        # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
+        filled = frontier.fill(segment=latent_seg, primitive=videos, conditions=wan_conds.to_dict())
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
 __all__ = ["WAN21Pipeline"]

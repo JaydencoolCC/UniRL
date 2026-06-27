@@ -48,7 +48,7 @@ framework's default machinery already handles.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import PIL.Image
 import torch
@@ -292,6 +292,12 @@ def _cumsum(values: List[int]) -> List[int]:
     return out
 
 
+# The batched single-modality primitive union — a Part's raw content (text /
+# image / video / audio). The canonical home for what ``rollout_req.PrimitiveValue``
+# used to alias; mirrors ``sample.Primitive``.
+PrimitiveValue = Union[Texts, Images, Videos, Audios]
+
+
 def primitive_modality_key(prim: Texts | Images | Videos | Audios) -> str:
     """Map a batched primitive to its modality slot key.
 
@@ -322,6 +328,7 @@ __all__ = [
     "TextAndImage",
     "TextAndVideo",
     "Texts",
+    "PrimitiveValue",
     "Video",
     "Videos",
     "primitive_modality_key",

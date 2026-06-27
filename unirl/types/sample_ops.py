@@ -1,34 +1,41 @@
-"""Request-side ``Sample`` extraction helpers the adapters' ``build_inputs`` call.
+"""Request-side ``Sample`` extraction helpers.
 
-Pure and family-agnostic. A ``vllm_omni`` request ``Sample`` is the input
-``Part`` (``parts[0]``: the prompts) followed by the pre-forked generation
-shells — one per stage, identified by the *type* of their ``sampling_params``
-(``ARSamplingParams`` → the ``"ar"`` stage; ``DiffusionSamplingParams`` → the
-diffusion stage). These helpers recover the prompts and locate those shells;
-the HI3 prompt construction (the task presets + the per-prompt entry builder)
-lives with the HI3 sub-adapters in ``adapters/hi3.py``.
+Pure, family-agnostic readers over a request :class:`~unirl.types.sample.Sample`:
+recover the prompt(s) and locate the pre-forked generation shells (by the *type*
+of their ``sampling_params``) or chained input Parts (by primitive type). Shared
+by the model pipelines' ``generate`` (``models/<model>/pipeline.py``) and the
+rollout-engine adapters' input construction, so both read the request the same
+way — they live in :mod:`unirl.types` rather than under a rollout engine so a
+model pipeline can import them without a ``models → rollout`` layer inversion.
+
+A request ``Sample`` is the input ``Part`` (``parts[0]``: the prompts), optionally
+followed by chained input Parts (extra modalities via :meth:`Part.input_child`),
+then the pre-forked generation shells — one per stage, identified by the type of
+their ``sampling_params`` (``ARSamplingParams`` → the AR stage;
+``DiffusionSamplingParams`` → the diffusion stage).
 """
 
 from __future__ import annotations
 
-from typing import List, Optional
-
-import PIL.Image
+from typing import TYPE_CHECKING, List, Optional
 
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
+if TYPE_CHECKING:
+    import PIL.Image
+
 
 def texts_from_sample(sample: Sample) -> Texts:
     """The input ``Part``'s prompt ``Texts``, tiled to the gen-sample count.
 
-    ``vllm_omni`` runs ``num_outputs_per_prompt=1`` — one engine output per gen
-    sample — so the prompts must align 1:1 with the frontier gen shell. The
-    request keeps the input ``Part`` un-fanned (one prompt per group); the gen
-    shell fans out ``samples_per_prompt`` via :meth:`Sample.fork`, group-by-parent
-    contiguous. So tile each prompt across its gen siblings here. A request that
-    is already 1:1 (no fan-out) is returned unchanged.
+    A 1:1 engine path (``num_outputs_per_prompt=1`` — one engine output per gen
+    sample) needs the prompts aligned 1:1 with the frontier gen shell. The request
+    keeps the input ``Part`` un-fanned (one prompt per group); the gen shell fans
+    out ``samples_per_prompt`` via :meth:`Sample.fork`, group-by-parent contiguous.
+    So tile each prompt across its gen siblings here. A request that is already 1:1
+    (no fan-out) is returned unchanged.
     """
     texts = sample.parts[0].primitive
     if not isinstance(texts, Texts):
@@ -80,8 +87,7 @@ def cot_text_from_sample(sample: Sample) -> Texts:
     The two-engine DiT recaption producer takes a SECOND text input — the
     recaption — chained after the prompt head via :meth:`Part.input_child`.
     Scans the non-head input Parts (``parts[1:-1]``) for a ``Texts`` primitive
-    and asserts a 1:1 count with the prompts. The original read this off
-    ``req.primitives['cot_text']``.
+    and asserts a 1:1 count with the prompts.
     """
     prompts = texts_from_sample(sample)
     cot_part = next((p for p in sample.parts[1:-1] if isinstance(p.primitive, Texts)), None)
@@ -96,7 +102,7 @@ def cot_text_from_sample(sample: Sample) -> Texts:
     return cot
 
 
-def pil_images_from_sample(sample: Sample, n: int) -> List[PIL.Image.Image]:
+def pil_images_from_sample(sample: Sample, n: int) -> List["PIL.Image.Image"]:
     """Extract an image input ``Part`` (``Images``) as a list of PIL images.
 
     Returns an empty list when there's no image input Part. Asserts batch

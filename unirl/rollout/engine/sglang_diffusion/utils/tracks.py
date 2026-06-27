@@ -1,4 +1,4 @@
-"""Assemble ``RolloutResp`` track pieces (segment / decoded / conditions) from raw results.
+"""Assemble ``Sample`` Part pieces (segment / decoded / conditions) from raw results.
 
 Pure: operates on already-fetched wire data (SGLang ``GenerationResult`` objects)
 and ``unirl.types`` — no SGLang import, no engine state. The model-specific
@@ -101,7 +101,7 @@ def derive_timestep_alignment(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Validate the T+1 trajectory shape and verify SGLang used the σ we sent.
 
-    ``expected_sigmas`` is the schedule the engine pinned on ``RolloutReq.sigmas``
+    ``expected_sigmas`` is the schedule the engine pinned on the gen Part's ``sigmas``
     and forwarded to SGLang; SGLang echoes it back per result via
     ``trajectory_timesteps``. :func:`verify_engine_used_sigmas` asserts elementwise
     equality (fatal on drift) so rollout and trainer-side replay use numerically

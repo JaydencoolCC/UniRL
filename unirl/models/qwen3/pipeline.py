@@ -48,8 +48,7 @@ class Qwen3Pipeline(Pipeline):
     - ``segment: TextSegment`` — the generated tokens + full-softmax log-probs.
     - ``primitive: Texts`` — detokenized response strings.
 
-    ``Part.conditions`` is left empty on this (trainside) path: replay re-tokenizes
-    from ``sample.conditioning()`` via :meth:`_conditions_for`, so rollout and
+    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``).conditioning()`` via :meth:`_conditions_for`, so rollout and
     replay build the prompt conditions through one shared path.
     """
 
@@ -133,7 +132,7 @@ class Qwen3Pipeline(Pipeline):
         byte-identical to rollout, which routing through this single path guarantees.
 
         An optional per-request ``system_instruction`` override rides on the input
-        Part's ``control["chat"]`` (was ``RolloutReq.stage_config["chat"]``).
+        Part's ``control["chat"]``.
         """
         chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
         if "system_instruction" in chat_overrides:
@@ -186,9 +185,10 @@ class Qwen3Pipeline(Pipeline):
         segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
         decoded = self._detokenize(segment)
 
-        # Fill the frontier shell; conditions left empty (replay re-tokenizes via
-        # _conditions_for, so rollout and replay share one encode path).
-        filled = frontier.fill(segment=segment, primitive=decoded)
+        # Fill the frontier shell, carrying the encoded conditions for trainer-side
+        # replay: Part.conditions is the train stack's source (GRPO re-types them via
+        # conditions_cls.from_dict in compute_loss_and_backward).
+        filled = frontier.fill(segment=segment, primitive=decoded, conditions=conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
     def _detokenize(self, segment) -> Texts:

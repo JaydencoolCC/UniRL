@@ -7,7 +7,7 @@ derivation (``_derive_group_seed``) that keys each sample's x_T.
 
 The driver (``DiffusionTrainer._build_req``) ships only a deterministic x_T
 RECIPE — per-sample ``init_noise_group_ids`` + ``init_noise_latent_shape`` on
-the ``RolloutReq`` — and every engine regenerates the byte-identical x_T from
+the request ``Sample`` — and every engine regenerates the byte-identical x_T from
 it via :func:`regen_initial_noise` (a CPU-fp32 wrapper over
 :func:`generate_shared_noise`). The plain ``generate_latents`` fallback runs
 only when neither a recipe nor ``request_conditions['initial_latents']`` is

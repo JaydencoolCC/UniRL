@@ -2,7 +2,7 @@
 
 Holds the conversion logic once: chat-template encoding into per-prompt
 ``/generate`` payloads (``build_inputs``) and the predecessor's
-``build_rollout_resp`` packing fanned out per ``RolloutTrack`` field
+``build_response`` packing fanned out per ``Part`` field
 (``build_response`` is the template; ``build_ids`` / ``build_segment`` /
 ``build_decoded`` / ``build_conditions`` each derive one field from
 ``(req, prepared, raw)``). The VLM adapter overrides the steps that differ.
@@ -52,7 +52,7 @@ class TextLMAdapter(ModelAdapter):
         return hasattr(self._tokenizer, "apply_chat_template") and bool(getattr(self._tokenizer, "chat_template", None))
 
     # ------------------------------------------------------------------ #
-    # build_inputs — RolloutReq → per-prompt /generate payloads
+    # build_inputs — request ``Sample`` → per-prompt /generate payloads
     # ------------------------------------------------------------------ #
 
     def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
@@ -141,7 +141,7 @@ class TextLMAdapter(ModelAdapter):
         return [int(t) for t in ids]
 
     # ------------------------------------------------------------------ #
-    # build_response — the template: one fan-out stage per RolloutTrack field
+    # build_response — the template: one fan-out stage per ``Part`` field
     # ------------------------------------------------------------------ #
 
     def build_response(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Sample:

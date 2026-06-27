@@ -7,7 +7,7 @@ Contract
 --------
 
 The engine adapter (main side):
-    1. Pins ``RolloutReq.sigmas`` via
+    1. Pins the gen Part's ``DiffusionSamplingParams.sigmas`` via
        :func:`unirl.sde.runtime.ensure_req_sigmas` (which applies
        the engine's :class:`FlowMatchSchedulePolicy` to the per-request
        ``(T, H, W)`` triple).
@@ -80,7 +80,7 @@ def verify_engine_used_sigmas(
             May be ``None`` for legacy results that don't surface it;
             we then raise rather than silently pass (silent agreement
             on σ is unsafe).
-        expected: ``RolloutReq.sigmas`` (engine pinned). ``None`` skips
+        expected: the gen Part's engine-pinned ``sigmas``. ``None`` skips
             the check — legacy callers that bypass
             :func:`unirl.sde.runtime.ensure_req_sigmas` keep their
             pre-existing behavior.

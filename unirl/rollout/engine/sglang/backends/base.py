@@ -8,7 +8,7 @@ CPU-importable.
 **No RL types cross this seam.** ``generate`` takes ready-to-POST ``/generate``
 payload dicts (one per prompt) and returns ``list[RawResult]`` (a structural view
 of one parsed ``/generate`` candidate); the adapters do the
-``RolloutReq``↔``RolloutResp`` translation. The impl absorbs its transport
+``Sample``↔wire translation. The impl absorbs its transport
 asymmetries (async fan-out, retries, SGLang's dict-vs-list response shape for
 ``n``) behind these signatures.
 

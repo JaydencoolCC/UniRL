@@ -256,14 +256,14 @@ class StageAlgorithm(Remote, ABC):
         keeps the rollout engine's best-effort emission (raising if it emitted
         nothing); ``"replay"`` recomputes via a ``torch.no_grad``
         ``stage.replay`` and overwrites it. Because this hook fires ONCE per
-        ``RolloutResp`` — before the trainer's ``num_updates_per_batch`` train
+        the filled ``Sample`` — before the trainer's ``num_updates_per_batch`` train
         loop — the anchor is frozen at pre-update weights across all N updates,
         matching the on-policy ratio semantics of PPO-style algorithms.
 
         Args:
-            conditions: ``RolloutResp.tracks[slot].conditions`` — stage-typed conditions
+            conditions: ``Part.conditions`` — stage-typed conditions
                 are reconstructed inside the algorithm if needed.
-            segment: ``RolloutResp.tracks[slot].segment`` for this algorithm's
+            segment: ``Part.segment`` for this algorithm's
                 slot. Implementations may mutate field defaults that were
                 left ``None`` by the rollout (lazy initialization); they
                 must NOT mutate fields that the rollout already populated.
@@ -283,9 +283,9 @@ class StageAlgorithm(Remote, ABC):
         """Compute loss for one micro-batch and call ``.backward()``.
 
         Args:
-            conditions: ``RolloutResp.tracks[slot].conditions`` — stage-typed conditions
+            conditions: ``Part.conditions`` — stage-typed conditions
                 are reconstructed inside the algorithm if needed.
-            segment: ``RolloutResp.tracks[slot].segment`` — diffusion algorithms
+            segment: ``Part.segment`` — diffusion algorithms
                 read ``segment.sde_logp`` / ``segment.sde_indices`` /
                 ``segment.sigmas``; AR algorithms read ``segment.log_probs`` /
                 ``segment.cu_seqlens``.

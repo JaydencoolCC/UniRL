@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from unirl.distributed.tensor.batch import Batch, concat_field
-from unirl.types.rollout_req import PrimitiveValue
+from unirl.types.primitives import PrimitiveValue
 
 
 @dataclass
