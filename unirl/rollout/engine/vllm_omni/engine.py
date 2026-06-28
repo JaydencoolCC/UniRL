@@ -33,9 +33,9 @@ from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
-from unirl.rollout.engine.vllm_omni.utils import diffusion_gen_part
 from unirl.rollout.engine.vllm_omni.weight_sync import WeightSync
 from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 
 class VLLMOmniRolloutEngine(BaseRolloutEngine):
@@ -137,7 +137,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         request's (T, H, W). Shared across the part's samples (one params
         object). Idempotent — a pre-pinned σ is left as-is.
         """
-        gen_part = diffusion_gen_part(sample)
+        gen_part = sample.gen_part_or_none(DiffusionSamplingParams)
         if gen_part is None:
             return
         diffusion = gen_part.sampling_params

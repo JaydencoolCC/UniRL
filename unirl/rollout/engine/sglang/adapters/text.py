@@ -11,7 +11,7 @@ Holds the conversion logic once: chat-template encoding into per-prompt
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 
@@ -24,6 +24,7 @@ from unirl.rollout.engine.sglang.adapters.base import (
 from unirl.rollout.engine.sglang.backends import RawResult
 from unirl.rollout.engine.sglang.utils import (
     ResolvedSampling,
+    build_text_conversations,
     pack_prompt_condition,
 )
 from unirl.types.primitives import Texts
@@ -56,8 +57,6 @@ class TextLMAdapter(ModelAdapter):
     # ------------------------------------------------------------------ #
 
     def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
-        prompts = self.extract_prompts(sample)
-
         use_template = self._has_chat_template()
         require(
             use_template or sampling.system_instruction is None,
@@ -67,19 +66,34 @@ class TextLMAdapter(ModelAdapter):
 
         wire: List[Dict[str, Any]] = []
         prompt_token_ids: List[List[int]] = []
-        for prompt in prompts:
-            payload = self.base_payload(sampling)
-            if use_template:
-                ids = self.apply_chat_template(prompt, sampling.system_instruction)
+
+        if use_template:
+            # Render the whole trajectory (role-tagged turns), de-expanded to the
+            # unique conversations the backend fans out ``n`` per. Degenerates to a
+            # single user turn on single-turn requests (byte-identical to before).
+            conversations, k = build_text_conversations(sample, sampling.system_instruction)
+            require(
+                k == sampling.n,
+                f"{type(self).__name__}.build_inputs: de-expanded fan-out k={k} != "
+                f"resolved n={sampling.n}; conversation grouping and the sampling block "
+                "disagree on the gen branch.",
+            )
+            for messages in conversations:
+                payload = self.base_payload(sampling)
+                ids = self.apply_chat_template(messages)
                 payload["input_ids"] = ids
-            else:
-                # Raw-text completion mode — encode the raw prompt so the
-                # replay's prompt condition still carries the ids the server
-                # tokenized.
+                prompt_token_ids.append(list(ids))
+                wire.append(payload)
+        else:
+            # Raw-text completion mode — no chat template, so no roles/turns: encode
+            # the raw prompt so the replay's prompt condition still carries the ids
+            # the server tokenized.
+            for prompt in self.extract_prompts(sample):
+                payload = self.base_payload(sampling)
                 payload["text"] = prompt
                 ids = list(self._tokenizer.encode(prompt))
-            prompt_token_ids.append(list(ids))
-            wire.append(payload)
+                prompt_token_ids.append(list(ids))
+                wire.append(payload)
 
         return PreparedInputs(
             wire=wire,
@@ -103,23 +117,15 @@ class TextLMAdapter(ModelAdapter):
             "logprob_start_len": 0,
         }
 
-    def apply_chat_template(
-        self,
-        user_prompt: str,
-        system_instruction: Optional[str] = None,
-    ) -> List[int]:
-        """Build chat-formatted ``input_ids`` via the tokenizer's chat template.
+    def apply_chat_template(self, messages: List[Dict[str, Any]]) -> List[int]:
+        """Tokenize a chat conversation into ``input_ids`` via the chat template.
 
-        Only called in templated mode (``_has_chat_template``). A failure
-        raises: a set-but-broken template (bad ``chat_template_kwargs``, jinja
-        error) is a config bug — silently switching the run's prompt format
-        would corrupt training.
+        Only called in templated mode (``_has_chat_template``). ``messages`` is the
+        role-tagged conversation :func:`build_text_conversations` assembled (system
+        prefix + one message per turn). A failure raises: a set-but-broken template
+        (bad ``chat_template_kwargs``, jinja error) is a config bug — silently
+        switching the run's prompt format would corrupt training.
         """
-        messages: List[Dict[str, Any]] = []
-        if system_instruction:
-            messages.append({"role": "system", "content": system_instruction})
-        messages.append({"role": "user", "content": user_prompt})
-
         # tokenize=True + return_dict=False yields a bare List[int]. transformers
         # >=5 defaults return_dict=True, handing back a BatchEncoding that then
         # leaks into the JSON /generate payload ("Object of type BatchEncoding is

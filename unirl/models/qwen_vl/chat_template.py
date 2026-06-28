@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-import PIL.Image
 import torch
 
+from unirl.config.require import require
+from unirl.models.types.conversations import build_vision_messages
 from unirl.types.conditions import TextTokenCondition
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Images
+from unirl.types.sample import Turn
 
 from .bundle import QwenVLBundle
 from .conditions import QwenVLARConditions
@@ -31,30 +33,22 @@ class QwenVLChatTemplateStage:
         # Default False preserves the v1 dynamic-pad behavior.
         self.pad_to_max_length = bool(pad_to_max_length)
 
-    def embed(
-        self,
-        texts: Texts,
-        images: Optional[List[Optional[PIL.Image.Image]]] = None,
-    ) -> QwenVLARConditions:
+    def embed(self, turns: List[Turn]) -> QwenVLARConditions:
+        """Render the trajectory ``turns`` into one fused chat conversation per
+        frontier sample (image-before-text, inline PIL), processor-encode each, and
+        pack into VLM AR conditions. Degenerates to today's single ``user`` message
+        (image + text) on a single-turn it2i request."""
+        require(
+            sum(isinstance(t.content, Images) for t in turns) <= 1,
+            "QwenVLChatTemplateStage.embed: at most one image turn per request is "
+            "supported (multi-image trajectories are out of scope).",
+        )
         processor = self.bundle.processor
         device = self.bundle.device
         dtype = self.bundle.dtype
-        batch_size = len(texts.texts)
 
         per_sample_inputs = []
-        for i, text in enumerate(texts.texts):
-            content: list = []
-            sample_images: list = []
-            if images is not None and i < len(images) and images[i] is not None:
-                content.append({"type": "image", "image": images[i]})
-                sample_images.append(images[i])
-            content.append({"type": "text", "text": text})
-
-            messages: list = []
-            if self.system_instruction is not None:
-                messages.append({"role": "system", "content": self.system_instruction})
-            messages.append({"role": "user", "content": content})
-
+        for messages in build_vision_messages(turns, self.system_instruction):
             inputs = processor.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
@@ -63,6 +57,7 @@ class QwenVLChatTemplateStage:
                 return_tensors="pt",
             )
             per_sample_inputs.append(inputs)
+        batch_size = len(per_sample_inputs)
 
         if self.pad_to_max_length:
             max_len = self.max_prompt_length

@@ -30,15 +30,6 @@ from unirl.types.sampling import is_forward_process
 from unirl.types.segments.latent import make_image_segment
 
 
-def _prompts_per_sample(sample: Sample) -> List[str]:
-    """Prompt text aligned 1:1 with the frontier gen ``Part``'s samples, recovered
-    from the input ``Part`` by lineage (each gen sample's parent id → its prompt)."""
-    input_part, gen_part = sample.parts[0], sample.parts[-1]
-    texts = list(input_part.primitive.texts) if input_part.primitive is not None else []
-    pid_to_prompt = dict(zip(input_part.sample_ids, texts))
-    return [pid_to_prompt[pid] for pid in gen_part.group_ids]
-
-
 class ImageAdapter(ModelAdapter):
     """Conversion for image-output families (SD3, FLUX, …). Default path end-to-end."""
 
@@ -207,7 +198,8 @@ class ImageAdapter(ModelAdapter):
         forward-batch chunks (a chunk may hold a partial group).
         """
         gen_part = sample.parts[-1]
-        prompts = _prompts_per_sample(sample)
+        # text-only consumer: the frontier-aligned prompt is the (single) text turn.
+        prompts = list(sample.text_conditioning()[0].content.texts)
         unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(gen_part.group_ids))
         out: Dict[str, Any] = {
             "prompt": unique_prompts if len(unique_prompts) > 1 else unique_prompts[0],
@@ -242,7 +234,7 @@ class ImageAdapter(ModelAdapter):
 
     def build_response(self, sample: Sample, raw: List[RawResult]) -> Sample:
         require(bool(raw), "build_response: SGLang returned no results")
-        input_part, gen_part = sample.parts[0], sample.parts[-1]
+        gen_part = sample.parts[-1]
         diffusion = gen_part.sampling_params
         require(
             diffusion is not None and diffusion.sigmas is not None,
@@ -271,10 +263,9 @@ class ImageAdapter(ModelAdapter):
         if self.cfg.populate_conditions:
             conditions = self.build_condition(raw)
 
-        # Fill the frontier gen Part with the generation outputs; the input Part
-        # (prompts) is preserved as the chain head.
-        filled = gen_part.fill(segment=segment, primitive=decoded, conditions=conditions)
-        return Sample(parts=[input_part, filled])
+        # Fill the frontier gen Part; ``with_filled_frontier`` preserves every
+        # preceding part (the prompt head and any chained inputs).
+        return sample.with_filled_frontier(segment=segment, primitive=decoded, conditions=conditions)
 
     # ------------------------------------------------------------------ #
     # Overridable conversion steps (defaults delegate to utils)

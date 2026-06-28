@@ -25,14 +25,7 @@ from typing import Callable, Tuple
 import torch
 
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
-from unirl.rollout.engine.vllm_omni.utils import (
-    ar_gen_part,
-    assemble_sample,
-    cot_text_from_sample,
-    diffusion_gen_part,
-    image_input_part,
-    texts_from_sample,
-)
+from unirl.rollout.engine.vllm_omni.utils import assemble_sample
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Image, Images, Texts
 from unirl.types.sample import Part, Sample, _part_with_field
@@ -56,28 +49,20 @@ def _two_stage_sample() -> Tuple[Sample, Part, Part, Part]:
     """``[input(P=2), ar(P*N, N=1), image(P*N*M, M=1)]`` — the HI3 t2i shape."""
     inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))
     ar_shell = inp.fork(1, sampling_params=ARSamplingParams())
-    img_shell = ar_shell.fork(
-        1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256)
-    )
+    img_shell = ar_shell.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     return Sample(parts=[inp, ar_shell, img_shell]), inp, ar_shell, img_shell
 
 
 def check_part_extraction() -> None:
-    """The part-extraction helpers route by ``sampling_params`` type / primitive."""
+    """Stage location by ``sampling_params`` TYPE + the conditioning read."""
     sample, _inp, ar_shell, img_shell = _two_stage_sample()
-    _check(ar_gen_part(sample) is ar_shell, "ar_gen_part must return the AR shell")
-    _check(diffusion_gen_part(sample) is img_shell, "diffusion_gen_part must return the image shell")
-    _check(image_input_part(sample) is None, "image_input_part must be None (no Images input Part present)")
-    _check(list(texts_from_sample(sample).texts) == ["a cat", "a dog"], "texts_from_sample returns input prompts")
-
-    # A prompt/gen count mismatch must fail fast (mis-forked Sample).
-    mismatched = Sample(
-        parts=[
-            Part.input(["p0"], primitive=Texts(texts=["x", "y"])),
-            Part.input(["p0"], primitive=Texts(texts=["x", "y"])).fork(1, sampling_params=ARSamplingParams()),
-        ]
+    _check(sample.gen_part(ARSamplingParams) is ar_shell, "gen_part locates the AR shell")
+    _check(sample.gen_part(DiffusionSamplingParams) is img_shell, "gen_part locates the image shell")
+    _check(not sample.has_image_input(), "has_image_input False (no Images input Part present)")
+    _check(
+        list(sample.text_conditioning()[0].content.texts) == ["a cat", "a dog"],
+        "text_conditioning surfaces the input prompts",
     )
-    _expect_raises(lambda: texts_from_sample(mismatched), ValueError, "prompt/gen count mismatch must raise")
 
 
 def check_assemble_sample() -> None:
@@ -179,13 +164,9 @@ def check_multi_input_image_chain() -> None:
         .fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     )
     _check(len(sample.parts) == 4, "multi-input chain has 4 parts [text, image, ar, image]")
-    _check(image_input_part(sample) is sample.parts[1], "image_input_part finds the chained image input")
-    _check(ar_gen_part(sample) is sample.parts[2], "ar_gen_part routes past the image input Part")
-    _check(diffusion_gen_part(sample) is sample.parts[3], "diffusion_gen_part routes past the image input Part")
-    _check(
-        list(texts_from_sample(sample).texts) == ["edit the cat", "edit the dog"],
-        "texts_from_sample reads the prompt head",
-    )
+    _check(sample.has_image_input(), "has_image_input True (chained image input)")
+    _check(sample.gen_part(ARSamplingParams) is sample.parts[2], "gen_part routes past the image input Part")
+    _check(sample.gen_part(DiffusionSamplingParams) is sample.parts[3], "gen_part routes past the image input Part")
     cond = sample.conditioning()
     _check(
         len(cond) == 2 and isinstance(cond[0], Texts) and isinstance(cond[1], Images),
@@ -203,24 +184,19 @@ def check_multi_input_image_chain() -> None:
 
 
 def check_cot_text_chain() -> None:
-    """dit_recaption-shaped multi-input ``[text, cot_text_input, image_gen]``: cot_text_from_sample
-    finds the chained recaption Texts and the count guard fires on mismatch."""
+    """dit_recaption-shaped ``[text, cot_text_input, image_gen]``: the chained recaption
+    is the second text turn of ``text_conditioning()`` (1:1 with prompts by lineage)."""
     text = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))
     cot_in = text.input_child(Texts(texts=["a fluffy ginger cat", "a happy golden dog"]))
     sample = Sample.request(text, cot_in).fork(
         1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256)
     )
+    turns = sample.text_conditioning()
+    _check(list(turns[0].content.texts) == ["a cat", "a dog"], "text_conditioning()[0] is the prompt")
     _check(
-        list(cot_text_from_sample(sample).texts) == ["a fluffy ginger cat", "a happy golden dog"],
-        "cot_text_from_sample returns the chained recaption Texts",
+        list(turns[1].content.texts) == ["a fluffy ginger cat", "a happy golden dog"],
+        "text_conditioning()[1] is the chained recaption",
     )
-    # cot count != prompt count must raise (prompts=1, cot=2; gen count matches prompts so the
-    # texts_from_sample guard passes and the cot guard is what fires)
-    bad_text = Part.input(["p0"], primitive=Texts(texts=["a cat"]))
-    bad = Sample.request(bad_text, bad_text.input_child(Texts(texts=["x", "y"]))).fork(
-        1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256)
-    )
-    _expect_raises(lambda: cot_text_from_sample(bad), ValueError, "cot/prompt count mismatch must raise")
 
 
 def check_root_group_ids() -> None:
@@ -342,7 +318,9 @@ def check_rollout_metric_naming() -> None:
     from unirl.utils.wandb_metrics import compute_rollout_sample_metrics
 
     inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
-    ar = _part_with_field(inp.fork(2, sampling_params=ARSamplingParams()), "rewards", torch.arange(4, dtype=torch.float32))
+    ar = _part_with_field(
+        inp.fork(2, sampling_params=ARSamplingParams()), "rewards", torch.arange(4, dtype=torch.float32)
+    )
     img = _part_with_field(
         ar.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256)),
         "rewards",
@@ -363,9 +341,7 @@ def check_disable_driver_xt_flag() -> None:
     _check(d.disable_driver_xt is False, "disable_driver_xt defaults to False")
     _check(dataclasses.replace(d, disable_driver_xt=True).disable_driver_xt is True, "replace sets the flag")
     _check(
-        DiffusionSamplingParams(
-            num_inference_steps=4, height=256, width=256, disable_driver_xt=True
-        ).disable_driver_xt
+        DiffusionSamplingParams(num_inference_steps=4, height=256, width=256, disable_driver_xt=True).disable_driver_xt
         is True,
         "recipe can construct with the flag set",
     )
@@ -379,8 +355,12 @@ def check_noise_recipe_from_sample() -> None:
     img = inp.fork(
         2,
         sampling_params=DiffusionSamplingParams(
-            num_inference_steps=4, height=256, width=256, seed=7,
-            init_noise_latent_shape=[16, 32, 32], init_same_noise=False,
+            num_inference_steps=4,
+            height=256,
+            width=256,
+            seed=7,
+            init_noise_latent_shape=[16, 32, 32],
+            init_same_noise=False,
         ),
     )
     recipe = NoiseRecipe.from_sample(Sample(parts=[inp, img]))
@@ -392,8 +372,12 @@ def check_noise_recipe_from_sample() -> None:
     img_shared = inp.fork(
         2,
         sampling_params=DiffusionSamplingParams(
-            num_inference_steps=4, height=256, width=256, seed=7,
-            init_noise_latent_shape=[16, 32, 32], init_same_noise=True,
+            num_inference_steps=4,
+            height=256,
+            width=256,
+            seed=7,
+            init_noise_latent_shape=[16, 32, 32],
+            init_same_noise=True,
         ),
     )
     shared = NoiseRecipe.from_sample(Sample(parts=[inp, img_shared]))

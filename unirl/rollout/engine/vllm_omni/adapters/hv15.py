@@ -18,16 +18,15 @@ from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutp
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
 from unirl.rollout.engine.vllm_omni.utils import (
     collect_dit_outputs,
-    diffusion_gen_part,
     grouped_pils_to_videos,
-    image_input_part,
 )
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 
 def _num_frames(sample: Sample) -> int:
-    return int(getattr(diffusion_gen_part(sample).sampling_params, "num_frames", 5))
+    return int(getattr(sample.gen_part(DiffusionSamplingParams).sampling_params, "num_frames", 5))
 
 
 class Hv15InputAdapter(DitInputAdapter):
@@ -143,7 +142,7 @@ class Hv15T2vAdapter(ModelAdapter):
         self.output_adapter = Hv15VideoOutputAdapter(self.modality)
 
     def validate_request(self, sample: Sample) -> None:
-        if image_input_part(sample) is not None:
+        if sample.has_image_input():
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use an image-conditioned modality instead."
             )

@@ -33,7 +33,7 @@ from unirl.distributed.tensor.batch import (
 from unirl.distributed.tensor.ref import hydrate
 from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
-from unirl.types.primitives import Audios, Images, Texts, Videos
+from unirl.types.primitives import Audios, Images, Texts, Videos, primitive_modality_key
 from unirl.types.sample_id import child_id, parent_id
 from unirl.types.sampling import BaseSamplingParams
 from unirl.types.segments import Segment
@@ -45,6 +45,26 @@ logger = logging.getLogger(__name__)
 # the encoded ``segment``: given content on an input Part, decoded output on a
 # generation Part. One value (a Part is single-modality).
 Primitive = Union[Texts, Images, Videos, Audios]
+
+# The conversation roles a turn can carry when a trajectory is rendered for an
+# LLM/VLM consumer (see :meth:`Sample.turns` and the ``*_conditioning`` renderers).
+# ``system`` / ``tool`` are not derivable — set ``Part.role`` explicitly for them.
+TURN_ROLES = ("system", "user", "assistant", "tool")
+
+
+@dataclass
+class Turn:
+    """One conditioning turn: a role tag + its frontier-aligned content primitive.
+
+    The unit :meth:`Sample.turns` surfaces — a role-aware view over the
+    :meth:`Sample.conditioning` ancestor walk, so a multi-turn (agent) trajectory
+    can be rendered into an LLM/VLM conversation. A plain return type (not a
+    :class:`Batch`): ``content`` is already a batched primitive (one row per
+    frontier sample).
+    """
+
+    role: str
+    content: Primitive
 
 
 @dataclass
@@ -86,6 +106,10 @@ class Part(Batch):
     control: Dict[str, Any] = shared_field(default_factory=dict)
     # The sampling params this part was generated under (provenance; set at fork).
     sampling_params: Optional[BaseSamplingParams] = shared_field(default=None)
+    # Conversation role for trajectory → LLM/VLM rendering (one of ``TURN_ROLES``).
+    # Per-part (shared across the part's fan-out samples). ``None`` ⇒ derived by
+    # :meth:`resolved_role` (gen part → ``"assistant"``, input → ``"user"``).
+    role: Optional[str] = shared_field(default=None)
 
     @classmethod
     def input(
@@ -96,6 +120,7 @@ class Part(Batch):
         primitive: Optional[Primitive] = None,
         control: Optional[Dict[str, Any]] = None,
         metadata: Optional[List[Optional[Dict[str, Any]]]] = None,
+        role: Optional[str] = None,
     ) -> "Part":
         """Build a turn-0 input Part (the prompt, a root; untrained).
 
@@ -115,9 +140,10 @@ class Part(Batch):
             primitive=primitive,
             control=dict(control) if control else {},
             metadata=list(metadata) if metadata else [],
+            role=role,
         )
 
-    def input_child(self, primitive: Primitive) -> "Part":
+    def input_child(self, primitive: Primitive, *, role: Optional[str] = None) -> "Part":
         """A branch-1 *input* child carrying an extra conditioning modality.
 
         Multi-input multimodal (e.g. image+text → image): a Part is
@@ -133,6 +159,7 @@ class Part(Batch):
         return Part(
             sample_ids=[child_id(pid, 0) for pid in self.sample_ids],
             primitive=primitive,
+            role=role,
         )
 
     @property
@@ -146,6 +173,17 @@ class Part(Batch):
         """Whether this is a chain head (input/root) — its sample ids carry no
         lineage segment. An empty part is not a root (no samples to root)."""
         return bool(self.sample_ids) and not any("/" in sid for sid in self.sample_ids)
+
+    def resolved_role(self) -> str:
+        """This turn's conversation role, deriving when :attr:`role` is unset.
+
+        Explicit :attr:`role` wins; otherwise a generated part (carries
+        ``sampling_params``) is ``"assistant"`` and an input part is ``"user"``.
+        ``system`` / ``tool`` turns are not derivable — set :attr:`role` for them.
+        """
+        if self.role is not None:
+            return self.role
+        return "assistant" if self.sampling_params is not None else "user"
 
     @property
     def group_ids(self) -> List[str]:
@@ -501,6 +539,16 @@ class Sample(Batch):
                 return p
         raise ValueError(f"Sample.gen_part: no Part with sampling_params of type {params_type.__name__}")
 
+    def gen_part_or_none(self, params_type: type) -> Optional[Part]:
+        """:meth:`gen_part`, but returns ``None`` instead of raising when no Part of
+        ``params_type`` is present — the Optional replacement for the file-level
+        ``diffusion_gen_part`` / ``ar_gen_part`` readers (e.g. a text-out / AR-only
+        request carries no diffusion stage)."""
+        for p in self.parts:
+            if isinstance(p.sampling_params, params_type):
+                return p
+        return None
+
     def gen_part_index(self, params_type: type) -> int:
         """Index of :meth:`gen_part` — for write-back (e.g. replacing a Part with
         its advantage-filled version via :meth:`with_parts`)."""
@@ -597,23 +645,23 @@ class Sample(Batch):
 
         return type(self)(parts=new_parts, reward_compute_s=self.reward_compute_s)
 
-    def conditioning(self) -> List[Primitive]:
-        """Conditioning inputs for generating the frontier (last) part: each
-        ancestor's ``primitive`` (raw text/image), row-aligned to the frontier's
-        samples, in chronological order (root → frontier-parent). The model encodes
-        these into its own conditions, mapping position → turn via the fixed
-        schedule. Undecoded ancestors (``primitive is None``) are skipped; to get a
-        non-frontier part's conditioning (replay), call this on ``parts[:i+1]``.
+    def turns(self) -> List[Turn]:
+        """Role-tagged, turn-ordered, frontier-aligned conditioning — the agent
+        substrate. The same ancestor walk as :meth:`conditioning`, but each
+        surfaced primitive is paired with its part's :meth:`Part.resolved_role`,
+        so a multi-turn trajectory can be rendered into an LLM/VLM conversation.
 
         Ancestors are walked by id: ``active_ids`` are the ancestor ids aligned to
         the frontier's samples, climbed one level per step via ``parent_id``; each
-        level's rows are looked up by id (position-independent)."""
+        level's rows are looked up by id (position-independent). Undecoded ancestors
+        (``primitive is None``) are skipped; for a non-frontier part's turns
+        (replay), call this on ``parts[:i+1]``."""
         if not self.parts:
             return []
         frontier = self.parts[-1]
         if frontier.is_root:
             return []
-        out: List[Primitive] = []
+        out: List[Turn] = []
         active_ids = [parent_id(sid) for sid in frontier.sample_ids]
         anc = len(self.parts) - 2
         while anc >= 0:
@@ -623,11 +671,11 @@ class Sample(Batch):
                 rows = [sid_to_row[aid] for aid in active_ids]
             except KeyError as e:
                 raise ValueError(
-                    f"Sample.conditioning: ancestor id {e.args[0]!r} not found in part {anc}; "
-                    f"lineage chain is malformed."
+                    f"Sample.turns: ancestor id {e.args[0]!r} not found in part {anc}; lineage chain is malformed."
                 ) from None
             if part.primitive is not None:
-                out.append(part.primitive.select(torch.tensor(rows, dtype=torch.long)))
+                content = part.primitive.select(torch.tensor(rows, dtype=torch.long))
+                out.append(Turn(role=part.resolved_role(), content=content))
             if part.is_root:
                 break
             active_ids = [parent_id(aid) for aid in active_ids]
@@ -635,9 +683,60 @@ class Sample(Batch):
         out.reverse()  # chronological: root → frontier-parent
         return out
 
+    def conditioning(self) -> List[Primitive]:
+        """Conditioning primitives for generating the frontier (last) part: each
+        ancestor's ``primitive`` (raw text/image), row-aligned to the frontier's
+        samples, in chronological order (root → frontier-parent). The role-stripped
+        view of :meth:`turns` — the bare-primitive escape unified models consume
+        (replay: call on ``parts[:i+1]``)."""
+        return [t.content for t in self.turns()]
+
+    def text_conditioning(self) -> List[Turn]:
+        """LLM render: the trajectory as an all-text conversation. Fails loud on
+        any non-text turn — this consumer has no image channel."""
+        ts = self.turns()
+        non_text = [primitive_modality_key(t.content) for t in ts if not isinstance(t.content, Texts)]
+        if non_text:
+            raise ValueError(f"Sample.text_conditioning: the LLM path requires all-text turns; got non-text {non_text}")
+        return ts
+
+    def vision_conditioning(self) -> tuple[List[Turn], List[Images]]:
+        """VLM render: the trajectory as a text+image conversation. Returns the
+        role-tagged turns (for placeholder ordering) plus the image collection
+        (1..k, for the processor). Fails loud on zero images or any non-text/image
+        modality."""
+        ts = self.turns()
+        images = [t.content for t in ts if isinstance(t.content, Images)]
+        extra = [primitive_modality_key(t.content) for t in ts if not isinstance(t.content, (Texts, Images))]
+        if extra or not images:
+            raise ValueError(
+                f"Sample.vision_conditioning: requires text+image turns only; got "
+                f"{[primitive_modality_key(t.content) for t in ts]}"
+            )
+        return ts, images
+
+    def has_image_input(self) -> bool:
+        """Whether any non-frontier Part carries an ``Images`` primitive — the
+        boolean replacement for the retired ``image_input_part`` reject/require
+        guards."""
+        return any(isinstance(p.primitive, Images) for p in self.parts[:-1])
+
+    def replace_frontier(self, part: Part) -> "Sample":
+        """Swap the frontier (last) part, preserving the chain (``parts[:-1]``) and
+        ``reward_compute_s`` — the structural write-back for the adapter output
+        rebuild and chunk slice/concat (mirrors trainside; never drops intermediates)."""
+        return self.with_parts([*self.parts[:-1], part])
+
+    def with_filled_frontier(self, **fill_kwargs: Any) -> "Sample":
+        """Fill the frontier gen shell with generation outputs, chain preserved —
+        ``with_filled_frontier(segment=…, primitive=…, conditions=…)``."""
+        return self.replace_frontier(self.parts[-1].fill(**fill_kwargs))
+
 
 __all__ = [
     "Sample",
     "Part",
     "Primitive",
+    "Turn",
+    "TURN_ROLES",
 ]

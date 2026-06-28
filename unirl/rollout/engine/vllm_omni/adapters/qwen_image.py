@@ -31,14 +31,10 @@ import torch
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
-from unirl.rollout.engine.vllm_omni.utils import (
-    collect_dit_outputs,
-    diffusion_gen_part,
-    image_input_part,
-    texts_from_sample,
-)
+from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 
 def _ragged_pad_cat(pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> TextEmbedCondition:
@@ -77,10 +73,9 @@ class QwenImageInputAdapter(DitInputAdapter):
         the key (``""`` counts as present), so the shared skeleton's
         unconditional ``negative_prompt: ""`` cannot be reused here.
         """
-        if image_input_part(sample) is not None:
-            raise ValueError(f"modality={self.modality!r} does not accept an image input Part")
-        texts = texts_from_sample(sample)
-        diff_params = diffusion_gen_part(sample).sampling_params
+        # text-only consumer: text_conditioning() fails loud if an image turn is present.
+        texts = sample.text_conditioning()[0].content
+        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
         if float(diff_params.guidance_scale) > 1.0:
             negative_prompt = str(getattr(diff_params, "negative_prompt", "") or "")
             return [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
@@ -88,7 +83,7 @@ class QwenImageInputAdapter(DitInputAdapter):
 
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         sampling = super().build_sampling(sample)
-        diff_params = diffusion_gen_part(sample).sampling_params
+        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
         kwargs = sampling[0].kwargs
         # Qwen's CFG knob: set it ALWAYS so upstream's ``or 4.0`` default
         # never fires (at <= 1.0 ``do_true_cfg`` stays False regardless of
@@ -163,7 +158,7 @@ class QwenImageT2iAdapter(ModelAdapter):
         self.output_adapter = QwenImageOutputAdapter(self.modality)
 
     def validate_request(self, sample: Sample) -> None:
-        if image_input_part(sample) is not None:
+        if sample.has_image_input():
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use an image-conditioned modality instead."
             )

@@ -27,14 +27,12 @@ from unirl.rollout.engine.vllm_omni.utils import (
     build_ar_segment,
     build_image_segment,
     collect_dit_outputs,
-    diffusion_gen_part,
-    image_input_part,
     pils_to_images,
-    texts_from_sample,
 )
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
 from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 
 class DitInputAdapter:
@@ -56,10 +54,9 @@ class DitInputAdapter:
 
     def build_prompts(self, sample: Sample) -> List[Any]:
         """The per-prompt dicts: the ``{"prompt", "negative_prompt"}`` shape."""
-        if image_input_part(sample) is not None:
-            raise ValueError(f"modality={self.modality!r} does not accept an image input Part")
-        texts = texts_from_sample(sample)
-        diff_params = diffusion_gen_part(sample).sampling_params
+        # text-only consumer: text_conditioning() fails loud if an image turn is present.
+        texts = sample.text_conditioning()[0].content
+        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
         negative_prompt = str(getattr(diff_params, "negative_prompt", "") or "")
         return [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
 
@@ -67,7 +64,7 @@ class DitInputAdapter:
         """The single diffusion-stage intent: the typed diffusion kwargs,
         optional ``max_sequence_length`` / ``seed``, sparse SDE indices, and
         the driver-authoritative x_T recipe."""
-        gen_part = diffusion_gen_part(sample)
+        gen_part = sample.gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
 
         diff_kwargs = core_diff_kwargs(diff_params)
@@ -123,7 +120,7 @@ class DitOutputAdapter:
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        expected_sigmas = diffusion_gen_part(sample).sampling_params.sigmas
+        expected_sigmas = sample.gen_part(DiffusionSamplingParams).sampling_params.sigmas
         segments = {self.track_name: build_image_segment(diff_outputs, expected_sigmas=expected_sigmas)}
         # Parity with v1's unconditional Stage-0 sweep: a single-DiT stage
         # carries no completions, so this is None unless something upstream

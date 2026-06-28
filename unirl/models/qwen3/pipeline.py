@@ -23,12 +23,12 @@ schedule — the hosting engine's σ-pinning is a no-op for AR-only pipelines.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from unirl.models.types.ar import ARSamplingParams
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
-from unirl.types.sample import Sample
+from unirl.types.sample import Sample, Turn
 
 from .ar import Qwen3ARParams, Qwen3ARStage
 from .bundle import Qwen3Bundle
@@ -41,15 +41,18 @@ class Qwen3Pipeline(Pipeline):
     """Qwen3 AR generate pipeline: ``Sample → Sample``.
 
     Consumes a request ``Sample`` whose frontier (last) Part is a pre-forked AR
-    gen shell carrying ``ARSamplingParams``. Reads the prompt via
-    ``sample.conditioning()`` (an optional ``{"system_instruction": str}`` override
-    rides on the input Part's ``control["chat"]``) and fills the frontier Part:
+    gen shell carrying ``ARSamplingParams``. Reads the full role-tagged trajectory
+    via ``sample.text_conditioning()`` (one message per turn; an optional
+    ``{"system_instruction": str}`` override rides on the input Part's
+    ``control["chat"]``) and fills the frontier Part:
 
     - ``segment: TextSegment`` — the generated tokens + full-softmax log-probs.
     - ``primitive: Texts`` — detokenized response strings.
 
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``).conditioning()`` via :meth:`_conditions_for`, so rollout and
-    replay build the prompt conditions through one shared path.
+    ``Part.conditions`` carries the encoded prompt conditions; trainer-side replay
+    teacher-forces over those *stored* ids (it re-types them via
+    ``conditions_cls.from_dict``), so the encode here is the single source of truth
+    and the importance ratio stays consistent.
     """
 
     def __init__(
@@ -125,14 +128,12 @@ class Qwen3Pipeline(Pipeline):
         )
         return cls(bundle=bundle, chat_template=chat_template, ar=ar)
 
-    def _conditions_for(self, texts: Texts, control: Optional[Dict[str, Any]] = None) -> Qwen3ARConditions:
-        """Chat-template + tokenize prompts → :class:`Qwen3ARConditions`. Shared by
-        rollout-``generate`` and trainer-side replay (re-tokenize), so both build the
-        prompt conditions through one path — the re-tokenization must be
-        byte-identical to rollout, which routing through this single path guarantees.
+    def _conditions_for(self, turns: List[Turn], control: Optional[Dict[str, Any]] = None) -> Qwen3ARConditions:
+        """Chat-template + tokenize the trajectory ``turns`` → :class:`Qwen3ARConditions`.
 
-        An optional per-request ``system_instruction`` override rides on the input
-        Part's ``control["chat"]``.
+        The rollout encode path: production replay teacher-forces over the *stored*
+        conditions this produces (not a re-encode). An optional per-request
+        ``system_instruction`` override rides on the input Part's ``control["chat"]``.
         """
         chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
         if "system_instruction" in chat_overrides:
@@ -144,7 +145,7 @@ class Qwen3Pipeline(Pipeline):
             )
         else:
             chat_stage = self.chat_template
-        return chat_stage.embed(texts)
+        return chat_stage.embed(turns)
 
     def generate(self, sample: Sample) -> Sample:
         """Run Qwen3 AR generation end-to-end, filling the frontier (pre-forked) gen Part."""
@@ -156,15 +157,10 @@ class Qwen3Pipeline(Pipeline):
                 f"got {type(ar).__name__ if ar is not None else 'None'}"
             )
 
-        conditioning = sample.conditioning()
-        texts = conditioning[0] if conditioning else None
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"Qwen3Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
-
-        conds = self._conditions_for(texts, sample.parts[0].control)
+        # Full role-tagged trajectory (one turn per message), frontier-aligned —
+        # text_conditioning() fails loud on any non-text turn.
+        turns = sample.text_conditioning()
+        conds = self._conditions_for(turns, sample.parts[0].control)
 
         # Normalize the gen shell's ARSamplingParams through Qwen3ARParams (parity
         # with the prior req-sourced path: stop_token_id reset, types coerced).

@@ -89,20 +89,20 @@ def main() -> int:
         assert isinstance(gen.primitive, Texts) and len(gen.primitive.texts) == n_expect, (
             f"expected {n_expect} decoded texts"
         )
-        assert not gen.conditions, "trainside path must leave Part.conditions empty (replay re-encodes)"
-        _log(f"rollout PASS: {n_expect} completions; conditions empty ✓")
+        assert gen.conditions, "trainside path stores Part.conditions for replay (re-typed via from_dict)"
+        _log(f"rollout PASS: {n_expect} completions; conditions stored ✓")
 
         # ---- replay (twice) at fixed weights: the production old_logp_source=replay path ----
         _log("re-tokenizing conditions from the filled Sample and replaying (x2) ...")
         temperature = float(gen.sampling_params.temperature)
-        texts = out.conditioning()[0]
+        turns, _images = out.vision_conditioning()
         control = out.parts[0].control
         model = pipeline.ar.trainable_module()
         was_training = model.training
         model.eval()
         try:
             with torch.no_grad():
-                conds = pipeline._conditions_for(texts, None, control)
+                conds = pipeline._conditions_for(turns, control)
                 new1 = pipeline.ar.replay(conds, segment=gen.segment, temperature=temperature)
                 new2 = pipeline.ar.replay(conds, segment=gen.segment, temperature=temperature)
         finally:

@@ -1,10 +1,11 @@
-"""Qwen3ChatTemplateStage — ``Texts → Qwen3ARConditions``.
+"""Qwen3ChatTemplateStage — ``List[Turn] → Qwen3ARConditions``.
 
-Implements ``EmbedStage[Texts, Qwen3ARConditions]`` from
-:mod:`unirl.models.types.embedding`. Applies the bundle
-tokenizer's chat template (with ``add_generation_prompt=True``) so the
-AR stage starts from the canonical assistant-turn prefix the model was
-trained against.
+Implements ``EmbedStage[List[Turn], Qwen3ARConditions]`` from
+:mod:`unirl.models.types.embedding`. Renders the role-tagged trajectory
+(:meth:`Sample.text_conditioning`) into one chat conversation per frontier sample
+and applies the bundle tokenizer's chat template (with
+``add_generation_prompt=True``) so the AR stage starts from the canonical
+assistant-turn prefix the model was trained against.
 
 An optional ``system_instruction`` string is prepended as a ``system``
 message — callers that need byte-for-byte parity with an SFT template
@@ -18,15 +19,16 @@ from typing import List, Optional
 
 import torch
 
+from unirl.models.types.conversations import build_text_messages
 from unirl.models.types.embedding import EmbedStage
 from unirl.types.conditions import TextTokenCondition
-from unirl.types.primitives import Texts
+from unirl.types.sample import Turn
 
 from .bundle import Qwen3Bundle
 from .conditions import Qwen3ARConditions
 
 
-class Qwen3ChatTemplateStage(EmbedStage[Texts, Qwen3ARConditions]):
+class Qwen3ChatTemplateStage(EmbedStage[List[Turn], Qwen3ARConditions]):
     """Apply the Qwen3 chat template, right-pad in batch, return AR conditions."""
 
     def __init__(
@@ -45,17 +47,18 @@ class Qwen3ChatTemplateStage(EmbedStage[Texts, Qwen3ARConditions]):
         # prompts diverge and the importance ratio breaks.
         self.enable_thinking = bool(enable_thinking)
 
-    def embed(self, p: Texts) -> Qwen3ARConditions:
-        """Tokenize ``p.texts`` via the chat template and pack into AR conditions."""
+    def embed(self, turns: List[Turn]) -> Qwen3ARConditions:
+        """Render the trajectory ``turns`` into one chat conversation per frontier
+        sample, tokenize via the chat template, and pack into AR conditions.
+
+        Multi-turn: ``turns`` (from :meth:`Sample.text_conditioning`) becomes one
+        role-tagged message per turn, per sample. Degenerates to today's single
+        ``user`` message when no roles are set (byte-identical, single-turn)."""
         tokenizer = self.bundle.tokenizer
         device = self.bundle.device
 
         per_sample_ids: List[torch.Tensor] = []
-        for text in p.texts:
-            messages: List[dict] = []
-            if self.system_instruction is not None:
-                messages.append({"role": "system", "content": self.system_instruction})
-            messages.append({"role": "user", "content": text})
+        for messages in build_text_messages(turns, self.system_instruction):
             ids = tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,

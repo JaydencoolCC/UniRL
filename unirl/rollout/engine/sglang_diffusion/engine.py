@@ -137,16 +137,15 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         if fbs is None or bs <= fbs:
             return self._generate_batch(sample)
 
-        # Slice the gen part into chunks; the input part (prompts) is small and
-        # shared, so keep it whole and concat the filled gen parts back.
-        input_part = sample.parts[0]
+        # Slice the gen frontier into chunks; ``replace_frontier`` keeps the input
+        # part(s) whole (mirrors trainside; preserves any chained inputs).
         gen_chunks: List[Part] = []
         for start in range(0, bs, fbs):
             end = min(start + fbs, bs)
-            chunk = self._generate_batch(Sample(parts=[input_part, gen.slice(start, end)]))
+            chunk = self._generate_batch(sample.replace_frontier(gen.slice(start, end)))
             gen_chunks.append(chunk.parts[-1])
             torch.cuda.empty_cache()
-        return Sample(parts=[input_part, Part.concat(gen_chunks)])
+        return sample.replace_frontier(Part.concat(gen_chunks))
 
     def _ensure_sample_sigmas(self, sample: Sample) -> None:
         """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``.
@@ -180,20 +179,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         """
         gen = sample.parts[-1]
         diffusion = gen.sampling_params
-        seg = gen.segment
-        initial_latents = getattr(seg, "initial_latents", None) if seg is not None else None
-        share = bool(getattr(diffusion, "init_same_noise", False)) if diffusion is not None else False
-        keys = gen.group_ids if share else list(gen.sample_ids)
-        recipe = NoiseRecipe(
-            noise_group_ids=[str(k) for k in keys],
-            base_seed=int(diffusion.seed) if diffusion is not None and diffusion.seed is not None else 0,
-            latent_shape=(
-                tuple(diffusion.init_noise_latent_shape)
-                if diffusion is not None and diffusion.init_noise_latent_shape
-                else None
-            ),
-            initial_latents=initial_latents,
-        )
+        recipe = NoiseRecipe.from_sample(sample)
         xt = recipe.resolve()
         if xt is not None:
             return xt

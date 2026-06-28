@@ -16,7 +16,7 @@ import torch
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult
-from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs, image_input_part
+from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.sample import Sample
 
@@ -72,7 +72,7 @@ class Sd3T2iAdapter(ModelAdapter):
         self.output_adapter = Sd3OutputAdapter(self.modality)
 
     def validate_request(self, sample: Sample) -> None:
-        if image_input_part(sample) is not None:
+        if sample.has_image_input():
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use an image-conditioned modality instead."
             )

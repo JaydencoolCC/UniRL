@@ -37,10 +37,12 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
     top_p / top_k / max_new_tokens) > the input ``Part``'s ``control['ar']`` bag
     (stop / system_instruction / return_logprob) > engine-config defaults.
 
-    - ``n`` (the per-prompt fan-out the backend must generate) is the **fork
-      branch** ``len(gen) // len(input)``, so the backend fills the pre-forked gen
-      shell exactly — this subsumes the old ``samples_pre_expanded`` two-mode logic
-      (the fork *is* the expansion in the Sample model).
+    - ``n`` (the per-prompt fan-out the backend must generate) is the **last-fork
+      branch** ``len(gen) // len(parts[-2])`` (children per frontier parent), so the
+      backend fills the pre-forked gen shell exactly — this subsumes the old
+      ``samples_pre_expanded`` two-mode logic (the fork *is* the expansion in the
+      Sample model). For a multi-turn Sample the frontier parent is a later turn,
+      not the root ``parts[0]``; the two coincide for a single-stage request.
     - ``top_k``: MUST be threaded through — without it SGLang falls back to the
       model generation_config default (top_k=20 for Qwen3), peaking the sampling
       vs the trainer's top_k=0 (unrestricted) → low intra-group diversity → GRPO
@@ -51,8 +53,12 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
     ar = gen_part.sampling_params
     stage_ar: Dict[str, Any] = dict(input_part.control.get("ar") or {})
 
-    n_in = len(input_part.sample_ids)
-    n = (len(gen_part.sample_ids) // n_in) if n_in else 1
+    # Fan-out is the LAST-fork branch (children per *frontier parent*), not the
+    # root-relative count: in a multi-turn Sample the frontier's parent is a later
+    # turn (parts[-2]), not parts[0]. They coincide for a single-stage request.
+    parent_part = sample.parts[-2] if len(sample.parts) >= 2 else input_part
+    n_parent = len(parent_part.sample_ids)
+    n = (len(gen_part.sample_ids) // n_parent) if n_parent else 1
 
     raw_top_k = int(ar.top_k) if ar is not None else 0
     block: Dict[str, Any] = {

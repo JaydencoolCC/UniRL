@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from unirl.models.types.ar import ARSamplingParams
 from unirl.models.types.pipeline import Pipeline
-from unirl.types.primitives import Images, Texts
-from unirl.types.sample import Sample
+from unirl.types.primitives import Texts
+from unirl.types.sample import Sample, Turn
 
 from .ar import QwenVLARParams, QwenVLARStage
 from .bundle import QwenVLBundle
@@ -18,16 +18,17 @@ class QwenVLPipeline(Pipeline):
     """Qwen-VL AR (understanding) generate pipeline: ``Sample → Sample``.
 
     Consumes a request ``Sample`` whose frontier (last) Part is a pre-forked AR gen
-    shell carrying ``ARSamplingParams``. Reads the prompt — and, for image-input
-    tasks, the chained image — via ``sample.conditioning()`` (an optional
-    ``{"system_instruction": str}`` override rides on the input Part's
-    ``control["chat"]``) and fills the frontier Part:
+    shell carrying ``ARSamplingParams``. Reads the full role-tagged trajectory — text
+    turns plus the chained image turn(s) — via ``sample.vision_conditioning()`` (one
+    fused message per role; an optional ``{"system_instruction": str}`` override rides
+    on the input Part's ``control["chat"]``) and fills the frontier Part:
 
     - ``segment: TextSegment`` — the generated tokens + full-softmax log-probs.
     - ``primitive: Texts`` — detokenized response strings.
 
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``).conditioning()`` via :meth:`_conditions_for`, so rollout and
-    replay build the prompt conditions through one shared path.
+    ``Part.conditions`` carries the encoded prompt conditions; trainer-side replay
+    teacher-forces over those *stored* ids (re-typed via ``conditions_cls.from_dict``),
+    so the encode here is the single source of truth for the importance ratio.
     """
 
     def __init__(
@@ -78,17 +79,15 @@ class QwenVLPipeline(Pipeline):
 
     def _conditions_for(
         self,
-        texts: Texts,
-        images: Optional[Images] = None,
+        turns: List[Turn],
         control: Optional[Dict[str, Any]] = None,
     ) -> QwenVLARConditions:
-        """Chat-template + tokenize prompts (+ optional images) → :class:`QwenVLARConditions`.
-        Shared by rollout-``generate`` and trainer-side replay (re-tokenize), so both
-        build the prompt conditions through one path — the re-tokenization must be
-        byte-identical to rollout, which routing through this single path guarantees.
+        """Chat-template + tokenize the trajectory ``turns`` (text + image turns) →
+        :class:`QwenVLARConditions`.
 
-        An optional per-request ``system_instruction`` override rides on the input
-        Part's ``control["chat"]``.
+        The rollout encode path: production replay teacher-forces over the *stored*
+        conditions this produces (not a re-encode). An optional per-request
+        ``system_instruction`` override rides on the input Part's ``control["chat"]``.
         """
         chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
         if "system_instruction" in chat_overrides:
@@ -99,8 +98,7 @@ class QwenVLPipeline(Pipeline):
             )
         else:
             chat_stage = self.chat_template
-        pil_images = images.to_pils() if isinstance(images, Images) else None
-        return chat_stage.embed(texts, images=pil_images)
+        return chat_stage.embed(turns)
 
     def generate(self, sample: Sample) -> Sample:
         """Run Qwen-VL AR generation end-to-end, filling the frontier (pre-forked) gen Part."""
@@ -112,18 +110,10 @@ class QwenVLPipeline(Pipeline):
                 f"got {type(ar).__name__ if ar is not None else 'None'}"
             )
 
-        # conditioning() surfaces [text, image?] in turn order — an image-input task
-        # chains the image off the prompt head via Part.input_child.
-        conditioning = sample.conditioning()
-        texts = conditioning[0] if conditioning else None
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"QwenVLPipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
-        images = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
-
-        conds = self._conditions_for(texts, images, sample.parts[0].control)
+        # Full role-tagged trajectory (text + chained image turns), frontier-aligned —
+        # vision_conditioning() fails loud on a no-image or extra-modality request.
+        turns, _images = sample.vision_conditioning()
+        conds = self._conditions_for(turns, sample.parts[0].control)
 
         # Normalize the gen shell's ARSamplingParams through QwenVLARParams (parity
         # with the prior req-sourced path: stop_token_id reset, types coerced).

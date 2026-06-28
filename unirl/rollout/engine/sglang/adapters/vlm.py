@@ -11,7 +11,7 @@ input — the importance ratio stays consistent.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from unirl.config.require import require
 from unirl.rollout.engine.sglang.adapters.base import (
@@ -21,8 +21,11 @@ from unirl.rollout.engine.sglang.adapters.base import (
 )
 from unirl.rollout.engine.sglang.adapters.text import TextLMAdapter
 from unirl.rollout.engine.sglang.backends import RawResult
-from unirl.rollout.engine.sglang.utils import ResolvedSampling, pil_to_base64
-from unirl.types.primitives import Images
+from unirl.rollout.engine.sglang.utils import (
+    ResolvedSampling,
+    build_vision_conversations,
+    pil_to_base64,
+)
 from unirl.types.sample import Sample
 
 
@@ -46,14 +49,19 @@ class VLMAdapter(TextLMAdapter):
     # ------------------------------------------------------------------ #
 
     def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
-        prompts = self.extract_prompts(sample)
-        pil_images = self.extract_images(sample, n_prompts=len(prompts))
+        conversations, images_list, k = build_vision_conversations(sample, sampling.system_instruction)
+        require(
+            k == sampling.n,
+            f"{type(self).__name__}.build_inputs: de-expanded fan-out k={k} != "
+            f"resolved n={sampling.n}; conversation grouping and the sampling block "
+            "disagree on the gen branch.",
+        )
 
         wire: List[Dict[str, Any]] = []
         prompt_token_ids: List[List[int]] = []
         mm_encs: List[MMEncoding] = []
-        for prompt, image in zip(prompts, pil_images):
-            mm = self.encode_mm(prompt, image, sampling.system_instruction)
+        for messages, images in zip(conversations, images_list):
+            mm = self.encode_mm(messages, images)
             mm_encs.append(mm)
             payload = self.base_payload(sampling)
             # Send the chat-templated TEXT (single placeholder) + image_data so
@@ -72,45 +80,29 @@ class VLMAdapter(TextLMAdapter):
             mm=mm_encs,
         )
 
-    def extract_images(self, sample: Sample, *, n_prompts: int) -> List[Any]:
-        # Multi-input multimodal Sample: an image input Part (Images primitive)
-        # chained off the prompt head (Part.input_child). Located by primitive type.
-        image_part = next((p for p in sample.parts[:-1] if isinstance(p.primitive, Images)), None)
-        require(
-            image_part is not None,
-            f"{type(self).__name__} requires an image input Part (Images primitive) "
-            "chained off the prompt (Part.input_child); none found.",
-        )
-        image_prim = image_part.primitive
-        require(
-            len(image_prim) == n_prompts,
-            f"{type(self).__name__}: image batch {len(image_prim)} != prompt count {n_prompts}",
-        )
-        return image_prim.to_pils()
+    def encode_mm(self, messages: List[Dict[str, Any]], images: List[Any]) -> MMEncoding:
+        """Processor-encode one conversation + its image(s) into the native layout.
 
-    def encode_mm(
-        self,
-        user_prompt: str,
-        image: Any,
-        system_instruction: Optional[str] = None,
-    ) -> MMEncoding:
-        """Processor-encode one (prompt, image) into the model's native layout.
+        ``messages`` is the fused chat conversation :func:`build_vision_conversations`
+        assembled (image placeholder before text in the user message); ``images``
+        are its PILs in placeholder order. Returns a fully-populated
+        :class:`MMEncoding`: ``input_ids`` already has the placeholder expanded to
+        the per-image vision-token count — the SAME encoding the trainside replay
+        teacher-forces over (``input_ids`` + ``pixel_values``), so rollout and
+        replay are token-for-token identical.
 
-        Returns a fully-populated :class:`MMEncoding`: ``input_ids`` already has
-        the image placeholder expanded to the per-image vision-token count. This
-        is the SAME encoding the trainside replay (``chat_template.embed``) uses,
-        so the rollout (sent to SRT as ``text`` + ``image_data``) and the replay
-        (teacher-forced over ``input_ids`` + ``pixel_values``) are token-for-token
-        identical.
+        One image per request (``image_data`` / ``MMEncoding.image`` carry a single
+        PIL); multi-image conversations are out of scope.
         """
-        messages: List[Dict[str, Any]] = []
-        if system_instruction:
-            messages.append({"role": "system", "content": system_instruction})
-        messages.append({"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_prompt}]})
+        require(
+            len(images) == 1,
+            f"{type(self).__name__}.encode_mm: expected exactly one image per request, "
+            f"got {len(images)} (multi-image conversations are unsupported).",
+        )
         text = self._processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        enc = self._processor(text=[text], images=[image], return_tensors="pt")
+        enc = self._processor(text=[text], images=images, return_tensors="pt")
         return MMEncoding(
-            image=image,
+            image=images[0],
             text=text,
             input_ids=enc["input_ids"][0].tolist(),
             pixel_values=enc["pixel_values"],

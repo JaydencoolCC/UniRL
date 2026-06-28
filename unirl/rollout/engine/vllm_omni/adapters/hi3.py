@@ -44,21 +44,16 @@ from unirl.rollout.engine.vllm_omni.backends import (
     StageSampling,
 )
 from unirl.rollout.engine.vllm_omni.utils import (
-    ar_gen_part,
     assemble_sample,
     build_ar_segment,
     collect_dit_outputs,
-    cot_text_from_sample,
     decoded_text_from_ar,
-    diffusion_gen_part,
-    image_input_part,
-    pil_images_from_sample,
     seed_from_sample_id,
-    texts_from_sample,
 )
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
+from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
 # --------------------------------------------------------------------------- #
 # Chat-template prompt construction
@@ -307,19 +302,15 @@ class Hi3InputAdapter:
         """
         task, sys_type = self._resolve_task(sample.parts[0].control or {})
 
-        texts = texts_from_sample(sample)
-        n = len(texts.texts)
+        if self.image_input:
+            turns, images = sample.vision_conditioning()
+            texts = next(t.content for t in turns if isinstance(t.content, Texts))
+            pil_images = images[0].to_pils()
+        else:
+            texts = sample.text_conditioning()[0].content
+            pil_images = []
 
-        pil_images = pil_images_from_sample(sample, n) if self.image_input else []
-        if self.image_input and not pil_images:
-            raise ValueError(
-                f"modality={self.modality!r} requires an image input Part (Images primitive) "
-                "chained off the prompt (Part.input_child); none found."
-            )
-        if not self.image_input and image_input_part(sample) is not None:
-            raise ValueError(f"modality={self.modality!r} does not accept an image input Part")
-
-        diff_part = diffusion_gen_part(sample)
+        diff_part = sample.gen_part_or_none(DiffusionSamplingParams)
         diff_params = diff_part.sampling_params if diff_part is not None else None
         return _build_prompt_entries(
             texts,
@@ -332,10 +323,10 @@ class Hi3InputAdapter:
 
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         """AR always; a DiT stage rides along iff ``"dit" in self.stages``."""
-        ar_params = ar_gen_part(sample).sampling_params
+        ar_params = sample.gen_part(ARSamplingParams).sampling_params
         sampling = [self._ar_sampling(ar_params)]
         if "dit" in self.stages:
-            gen_part = diffusion_gen_part(sample)
+            gen_part = sample.gen_part(DiffusionSamplingParams)
             sampling.append(self._dit_sampling(gen_part, gen_part.sampling_params))
         return sampling
 
@@ -442,12 +433,13 @@ class Hi3DitRecaptionInputAdapter:
         self.sys_type = sys_type
 
     def build(self, sample: Sample) -> List[GenerateCall]:
-        if image_input_part(sample) is not None:
+        if sample.has_image_input():
             raise ValueError(f"modality={self.modality!r} does not accept an image input Part")
 
-        texts = texts_from_sample(sample)
-        cot = cot_text_from_sample(sample)  # the recaptions, 1:1-count-checked vs prompts
-        gen_part = diffusion_gen_part(sample)
+        turns = sample.text_conditioning()
+        texts = turns[0].content  # the prompts (root turn)
+        cot = turns[1].content  # the chained recaptions, 1:1 with prompts by lineage
+        gen_part = sample.gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
         sys_type = (sample.parts[0].control or {}).get("sys_type") or self.sys_type
 
@@ -620,7 +612,7 @@ class Hi3T2iAdapter(ModelAdapter):
         self.output_adapter = Hi3ImageOutputAdapter(self.modality)
 
     def validate_request(self, sample: Sample) -> None:
-        if image_input_part(sample) is not None:
+        if sample.has_image_input():
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use an image-conditioned modality instead."
             )
@@ -655,7 +647,7 @@ class Hi3It2iAdapter(ModelAdapter):
         self.output_adapter = Hi3ImageOutputAdapter(self.modality)
 
     def validate_request(self, sample: Sample) -> None:
-        if image_input_part(sample) is None:
+        if not sample.has_image_input():
             raise ValueError(
                 f"modality={self.modality!r} requires an image input Part (Images primitive) "
                 "chained off the prompt (Part.input_child); none found."
@@ -693,7 +685,7 @@ class Hi3I2tAdapter(ModelAdapter):
         self.output_adapter = Hi3TextOutputAdapter(self.modality)
 
     def validate_request(self, sample: Sample) -> None:
-        if image_input_part(sample) is None:
+        if not sample.has_image_input():
             raise ValueError(
                 f"modality={self.modality!r} requires an image input Part (Images primitive) "
                 "chained off the prompt (Part.input_child); none found."
@@ -728,7 +720,7 @@ class Hi3T2tAdapter(ModelAdapter):
         self.output_adapter = Hi3TextOutputAdapter(self.modality)
 
     def validate_request(self, sample: Sample) -> None:
-        if image_input_part(sample) is not None:
+        if sample.has_image_input():
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use modality='hi3_i2t' instead."
             )

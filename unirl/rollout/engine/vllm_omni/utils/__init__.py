@@ -21,36 +21,18 @@ from unirl.rollout.engine.vllm_omni.utils.tracks import (
     seed_from_sample_id,
 )
 
-# Request-side Sample readers now live in unirl.types.sample_ops (lifted out of the
-# rollout layer so model pipelines can import them too); re-exported here for the
-# vllm_omni adapters that already import them from this package.
-from unirl.types.sample_ops import (
-    ar_gen_part,
-    cot_text_from_sample,
-    diffusion_gen_part,
-    image_input_part,
-    pil_images_from_sample,
-    texts_from_sample,
-)
-
 __all__ = [
-    "ar_gen_part",
     "assemble_sample",
-    "cot_text_from_sample",
     "build_ar_segment",
     "build_image_segment",
     "collect_dit_outputs",
     "core_diff_kwargs",
     "decoded_text_from_ar",
-    "diffusion_gen_part",
     "grouped_pils_to_videos",
-    "image_input_part",
     "pack_initial_noise_extra_args",
     "pick_stage_output",
-    "pil_images_from_sample",
     "pils_to_images",
     "sde_extra_args",
     "seed_from_sample_id",
     "sigmas_list_from_diffusion",
-    "texts_from_sample",
 ]
