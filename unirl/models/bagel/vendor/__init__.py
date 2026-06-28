@@ -7,6 +7,12 @@ compatibility/grad fixes below:
 - import roots rewritten ``modeling.`` / ``data.`` / ``inferencer`` ->
   ``unirl.models.bagel.vendor.{modeling,data,inferencer}`` (9 statements across
   ``modeling/bagel/{bagel,qwen2_navit,siglip_navit}.py`` and ``inferencer.py``);
+- the ``flash_attn_varlen_func`` import in ``modeling/bagel/{qwen2_navit,siglip_navit}.py``
+  is repointed ``from flash_attn import ...`` -> ``from unirl.models.bagel.sdpa_varlen
+  import ...`` (2 statements), so the GENERATION / inference attention path runs with
+  no flash-attn dependency (the SDPA reimplementation lives in
+  ``unirl/models/bagel/sdpa_varlen.py``; the training / replay path already uses SDPA /
+  ``flex_attention`` and is unaffected);
 - added ``modeling/cache_utils/__init__.py`` (upstream ships ``cache_utils`` as a
   bare dir without an ``__init__``);
 - only a subset of upstream ``data/`` is vendored (``data_utils.py`` +
