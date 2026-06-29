@@ -140,6 +140,10 @@ class HPSv3PPSpec(BaseRewardComponentSpec):
     ``repo_path`` to that checkout. ``config_path`` defaults to
     ``<repo_path>/hpsv3/config/train_stage2.yaml``; empty ``checkpoint_path``
     auto-downloads ``Junjun2333/HPSv3-PlusPlus/hpsv3++.pth``.
+
+    ``score_scale`` is a *divisor* applied to the raw mu (which is ~7-11): the
+    reward is ``mu / score_scale``. Use ~15.0 to land it in ~0-1 (parity with
+    the ``hpsv3`` scorer); leave at 1.0 only if downstream wants the raw scale.
     """
 
     batch_size: int = 8
