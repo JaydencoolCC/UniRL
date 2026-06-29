@@ -604,6 +604,26 @@ class Sample(Batch):
         )
         return type(self)(parts=[*self.parts, child], reward_compute_s=self.reward_compute_s)
 
+    def observe(self, observation: Primitive, *, role: str = "tool") -> "Sample":
+        """Append an observation as a branch-1, mask-0 *input* Part off the frontier.
+
+        The world-response half of an agentic turn (``docs/agent-loop-design.md`` §4.3): the
+        observation rides as a chained input Part — one child per frontier sample, ids
+        extended by ``/0`` — carrying no ``sampling_params``. So it is excluded from
+        :meth:`gen_parts` (never trained) and surfaced to the next turn by
+        :meth:`conditioning`. Reuses :meth:`Part.input_child` (the same branch-1 input-child
+        mechanic), appended to the frontier rather than chained at the root.
+
+        ``role`` tags the observation's conversation turn for role-aware rendering
+        (:meth:`Part.resolved_role`), defaulting to ``"tool"`` — the agentic world-response is a
+        tool result, so the chat template wraps it as a ``<tool_response>``. A non-tool world
+        (e.g. a user simulator) can pass ``role="user"``.
+        """
+        if not self.parts:
+            raise ValueError("Sample.observe: no parts to observe from (empty Sample)")
+        obs_part = self.parts[-1].input_child(observation, role=role)
+        return type(self)(parts=[*self.parts, obs_part], reward_compute_s=self.reward_compute_s)
+
     def propagate_rewards(self, op: Literal["mean", "max", "sum"] = "mean") -> "Sample":
         """Aggregate child rewards up the chain (leaf → root) into unscored parents.
         Walks ``parts`` in reverse; per parent, reduces the successor's rewards
