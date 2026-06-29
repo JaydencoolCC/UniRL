@@ -286,7 +286,10 @@ class BagelFlowUniGRPO(FlowGRPO):
                     )
                 v_refs = [
                     self.stage.predict_velocity_at(
-                        forward_kwargs, sample=segment.latents_at(s)[0].to(device), sigma=schedule[s], params=self.params
+                        forward_kwargs,
+                        sample=segment.latents_at(s)[0].to(device),
+                        sigma=schedule[s],
+                        params=self.params,
                     ).detach()
                     for s in target_steps
                 ]

@@ -102,7 +102,9 @@ def flash_attn_varlen_func(
             attn_mask = ki_idx <= (qi_idx + (lk - lq))
 
         oi = scaled_dot_product_attention(
-            qh, kh, vh,
+            qh,
+            kh,
+            vh,
             attn_mask=attn_mask,
             dropout_p=dropout_p,
             scale=softmax_scale,
