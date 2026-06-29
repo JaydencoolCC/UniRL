@@ -14,9 +14,10 @@ owns ``engine.loop``, and the TokenizerManager's handler task binds to it at
 the first await — so EVERY coroutine here must run on that loop (via
 :meth:`NativeBackend._run`), never on a fresh one (a fresh loop would work once
 and deadlock on the second call). Engine's own sync wrappers already run on
-``self.loop``. Corollary: all verbs must be invoked from one thread — the Ray
-actor's single RPC thread today (``max_concurrency=1``); a concurrent
-``run_until_complete`` on the same loop raises.
+``self.loop``. Corollary: concurrent ``run_until_complete`` on one loop raises,
+so every loop-DRIVING verb takes ``self._lock`` (``_run`` + the Engine sync
+verbs), which makes a threaded Worker (``worker_max_concurrency>1``) safe.
+``async_generate`` / ``abort`` coroutines run *on* the driven loop and do not lock.
 
 Verb routing: public ``Engine`` methods where the seam signatures match
 (memory, NCCL group, distributed update); the two verbs whose seam payloads
@@ -38,6 +39,7 @@ import dataclasses
 import logging
 import multiprocessing
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -126,6 +128,15 @@ class NativeBackend:
         self._concurrency = int(concurrency)
         self._rt = runtime
         self._logged_first_response = False
+        # Serializes every call that DRIVES engine.loop (run_until_complete + the
+        # Engine sync verbs) so a threaded Worker (worker_max_concurrency>1) cannot
+        # drive the one loop from two threads at once. ``async_generate`` / abort
+        # coroutines run *on* the driven loop and do NOT take it.
+        self._lock = threading.Lock()
+        # One semaphore bounding concurrent in-flight requests across ALL groups of
+        # a generate (3.12 binds it to engine.loop on first use). Hoisted out of
+        # ``_generate_async`` so the per-group fan-out shares a single bound.
+        self._sem = asyncio.Semaphore(int(concurrency))
 
     # ------------------------------------------------------------------ #
     # Boot — the only place the sglang import / spawn / env quarantine live
@@ -204,8 +215,15 @@ class NativeBackend:
     # The single loop seam — every coroutine runs on engine.loop
     # ------------------------------------------------------------------ #
 
+    @property
+    def loop(self) -> Any:
+        """The engine's asyncio loop (the rollout engine adopts it as ``self._loop``)."""
+        return self._engine.loop
+
     def _run(self, coro: Any) -> Any:
-        return self._engine.loop.run_until_complete(coro)
+        # Serialize loop-driving: two concurrent run_until_complete on one loop raises.
+        with self._lock:
+            return self._engine.loop.run_until_complete(coro)
 
     # ------------------------------------------------------------------ #
     # Generation — per-payload fan-out on engine.loop (no retry; see module
@@ -226,30 +244,67 @@ class NativeBackend:
         )
         return results
 
+    async def generate_one(self, payload: Dict[str, Any]) -> List[Any]:
+        """Generate ONE ``/generate`` payload on engine.loop, bounded by the shared
+        semaphore. The per-request unit the async per-group engine path fans out."""
+        kwargs = payload_to_generate_kwargs(payload)
+        async with self._sem:
+            try:
+                response = await self._engine.async_generate(**kwargs)
+            except Exception as exc:
+                raise RuntimeError(f"sglang NativeBackend.generate failed: {exc}") from exc
+        parsed = parse_generate_response(response)
+        if not self._logged_first_response and parsed:
+            self._logged_first_response = True
+            first = parsed[0]
+            logger.info(
+                "sglang first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
+                len(first.token_ids),
+                len(first.logprobs),
+                first.text[:200],
+            )
+        return parsed
+
     async def _generate_async(self, requests: List[Dict[str, Any]]) -> List[Any]:
-        sem = asyncio.Semaphore(self._concurrency)
-
-        async def _generate_one(payload: Dict[str, Any]) -> List[Any]:
-            kwargs = payload_to_generate_kwargs(payload)
-            async with sem:
-                try:
-                    response = await self._engine.async_generate(**kwargs)
-                except Exception as exc:
-                    raise RuntimeError(f"sglang NativeBackend.generate failed: {exc}") from exc
-            parsed = parse_generate_response(response)
-            if not self._logged_first_response and parsed:
-                self._logged_first_response = True
-                first = parsed[0]
-                logger.info(
-                    "sglang first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
-                    len(first.token_ids),
-                    len(first.logprobs),
-                    first.text[:200],
-                )
-            return parsed
-
-        nested = await asyncio.gather(*(_generate_one(p) for p in requests))
+        nested = await asyncio.gather(*(self.generate_one(p) for p in requests))
         return [item for sublist in nested for item in sublist]
+
+    # ------------------------------------------------------------------ #
+    # Abort / pause — control-plane coroutines. The rollout engine schedules
+    # these onto the driven engine.loop via ``run_coroutine_threadsafe``, so
+    # they ride the loop a generate is driving and take NO lock.
+    # ------------------------------------------------------------------ #
+
+    async def aabort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
+        """Abort in-flight generation (best-effort across sglang versions)."""
+        tm = getattr(self._engine, "tokenizer_manager", None)
+        fn = getattr(tm, "abort_request", None)
+        if fn is None:
+            logger.warning("sglang NativeBackend: tokenizer_manager.abort_request unavailable; abort is a no-op")
+            return
+        try:
+            res = fn(rid=rid, abort_all=abort_all) if rid is not None else fn(abort_all=abort_all)
+        except TypeError:
+            res = fn(rid) if rid is not None else fn()
+        if asyncio.iscoroutine(res):
+            await res
+
+    async def apause(self) -> None:
+        """Pause generation admission if the runtime supports it (best-effort)."""
+        await self._call_optional("pause_generation")
+
+    async def aresume(self) -> None:
+        """Resume generation admission if the runtime supports it (best-effort)."""
+        await self._call_optional("continue_generation")
+
+    async def _call_optional(self, name: str) -> None:
+        tm = getattr(self._engine, "tokenizer_manager", None)
+        fn = getattr(tm, name, None) or getattr(self._engine, name, None)
+        if fn is None:
+            return
+        res = fn()
+        if asyncio.iscoroutine(res):
+            await res
 
     # ------------------------------------------------------------------ #
     # Result normalization — the native twin of _check_update_response

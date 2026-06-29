@@ -22,6 +22,7 @@ forwards each subset to the matching child with the prefix stripped.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -77,6 +78,14 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             "diffusion": self._diffusion,
         }
 
+        # Async path: composed drives its OWN fresh loop (loop-less orchestrator —
+        # each child drives its own loop). ``generate`` (the sync DP_SCATTER façade)
+        # is inherited; ``_agenerate_batch`` is overridden below so the whole shard
+        # runs as one wake/sleep transition. ``_weight_version`` is the base-surface
+        # default — composed owns no weights and propagates each child's stamp.
+        self._weight_version = 0
+        self._init_async_loop()
+
         if config.sleep_diffusion_on_start:
             self._diffusion.sleep()
 
@@ -126,19 +135,20 @@ class ComposedRolloutEngine(BaseRolloutEngine):
     # Generation — PE serial flow
     # ------------------------------------------------------------------
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, sample: Sample) -> Sample:
-        """Run PE serial flow: AR expansion → diffusion sampling → 3-part Sample.
+    async def agenerate(self, sample: Sample) -> Sample:
+        """Run the PE serial flow for the whole shard → filled 3-part ``Sample``.
 
-        Dispatched ``DP_SCATTER`` (like vllm-omni / trainside): the Handle shards the
-        Sample across DP workers (each owns its own sglang + sglang_diffusion subprocess),
-        every worker runs the serial flow on its prompt-shard, and ``_collect_dp_merge``
-        merges the per-worker Samples via ``Sample.concat``. (``BROADCAST`` would return a
-        list of per-worker Samples via ``_collect_passthrough`` and break the trainer.)
+        Composed's children share wake/sleep state, so the shard is processed as ONE
+        atomic unit: :meth:`_agenerate_batch` overrides the base split→gather and feeds
+        the whole batch here, giving a single AR→diffusion wake/sleep transition.
+        ``sample`` is the pre-forked request ``[input, ar_shell, diffusion_shell]`` for
+        P prompts: the AR shell carries ``ARSamplingParams`` (branch N), the diffusion
+        shell ``DiffusionSamplingParams`` (branch M, σ / x_T recipe).
 
-        The request is pre-forked ``[input, ar_shell, diffusion_shell]``: the AR shell
-        carries ``ARSamplingParams`` (branch N), the diffusion shell
-        ``DiffusionSamplingParams`` (branch M, σ / x_T recipe).
+        Each child is driven through its SYNC ``generate`` façade off a worker thread
+        (``asyncio.to_thread``): a child's ``agenerate`` is bound to the CHILD's loop
+        and cannot be awaited from composed's loop, but the façade drives the child's
+        own loop internally and is safe to call from a thread.
         """
         input_part, ar_shell, diffusion_shell = self._unpack_request(sample)
 
@@ -175,7 +185,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             primitive=text_primitive,
             control=self._ar_control(input_part.control or {}),
         )
-        ar_out = self._ar.generate(Sample(parts=[ar_input, ar_shell]))
+        ar_out = await asyncio.to_thread(self._ar.generate, Sample(parts=[ar_input, ar_shell]))
         ar_part = ar_out.parts[-1]
         require(
             len(ar_part.sample_ids) == P * N,
@@ -213,21 +223,52 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             sampling_params=diffusion_shell.sampling_params,
             new_segment=diffusion_shell.segment,
         )
-        diff_out = self._diffusion.generate(Sample(parts=[pe_input, diff_child_shell]))
+        diff_out = await asyncio.to_thread(self._diffusion.generate, Sample(parts=[pe_input, diff_child_shell]))
         diff_child = diff_out.parts[-1]
         require(
             len(diff_child.sample_ids) == len(diffusion_shell.sample_ids),
             f"ComposedRolloutEngine: diffusion child returned {len(diff_child.sample_ids)} "
             f"samples; expected {P}*{N}*{M}={P * N * M}",
         )
+        # Carry the diffusion child's weight version onto the frontier part — composed
+        # owns no weights, so it propagates the child's stamp rather than its own 0.
         diffusion_part = diffusion_shell.fill(
             segment=diff_child.segment,
             primitive=diff_child.primitive,
             conditions=dict(diff_child.conditions),
             media_preview=diff_child.media_preview,
+            weight_version=diff_child.weight_version,
         )
 
         return Sample(parts=[input_part, ar_part, diffusion_part])
+
+    async def _agenerate_batch(self, sample: Sample) -> Sample:
+        # Composed has SHARED child wake/sleep state, so the whole shard must run
+        # as ONE wake/sleep transition. The base split->gather would run P
+        # concurrent agenerate coroutines that interleave the shared sleep()/wake_up()
+        # calls and corrupt in-flight child gens. Process the whole batch as one unit.
+        return await self.agenerate(sample)
+
+    # ------------------------------------------------------------------
+    # Control plane — forwarded to both children (best-effort).
+    # ------------------------------------------------------------------
+
+    def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
+        """Abort in-flight generation on both children. Partials surface via the
+        pending ``generate`` returns, so this returns ``[]``. Composed-level ids
+        don't map onto child id-spaces (PE prompts are re-rooted), so abort-all."""
+        del ids
+        for child in self._child_by_name.values():
+            child.abort()
+        return []
+
+    def pause(self) -> None:
+        for child in self._child_by_name.values():
+            child.pause()
+
+    def resume(self) -> None:
+        for child in self._child_by_name.values():
+            child.resume()
 
     # ------------------------------------------------------------------
     # Generation helpers

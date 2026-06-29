@@ -110,6 +110,11 @@ class Part(Batch):
     # Per-part (shared across the part's fan-out samples). ``None`` ⇒ derived by
     # :meth:`resolved_role` (gen part → ``"assistant"``, input → ``"user"``).
     role: Optional[str] = shared_field(default=None)
+    # The policy weight version this part was generated under (provenance for
+    # off-policy / streaming accounting; stamped by the rollout engine after
+    # ``fill``). One fork = one version, so it is shared across a part's samples;
+    # ``None`` means "not stamped / not applicable" (e.g. train-side sampling).
+    weight_version: Optional[int] = shared_field(default=None)
 
     @classmethod
     def input(
@@ -265,6 +270,7 @@ class Part(Batch):
         conditions: Optional[Dict[str, Condition]] = None,
         media_preview: Optional[MediaPreview] = None,
         status: Optional[torch.Tensor] = None,
+        weight_version: Optional[int] = None,
     ) -> "Part":
         """Return a copy of this gen-shell part with generation outputs written.
 
@@ -280,6 +286,7 @@ class Part(Batch):
             ("conditions", conditions),
             ("media_preview", media_preview),
             ("status", status),
+            ("weight_version", weight_version),
         ):
             if value is not None:
                 kwargs[name] = value

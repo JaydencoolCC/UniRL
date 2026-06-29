@@ -31,6 +31,7 @@ import logging
 import multiprocessing
 import os
 import signal
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -218,8 +219,15 @@ class HTTPBackend:
         self._base_url = base_url
         self._concurrency = int(concurrency)
         self._rt = runtime
+        # Serializes loop-driving (run_until_complete) so a threaded Worker cannot
+        # drive _async_loop from two threads at once. abort/pause coroutines ride
+        # the driven loop via the engine's run_coroutine_threadsafe and don't lock.
+        self._lock = threading.Lock()
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._client: Any = None
+        # One shared semaphore bounding concurrent in-flight requests across all
+        # groups of a generate (hoisted out of ``_generate_async``).
+        self._sem = asyncio.Semaphore(int(concurrency))
         if httpx is not None:
             self._async_loop = asyncio.new_event_loop()
             self._client = self._run_async(self._make_client())
@@ -324,13 +332,20 @@ class HTTPBackend:
             trust_env=False,
         )
 
+    @property
+    def loop(self) -> Any:
+        """The HTTP client's asyncio loop (the rollout engine adopts it as ``self._loop``)."""
+        return self._async_loop
+
     def _run_async(self, awaitable: Any) -> Any:
         if self._async_loop is None or self._async_loop.is_closed():
             close = getattr(awaitable, "close", None)
             if close is not None:
                 close()
             raise RuntimeError("sglang HTTPBackend async event loop is not available.")
-        return self._async_loop.run_until_complete(awaitable)
+        # Serialize loop-driving: two concurrent run_until_complete on one loop raises.
+        with self._lock:
+            return self._async_loop.run_until_complete(awaitable)
 
     def generate(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
         """POST the per-prompt payloads concurrently; flatten prompt-major."""
@@ -347,26 +362,50 @@ class HTTPBackend:
         )
         return results
 
+    async def generate_one(self, payload: Dict[str, Any]) -> List[_HTTPRawResult]:
+        """POST ONE ``/generate`` payload, bounded by the shared semaphore. The
+        per-request unit the async per-group engine path fans out."""
+        async with self._sem:
+            response = await self._apost("/generate", payload)
+        parsed = parse_generate_response(response)
+        if not self._logged_first_response and parsed:
+            self._logged_first_response = True
+            first = parsed[0]
+            logger.info(
+                "sglang first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
+                len(first.token_ids),
+                len(first.logprobs),
+                first.text[:200],
+            )
+        return parsed
+
     async def _generate_async(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
-        sem = asyncio.Semaphore(self._concurrency)
-
-        async def _generate_one(payload: Dict[str, Any]) -> List[_HTTPRawResult]:
-            async with sem:
-                response = await self._apost("/generate", payload)
-            parsed = parse_generate_response(response)
-            if not self._logged_first_response and parsed:
-                self._logged_first_response = True
-                first = parsed[0]
-                logger.info(
-                    "sglang first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
-                    len(first.token_ids),
-                    len(first.logprobs),
-                    first.text[:200],
-                )
-            return parsed
-
-        nested = await asyncio.gather(*(_generate_one(p) for p in requests))
+        nested = await asyncio.gather(*(self.generate_one(p) for p in requests))
         return [item for sublist in nested for item in sublist]
+
+    # ------------------------------------------------------------------ #
+    # Abort / pause — control-plane coroutines (best-effort). The rollout
+    # engine schedules these onto the driven loop via run_coroutine_threadsafe.
+    # ------------------------------------------------------------------ #
+
+    async def aabort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
+        payload: Dict[str, Any] = {"rid": rid} if rid is not None else {"abort_all": bool(abort_all)}
+        try:
+            await self._apost("/abort_request", payload, max_retries=1)
+        except Exception as exc:  # best-effort; server may lack the endpoint
+            logger.warning("sglang HTTPBackend: /abort_request failed (best-effort): %s", exc)
+
+    async def apause(self) -> None:
+        await self._post_optional("/pause_generation")
+
+    async def aresume(self) -> None:
+        await self._post_optional("/continue_generation")
+
+    async def _post_optional(self, path: str) -> None:
+        try:
+            await self._apost(path, {}, max_retries=1)
+        except Exception as exc:
+            logger.warning("sglang HTTPBackend: %s failed (best-effort): %s", path, exc)
 
     async def _apost(
         self,

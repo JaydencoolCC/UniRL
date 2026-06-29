@@ -23,6 +23,7 @@ worker partitions.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -97,16 +98,52 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         # consumes it in ``generate`` (gated on the adapter's needs_sigmas).
         self.schedule_policy = self.adapter.schedule_policy()
 
+        # Async per-group path: a loop-less backend (the Omni orchestrator is
+        # driven synchronously) → a fresh on-demand loop, plus the policy-version
+        # counter. ``omni.generate`` is not request-concurrent-safe, so a
+        # semaphore caps the per-batch fan-out at one in-flight core at a time —
+        # the per-group ``agenerate`` cores run sequentially, matching the v1
+        # whole-batch ``for call in calls`` loop. (3.12 binds the semaphore to
+        # the engine loop on first acquire.)
+        self._weight_version = 0
+        self._init_async_loop()
+        self._sem = asyncio.Semaphore(1)
+
     def _tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
         """Late-bound bridge handed to the adapter as ``tokenize_fn``."""
         return self._backend.tokenize_prompt(text, task=task, sys_type=sys_type)
 
     # ------------------------------------------------------------------ #
-    # Generation
+    # Generation — async per-group core (``generate`` façade inherited from base)
     # ------------------------------------------------------------------ #
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, sample: Sample) -> Sample:
+    # ``generate`` (the sync DP_SCATTER batch façade) is inherited from
+    # BaseRolloutEngine: it splits the batch into groups and gathers ``agenerate``
+    # over them on the engine loop. The Omni orchestrator is driven synchronously,
+    # so the per-group core runs in a worker thread under a one-slot semaphore —
+    # ``omni.generate`` is not request-concurrent-safe.
+    async def agenerate(self, sample: Sample) -> Sample:
+        """Run ONE prompt-group and return it filled.
+
+        The per-group async core. Runs the synchronous ``_generate_core`` in a
+        worker thread (the Omni orchestrator has no event loop) under the one-slot
+        semaphore, so a batch's groups generate sequentially — byte-identical to
+        the v1 whole-batch ``for call in calls`` fan-out.
+        """
+        async with self._sem:
+            out = await asyncio.to_thread(self._generate_core, sample)
+        return self._stamp_weight_version(out)
+
+    async def _agenerate_batch(self, sample: Sample) -> Sample:
+        # Sync/batch backend, not a streaming target: run the whole shard through
+        # one ``_generate_core`` (the v1 whole-batch path — GPU-efficient) rather
+        # than the base split→gather, which would do many small per-group forwards
+        # serialized under sem=1. ``agenerate`` stays the per-group unit the
+        # deferred streaming driver consumes.
+        return await self.agenerate(sample)
+
+    def _generate_core(self, sample: Sample) -> Sample:
+        """Synchronous per-group generation: validate, σ-pin, build, run, decode."""
         # Defense-in-depth the v1 wake-failure path documented but never
         # implemented: a failed LoRA re-push keeps the engine offloaded so
         # this guard catches callers that swallowed the wake_up exception.
@@ -232,6 +269,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             use_shm=use_shm,
             replica_rank=replica_rank,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def init_weights_update_group(
         self,
@@ -274,6 +312,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def destroy_weights_update_group(
         self,
@@ -300,6 +339,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def set_lora_from_tensors(
         self,

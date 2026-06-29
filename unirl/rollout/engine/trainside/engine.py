@@ -9,11 +9,11 @@ worker subprocess and no weight sync are needed.
 
 from __future__ import annotations
 
+import asyncio
 from typing import List, Optional, Sequence, Union
 
 import torch
 
-from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.types.ar import ARStage
 from unirl.models.types.diffusion import DiffusionStage
 from unirl.models.types.pipeline import Pipeline
@@ -89,8 +89,41 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
             # AR stage — no diffusion schedule needed
             self.schedule_policy = None
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, sample: Sample) -> Sample:
+        # Async per-group path: a fresh on-demand loop (no rollout backend) plus a
+        # 1-permit semaphore. The in-process FSDP pipeline shares one GPU context,
+        # so overlapping forwards would only contend — serialize them at 1. There
+        # is no engine-side weight sync here, so the version counter stays at 0.
+        self._weight_version = 0
+        self._init_async_loop()
+        self._sem = asyncio.Semaphore(1)
+
+    # ------------------------------------------------------------------ #
+    # Generation — async per-group core (``generate`` façade inherited from base)
+    # ------------------------------------------------------------------ #
+
+    async def agenerate(self, sample: Sample) -> Sample:
+        """Run ONE prompt-group and return it with its gen Part filled.
+
+        The per-group async core. ``pipeline.generate`` is a blocking in-process
+        forward, so it runs in a worker thread (``to_thread``) to keep the engine
+        loop free for the sibling ``agenerate`` coroutines the base ``generate``
+        façade fans out. ``self._sem`` caps that to one forward at a time: the
+        FSDP pipeline shares a single GPU context, so overlap would only contend.
+        """
+        async with self._sem:
+            out = await asyncio.to_thread(self._generate_core, sample)
+        return self._stamp_weight_version(out)
+
+    async def _agenerate_batch(self, sample: Sample) -> Sample:
+        # Sync/batch backend, not a streaming target: run the whole shard through
+        # one ``_generate_core`` (the v1 whole-batch path — GPU-efficient) rather
+        # than the base split→gather, which would do many small per-group forwards
+        # serialized under sem=1. ``agenerate`` stays the per-group unit the
+        # deferred streaming driver consumes.
+        return await self.agenerate(sample)
+
+    def _generate_core(self, sample: Sample) -> Sample:
+        """Synchronous pipeline forward for one group (the former ``generate`` body)."""
         if self.schedule_policy is not None:
             self._ensure_sample_sigmas(sample)
         prev_modes = [m.training for m in self._models]

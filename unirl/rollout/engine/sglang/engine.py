@@ -21,6 +21,7 @@ subprocesses need is quarantined in the backends' ``boot``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -140,28 +141,61 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             uses_lora=bool(engine_kwargs.get("enable_lora", False)),
         )
 
+        # Async per-group path: adopt the backend's event loop (its awaitables are
+        # bound to it) and start the policy-version counter.
+        self._weight_version = 0
+        self._init_async_loop(self._backend.loop)
+
     # ------------------------------------------------------------------ #
-    # Generation
+    # Generation — async per-group core (``generate`` façade inherited from base)
     # ------------------------------------------------------------------ #
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, sample: Sample) -> Sample:
-        """Run text generation against the engine and return the filled ``Sample``."""
+    # ``generate`` (the sync DP_SCATTER batch façade) is inherited from
+    # BaseRolloutEngine: it splits the batch into groups and gathers ``agenerate``
+    # over them on the backend loop. Override the loop driver so generation and
+    # the weight-sync verbs share the BACKEND's lock (one driver of engine.loop).
+    def _run_coro(self, coro: Any) -> Any:
+        return self._backend._run(coro)
+
+    async def agenerate(self, sample: Sample) -> Sample:
+        """Run ONE prompt-group on the engine loop and return it filled.
+
+        The per-group async core. Awaits the backend's per-request ``generate_one``
+        directly (never ``backend.generate``, which would nest a second
+        ``run_until_complete`` on the loop already being driven). All groups of a
+        batch share one bounding semaphore, so concurrency matches the old
+        whole-batch fan-out exactly.
+        """
         require(
             int(sample.parts[-1].batch_size) > 0,
-            "SGLangRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
+            "SGLangRolloutEngine.agenerate requires a non-empty group (gen batch_size > 0)",
         )
         sampling = resolve_sampling(self.cfg, sample)
         prepared = self.adapter.build_inputs(sample, sampling=sampling)
-        # Activate the synced LoRA adapter for these requests — the visible
-        # line connecting WeightSync's state to the wire (the adapter and the
-        # seam stay unaware of weight sync).
+        # Activate the synced LoRA adapter for these requests — the visible line
+        # connecting WeightSync's state to the wire (adapter/seam stay unaware).
         active_adapter = self._weight_sync.active_adapter
         if active_adapter:
             for payload in prepared.wire:
                 payload["lora_path"] = active_adapter
-        raw = self._backend.generate(prepared.wire)
-        return self.adapter.build_response(sample, prepared, raw)
+        nested = await asyncio.gather(*(self._backend.generate_one(p) for p in prepared.wire))
+        raw = [item for sublist in nested for item in sublist]
+        out = self.adapter.build_response(sample, prepared, raw)
+        return self._stamp_weight_version(out)
+
+    # ── control plane — sync; reached via the raw Worker.call RPC ──────────
+    def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
+        """Abort in-flight generation (best-effort). Partials surface via the
+        pending ``generate``/``agenerate`` returns, so this returns ``[]``."""
+        del ids
+        self._run_coro_threadsafe(self._backend.aabort(abort_all=True))
+        return []
+
+    def pause(self) -> None:
+        self._run_coro_threadsafe(self._backend.apause())
+
+    def resume(self) -> None:
+        self._run_coro_threadsafe(self._backend.aresume())
 
     # ------------------------------------------------------------------ #
     # Lifecycle — the offload flags live here; decorators re-applied
@@ -272,6 +306,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def init_weights_update_group(
         self,
@@ -318,6 +353,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             group_name=group_name,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def destroy_weights_update_group(
         self,

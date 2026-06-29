@@ -17,6 +17,7 @@ engine is usable. ``generate`` / ``sleep`` / ``wake_up`` re-apply ``@distributed
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -117,12 +118,46 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         # σ schedule policy comes from the adapter (absorbs the generic-vs-factory branch).
         self.schedule_policy = self.adapter.schedule_policy()
 
+        # Async per-group path: the DiffGenerator backend is driven synchronously
+        # (no event loop, scheduler client not request-concurrent-safe) → a fresh
+        # on-demand loop plus a one-slot semaphore. The per-group ``agenerate``
+        # cores run sequentially in a worker thread, matching the v1 whole-batch
+        # forward. (3.12 binds the semaphore to the engine loop on first acquire.)
+        self._weight_version = 0
+        self._init_async_loop()
+        self._sem = asyncio.Semaphore(1)
+
     # ------------------------------------------------------------------ #
-    # Generation
+    # Generation — async per-group core (``generate`` façade inherited from base)
     # ------------------------------------------------------------------ #
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, sample: Sample) -> Sample:
+    # ``generate`` (the sync DP_SCATTER batch façade) is inherited from
+    # BaseRolloutEngine; ``_agenerate_batch`` below overrides the base split→gather
+    # to keep the v1 whole-batch forward (see its note). The DiffGenerator backend
+    # is driven synchronously, so the per-group core runs in a worker thread under
+    # a one-slot semaphore — the scheduler client is not request-concurrent-safe.
+    async def agenerate(self, sample: Sample) -> Sample:
+        """Run ONE prompt-group and return it with its gen Part filled.
+
+        The per-group async core. Runs the synchronous ``_generate_core`` in a
+        worker thread (the DiffGenerator backend has no event loop) under the
+        one-slot semaphore, so a batch's groups generate sequentially —
+        byte-identical to the v1 whole-batch forward.
+        """
+        async with self._sem:
+            out = await asyncio.to_thread(self._generate_core, sample)
+        return self._stamp_weight_version(out)
+
+    async def _agenerate_batch(self, sample: Sample) -> Sample:
+        # Sync/batch backend, not a streaming target: run the whole shard through
+        # one ``_generate_core`` (the v1 whole-batch path — GPU-efficient) rather
+        # than the base split→gather, which would do many small per-group forwards
+        # serialized under sem=1. ``agenerate`` stays the per-group unit the
+        # deferred streaming driver consumes.
+        return await self.agenerate(sample)
+
+    def _generate_core(self, sample: Sample) -> Sample:
+        """Synchronous per-group generation (the former ``generate`` body)."""
         gen = sample.parts[-1]
         require(
             int(gen.batch_size) > 0,
@@ -271,6 +306,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def init_weights_update_group(
         self,
@@ -313,6 +349,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def destroy_weights_update_group(
         self,
