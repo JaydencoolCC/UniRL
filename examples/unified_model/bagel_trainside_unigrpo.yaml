@@ -166,14 +166,16 @@ algorithm:
     stage_attr: diffusion
     clip_range: 1.0e-6                 # flow trust region (clip range)
     clip_schedule: constant
-    # bs=1 rollout: rollout and replay geometry match, so π_old = the rollout
-    # emission (on-policy ratio = 1 at update 0, no pre-update replay needed).
+    # Rollout anchor: μ_old (sde_means) and π_old (sde_logp) are the rollout's own
+    # per-SDE-step recordings. Valid because the rollout is per-sample navit bs=1 — the
+    # same geometry as the bs=1 train replay — so on-policy μ_old == μ_θ → ratio = 1.
+    # (Replay anchor would only be needed if rollout ran a different geometry, e.g. pack-B.)
     old_logp_source: rollout
     mse_weight: 1.5e-5                 # velocity-MSE weight (replaces the latent KL)
     # GRPO-Guard RatioNorm: per-SDE-step normalize the flow ratio (it is otherwise
     # left-shifted, mean < 1, so clipping never engages). Only bites on the off-policy
-    # update(s), i.e. needs num_updates_per_batch >= 2. Reads μ_old from the rollout's
-    # segment.sde_means (recorded by BagelDiffusionStage.diffuse).
+    # update(s), i.e. needs num_updates_per_batch >= 2. μ_old comes from segment.sde_means
+    # as recorded by the rollout (bs=1, matching the bs=1 replay geometry).
     ratio_norm: true
     grad_reweight: false              # GRPO-Guard's optional 2nd part (x 1/dt); off by default
     conditions_cls:

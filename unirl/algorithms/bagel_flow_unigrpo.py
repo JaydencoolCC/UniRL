@@ -352,8 +352,16 @@ class BagelFlowUniGRPO(FlowGRPO):
         mu_old = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means").to(
             dtype=mu_theta.dtype, device=mu_theta.device
         )
+        # std_var must use the same sigma_max as the SDE step that produced old/new log_probs
+        # (diffuse/replay pass schedule[1]); otherwise the two disagree at the σ=1 step.
+        sde_sigma_max = float(segment.sigmas[1]) if int(segment.sigmas.shape[0]) > 1 else float(segment.sigmas[0])
         std_var = self._sde_std_var(
-            segment.sigmas, target_steps, eta=float(self.params.eta), device=new_logp.device, dtype=new_logp.dtype
+            segment.sigmas,
+            target_steps,
+            eta=float(self.params.eta),
+            device=new_logp.device,
+            dtype=new_logp.dtype,
+            sigma_max=sde_sigma_max,
         )  # [1, S']
 
         log_r = new_logp - old_logp  # [1, S']

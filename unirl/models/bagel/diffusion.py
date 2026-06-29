@@ -477,9 +477,8 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         if 0 in needed:
             stored_pairs.append((0, x_t.detach().clone()))
         sde_logp_list: List[torch.Tensor] = []
-        # Per-SDE-step mean μ_old (the deterministic transition mean, noise aside).
-        # Only consumed by BagelFlowUniGRPO(ratio_norm=True) as μ_old; cheap and
-        # stored unconditionally, mirroring how sde_logp is recorded.
+        # Per-SDE-step mean μ_old (the deterministic transition mean), recorded on the
+        # same SDE steps as sde_logp; consumed by BagelFlowUniGRPO(ratio_norm=True).
         sde_means_list: List[torch.Tensor] = []
 
         with torch.no_grad(), self._autocast_ctx(device):
@@ -506,8 +505,10 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                     stored_pairs.append((i + 1, x_t.detach().clone()))
                 if log_prob is not None:
                     sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
-                if prev_mean is not None:
-                    sde_means_list.append(prev_mean.detach().to(dtype=self.trajectory_dtype))
+                    # Nested on purpose: prev_mean is non-None on every step, so appending it
+                    # outside this block would misalign sde_means with sde_logp / sde_indices.
+                    if prev_mean is not None:
+                        sde_means_list.append(prev_mean.detach().to(dtype=self.trajectory_dtype))
 
         positions_collected = [p for p, _ in stored_pairs]
         latents_stacked = torch.stack([t for _, t in stored_pairs], dim=0).unsqueeze(0)  # [1, K, seq, C]
