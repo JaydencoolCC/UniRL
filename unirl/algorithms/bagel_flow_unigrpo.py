@@ -111,10 +111,12 @@ class BagelFlowUniGRPO(FlowGRPO):
         # needs μ_old (sde_means) refreshed at the SAME replay geometry as π_old (sde_logp)
         # — base FlowGRPO only refreshes sde_logp — so declare both when ratio_norm is on.
         self.anchor_fields = ("sde_logp", "sde_means") if self.ratio_norm else ("sde_logp",)
-        # Full-FT v_ref: a frozen snapshot of the base (pre-training) weights, taken
-        # lazily before the first optimizer step (see _snapshot_reference). Stays
-        # None under LoRA (v_ref = adapters off) or mse_weight=0 (no MSE).
-        self._ref_snapshot: Optional[Dict[str, torch.Tensor]] = None
+        # Full-FT v_ref: a frozen bf16 snapshot of the base (pre-training) weights, captured
+        # lazily on the first v_ref swap (before the first optimizer step) from each trainable
+        # param's local shard, keyed by param id, and swapped in per step via in-place copy.
+        # Stays None under LoRA (v_ref = adapters off) or mse_weight=0 (no MSE). See
+        # _reference_weights.
+        self._ref_snapshot: Optional[Dict[int, torch.Tensor]] = None
 
     @staticmethod
     def _has_lora(transformer: Any) -> bool:
@@ -126,56 +128,57 @@ class BagelFlowUniGRPO(FlowGRPO):
         return any(isinstance(m, LoraLayer) for m in transformer.modules())
 
     def _snapshot_reference(self, transformer: Any) -> None:
-        """Clone the trainable params' current weights as the frozen v_ref (full FT).
-
-        Called once, from the FIRST compute_loss_and_backward — i.e. before the first
-        optimizer step — so the snapshot IS the pre-trained base.
-
-        Stored in **bf16**: the v_ref forward all-gathers and computes in bf16
-        (MixedPrecisionPolicy ``param_dtype``) regardless, so an fp32 snapshot is
-        wasted precision — bf16 halves the snapshot (~1.6 -> ~0.8 GiB/GPU) at zero
-        quality cost. The ``.data`` swap stays placement-consistent (the clone is the
-        same DTensor mesh/placement, only the dtype differs); FSDP2 casts the master
-        shard to ``param_dtype`` at all-gather, and bf16 -> bf16 is a no-op.
-        Caveat: on resume-from-checkpoint this captures the resumed weights, not the
-        original base — full-FT v_ref currently assumes a fresh run.
+        """Deprecated shim — the v_ref base snapshot is now captured lazily inside
+        :meth:`_reference_weights` (at the swap site, so the shard state matches every
+        step). Kept as a no-op for any external caller; safe to remove once none remain.
         """
-        if self._ref_snapshot is not None:
-            return
-        snap = {
-            name: p.detach().to(dtype=torch.bfloat16) for name, p in transformer.named_parameters() if p.requires_grad
-        }
-        if not snap:
+        return None
+
+    @contextmanager
+    def _reference_weights(self, transformer: Any) -> Iterator[None]:
+        """Swap the frozen base weights into the trainable params for a v_ref forward.
+
+        Full-FT analog of :func:`_disable_lora`. Swaps by **in-place copy of the local
+        shard**, NOT a ``.data`` pointer swap: under ``fully_shard`` the forward's
+        all-gather reads FSDP2's captured shard storage, so reassigning ``param.data`` is
+        silently ignored (verified on a 2-GPU repro — the swapped forward equalled the
+        live one), whereas ``local_view(p).copy_(...)`` writes that storage and IS honored.
+
+        On the FIRST call it captures the base snapshot (the pre-trained weights, before
+        the first optimizer step) **at this swap site** — the same shard state every
+        subsequent step sees, so the copy sizes always match (a pre-loop snapshot would be
+        sharded while the swap site, right after the v_theta forward, is unsharded → size
+        mismatch). Stored as bf16 (the forward computes in bf16; halves the ~3.5→1.75
+        GiB/GPU footprint) keyed by param id.
+
+        Per step: stash each live local shard, copy the base in (cast to the live fp32
+        master dtype), run the (no_grad) v_ref forward, then copy the trained weights back
+        before any backward — so v_theta's autograd graph (recomputed under activation
+        checkpointing at the post-loop backward) reads the trained weights. In-place
+        copy+restore is autograd-safe here (verified on a 2-GPU backward repro).
+        """
+        from unirl.train.ema import local_view
+
+        live = [p for p in transformer.parameters() if p.requires_grad]
+        if not live:
             raise RuntimeError(
                 "BagelFlowUniGRPO: mse_weight > 0 with no LoRA and no trainable params to snapshot "
                 "as the v_ref base — the transformer is fully frozen. Enable full fine-tuning "
                 "(use_lora=false unfreezes the decoder blocks) or set mse_weight=0."
             )
-        self._ref_snapshot = snap
+        if self._ref_snapshot is None:
+            self._ref_snapshot = {id(p): local_view(p).detach().to(dtype=torch.bfloat16).clone() for p in live}
 
-    @contextmanager
-    def _reference_weights(self, transformer: Any) -> Iterator[None]:
-        """Swap the frozen base snapshot into the trainable params for a v_ref forward.
-
-        Full-FT analog of :func:`_disable_lora`: load the snapshot into each trainable
-        param's ``.data`` (the same FSDP2-safe mechanism ``inject_mirror._swap_mirror``
-        uses), run the enclosed forward, then restore the trained weights. The caller
-        wraps this in ``torch.no_grad()``; backward runs only after restore, so
-        v_theta's autograd graph reads the trained weights.
-        """
-        snap = self._ref_snapshot or {}
-        saved: Dict[str, torch.Tensor] = {}
-        for name, p in transformer.named_parameters():
-            ref = snap.get(name)
-            if ref is not None:
-                saved[name] = p.data
-                p.data = ref
+        stash: List[torch.Tensor] = []
+        for p in live:
+            lv = local_view(p)
+            stash.append(lv.detach().clone())
+            lv.copy_(self._ref_snapshot[id(p)])
         try:
             yield
         finally:
-            for name, p in transformer.named_parameters():
-                if name in saved:
-                    p.data = saved[name]
+            for p, saved in zip(live, stash):
+                local_view(p).copy_(saved)
 
     def prepare_segment(
         self,
@@ -256,37 +259,50 @@ class BagelFlowUniGRPO(FlowGRPO):
         # rollout (LoRA-on) context with a base velocity forward.
         forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
         transformer = self.stage.model.transformer
-        # v_ref source: LoRA -> adapters off (cheap); full FT -> a frozen snapshot of
-        # the base weights, taken once here (before the first optimizer step = the
-        # pre-trained base) and swapped in per step. Both yield the pre-trained
-        # reference velocity over the (current) prebuilt context.
+        # v_ref source: LoRA -> adapters off (cheap); full FT -> a frozen bf16 snapshot of
+        # the base weights, captured lazily on the first _reference_weights swap (= the
+        # pre-trained base, before the first optimizer step). Both yield the pre-trained
+        # reference velocity over the prebuilt context.
         full_ft_ref = not self._has_lora(transformer)
-        if full_ft_ref:
-            self._snapshot_reference(transformer)
+        # Compute ALL v_ref FIRST, under a SINGLE base-weight swap, storing only the
+        # detached velocity tensors (tiny [seq,C] each — no autograd graphs). Then run the
+        # v_theta forwards (grad-on) against those constants. This keeps the expensive
+        # base-weight swap (a full fp32 master-sized stash under full FT) OUT of the window
+        # where the N retained v_theta graphs + activations are live — the peak that OOM'd
+        # a per-step swap. v_ref is a detached constant either way (it is `.detach()`ed into
+        # the MSE), so hoisting it changes nothing numerically.
+        with torch.no_grad():
+            if full_ft_ref:
+                ref_ctx = self._reference_weights(transformer)
+            else:
+                ref_ctx = _disable_lora(transformer)
+            with ref_ctx as disabled:
+                if not full_ft_ref and not disabled:
+                    raise RuntimeError(
+                        "BagelFlowUniGRPO: mse_weight > 0 but found neither peft LoRA layers "
+                        "to disable nor trainable params to snapshot as v_ref on "
+                        "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
+                        "or set mse_weight=0."
+                    )
+                v_refs = [
+                    self.stage.predict_velocity_at(
+                        forward_kwargs, sample=segment.latents_at(s)[0].to(device), sigma=schedule[s], params=self.params
+                    ).detach()
+                    for s in target_steps
+                ]
+        # Return the freed stash + v_ref activation blocks to the driver before the v_theta
+        # graphs build, so this step's peak does not carry both (mirrors the train stack's
+        # post-churn defrag under num_updates_per_batch>1). Full-FT only — the LoRA path's
+        # v_ref leaves no stash to reclaim.
+        if full_ft_ref and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         mse_terms: List[torch.Tensor] = []
-        for step_idx in target_steps:
+        for step_idx, v_ref in zip(target_steps, v_refs):
             x_t = segment.latents_at(step_idx)[0].to(device)  # [seq, C] (navit bs=1)
             sigma = schedule[step_idx]
             v_theta = self.stage.predict_velocity_at(forward_kwargs, sample=x_t, sigma=sigma, params=self.params)
-            with torch.no_grad():
-                if full_ft_ref:
-                    with self._reference_weights(transformer):
-                        v_ref = self.stage.predict_velocity_at(
-                            forward_kwargs, sample=x_t, sigma=sigma, params=self.params
-                        )
-                else:
-                    with _disable_lora(transformer) as disabled:
-                        if not disabled:
-                            raise RuntimeError(
-                                "BagelFlowUniGRPO: mse_weight > 0 but found neither peft LoRA layers "
-                                "to disable nor trainable params to snapshot as v_ref on "
-                                "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
-                                "or set mse_weight=0."
-                            )
-                        v_ref = self.stage.predict_velocity_at(
-                            forward_kwargs, sample=x_t, sigma=sigma, params=self.params
-                        )
-            mse_terms.append(((v_theta - v_ref.detach()) ** 2).mean())
+            mse_terms.append(((v_theta - v_ref) ** 2).mean())
 
         mse = torch.stack(mse_terms).mean()
         (self.mse_weight * mse * loss_scale).backward()
