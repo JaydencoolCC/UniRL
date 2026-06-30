@@ -21,7 +21,7 @@ from torch.nn.attention.flex_attention import flex_attention
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
-from unirl.models.bagel.sdpa_varlen import flash_attn_varlen_func
+from flash_attn import flash_attn_varlen_func
 from unirl.models.bagel.vendor.modeling.qwen2.modeling_qwen2 import (
     Qwen2Attention, 
     Qwen2MLP, 
