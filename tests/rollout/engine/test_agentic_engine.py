@@ -1,0 +1,329 @@
+"""CPU contract tests for AgenticRolloutEngine (LIN-522).
+
+Exercises the REAL per-worker execution logic — the persistent ``_drain`` loop,
+``_run_one`` multi-turn trajectory loop, the per-worker ``_cap`` gate, and the
+``next_task`` FIFO queue — with a CPU ``FakeEngine`` inner (``_fakes.py``) and a
+re-entrant multi-turn ``FakeEnv``. Only ``_pull`` is monkeypatched (to draw from
+an in-process queue) so these run without Ray; the rank-0 coordinator's
+``generate``/``Worker.call`` wiring + cross-worker balance are covered by the GPU
+smoke (``scripts/agentic_engine_smoke.py``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections import Counter, deque
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import pytest
+
+pytest.importorskip("torch")  # the unirl types import torch at module load
+
+from tests.rollout.engine._fakes import FakeEngine  # noqa: E402
+
+from unirl.rollout.engine.agentic.config import AgenticRolloutEngineConfig  # noqa: E402
+from unirl.rollout.engine.agentic.engine import AgenticRolloutEngine  # noqa: E402
+from unirl.rollout.engine.base import BaseEngineConfig  # noqa: E402
+from unirl.types.primitives import Texts  # noqa: E402
+from unirl.types.sample import Part, Sample  # noqa: E402
+from unirl.types.sampling import ARSamplingParams  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# Fakes: an inner-engine config that builds a FakeEngine, and a re-entrant env
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _FakeInnerConfig(BaseEngineConfig):
+    """Builds a CPU ``FakeEngine`` as the agentic engine's inner."""
+
+    concurrency: int = 16
+    yields: int = 4
+
+    def make_engine(self, **deps: Any) -> FakeEngine:  # deps (device/rank/...) ignored
+        return FakeEngine(concurrency=self.concurrency, yields=self.yields)
+
+
+class FakeEnv:
+    """Re-entrant multi-turn env: terminate after ``turns_for(root_id)`` turns.
+
+    Stateless — the turn is derived from the sample (``len(gen_parts())``), so one
+    instance safely serves many concurrent trajectories (the LIN-522 requirement).
+    Each non-final turn returns a one-row tool-result observation so the trajectory
+    grows ``[input, gen, obs, gen, ...]``. Optionally sleeps in ``astep`` (slow
+    tool) or raises for a set of root ids (failure-isolation).
+    """
+
+    def __init__(
+        self,
+        *,
+        turns_by_prompt: Optional[Dict[str, int]] = None,
+        default_turns: int = 1,
+        astep_sleep: float = 0.0,
+        fail_roots: Tuple[str, ...] = (),
+    ) -> None:
+        self._turns = dict(turns_by_prompt or {})
+        self._default = int(default_turns)
+        self._sleep = float(astep_sleep)
+        self._fail = set(fail_roots)
+
+    @staticmethod
+    def _root(sample: Sample) -> str:
+        return sample.parts[0].sample_ids[0]
+
+    def reset(self, request: Sample) -> Sample:
+        return request
+
+    def step(self, sample: Sample) -> Tuple[Optional[Texts], bool, dict]:
+        root = self._root(sample)
+        if root in self._fail:
+            raise RuntimeError(f"FakeEnv boom for {root}")
+        turn = len(sample.gen_parts())
+        target = self._turns.get(root, self._default)
+        if turn >= target:
+            return None, True, {"turn": turn}
+        rows = sample.parts[-1].sample_ids
+        return Texts(texts=[f"obs::{root}::t{turn}" for _ in rows]), False, {"turn": turn}
+
+    async def astep(self, sample: Sample) -> Tuple[Optional[Texts], bool, dict]:
+        if self._sleep:
+            await asyncio.sleep(self._sleep)
+        return self.step(sample)
+
+
+def _make_engine(
+    *,
+    n: int = 1,
+    cap: int = 8,
+    max_turns: int = 8,
+    env: Optional[FakeEnv] = None,
+    inner_yields: int = 4,
+    concurrency: int = 16,
+) -> AgenticRolloutEngine:
+    cfg = AgenticRolloutEngineConfig(
+        inner=_FakeInnerConfig(concurrency=concurrency, yields=inner_yields),
+        env=env if env is not None else FakeEnv(default_turns=1),
+        max_turns=max_turns,
+        episode_sampling=ARSamplingParams(samples_per_prompt=n),
+        per_worker_concurrency=cap,
+    )
+    return AgenticRolloutEngine(cfg, rank=0)
+
+
+def _req(root_id: str) -> Sample:
+    """A single-trajectory request: ``[input(1)]`` rooted at a slash-free id."""
+    return Sample.request(Part.input([root_id], primitive=Texts(texts=[f"prompt-{root_id}"])))
+
+
+def _patch_pull(engine: AgenticRolloutEngine, queue: deque) -> None:
+    """Replace ``_pull`` with an in-process pop (no Ray); FIFO, ``None`` sentinel."""
+
+    async def _pull(_coordinator: Any, _role: str) -> Optional[Sample]:
+        return queue.popleft() if queue else None
+
+    engine._pull = _pull  # type: ignore[assignment]
+
+
+def _drive(engine: AgenticRolloutEngine, queue: deque) -> List[Sample]:
+    _patch_pull(engine, queue)
+    return engine._run_coro(engine._drain(None, ""))
+
+
+# --------------------------------------------------------------------------- #
+# Tests
+# --------------------------------------------------------------------------- #
+
+
+def test_run_one_builds_a_multi_turn_trajectory():
+    """``_run_one`` forks-generates-observes until the env says done; weight_version
+    is stamped on each gen Part."""
+    engine = _make_engine(env=FakeEnv(turns_by_prompt={"p0": 3}))
+    traj = engine._run_coro(engine._run_one(_req("p0")))
+
+    assert traj.parts[0].sample_ids == ["p0"]  # root prompt id preserved
+    assert len(traj.gen_parts()) == 3  # 3 turns
+    # [input, gen, obs, gen, obs, gen]
+    assert len(traj.parts) == 6
+    assert [bool(p.sampling_params is not None) for p in traj.parts] == [False, True, False, True, False, True]
+    for gp in traj.gen_parts():
+        assert gp.weight_version == 0  # FakeEngine stamps version 0
+    engine.shutdown()
+
+
+def test_drain_returns_flat_list_of_n_times_P():
+    """The drain returns one trajectory per task; count == n × P."""
+    engine = _make_engine(n=2)
+    tasks = deque(_req(r) for r in ("p0", "p0", "p1", "p1"))  # 2 prompts × n=2
+    out = _drive(engine, tasks)
+    assert isinstance(out, list)
+    assert len(out) == 4
+    assert all(isinstance(s, Sample) for s in out)
+    engine.shutdown()
+
+
+def test_ragged_depth_and_bucket_by_root_id():
+    """THE §4.1/§3.1 case: trajectories of DIFFERENT turn counts come back as
+    distinct variable-depth Samples (no concat), and bucket-by-root-id recovers
+    each prompt's n-group."""
+    env = FakeEnv(turns_by_prompt={"p0": 1, "p1": 3})
+    engine = _make_engine(n=2, env=env)
+    tasks = deque([_req("p0"), _req("p0"), _req("p1"), _req("p1")])
+    out = _drive(engine, tasks)
+
+    # group recovered purely by root id (a read over the list)
+    by_root: Dict[str, List[Sample]] = {}
+    for traj in out:
+        by_root.setdefault(traj.parts[0].sample_ids[0], []).append(traj)
+    assert Counter({k: len(v) for k, v in by_root.items()}) == Counter({"p0": 2, "p1": 2})
+
+    # ragged depth: p0 trajectories are 1 turn, p1 are 3 — never coerced/concat'd
+    assert sorted(len(s.gen_parts()) for s in by_root["p0"]) == [1, 1]
+    assert sorted(len(s.gen_parts()) for s in by_root["p1"]) == [3, 3]
+    engine.shutdown()
+
+
+def test_cap_bounds_concurrent_trajectories():
+    """The per-worker cap is the binding bound on concurrent trajectories: the
+    drain saturates it (no idle while the queue is non-empty + a slot is free) and
+    never exceeds it."""
+    cap = 4
+
+    class _Counting(AgenticRolloutEngine):
+        def __init__(self, *a: Any, **k: Any) -> None:
+            super().__init__(*a, **k)
+            self.inflight = 0
+            self.peak = 0
+
+        async def _run_one(self, task: Sample) -> Sample:
+            self.inflight += 1
+            self.peak = max(self.peak, self.inflight)
+            try:
+                return await super()._run_one(task)
+            finally:
+                self.inflight -= 1
+
+    cfg = AgenticRolloutEngineConfig(
+        inner=_FakeInnerConfig(concurrency=16, yields=4),
+        env=FakeEnv(default_turns=1),
+        max_turns=4,
+        episode_sampling=ARSamplingParams(samples_per_prompt=1),
+        per_worker_concurrency=cap,
+    )
+    engine = _Counting(cfg, rank=0)
+    tasks = deque(_req(f"p{i}") for i in range(10))  # 10 > cap
+    out = _drive(engine, tasks)
+
+    assert len(out) == 10  # drained fully
+    assert engine.peak == cap  # saturated the cap (greedy pull up to cap)
+    engine.shutdown()
+
+
+def test_two_bounds_are_distinct():
+    """Concurrent TRAJECTORIES (cap) and concurrent REQUESTS (the inner backend's
+    semaphore) are different bounds: with concurrency < cap, more trajectories are
+    in flight than requests (design §5)."""
+    cap, concurrency = 4, 2
+
+    class _Counting(AgenticRolloutEngine):
+        def __init__(self, *a: Any, **k: Any) -> None:
+            super().__init__(*a, **k)
+            self.peak = 0
+            self._n_inflight = 0
+
+        async def _run_one(self, task: Sample) -> Sample:
+            self._n_inflight += 1
+            self.peak = max(self.peak, self._n_inflight)
+            try:
+                return await super()._run_one(task)
+            finally:
+                self._n_inflight -= 1
+
+    cfg = AgenticRolloutEngineConfig(
+        inner=_FakeInnerConfig(concurrency=concurrency, yields=6),
+        env=FakeEnv(default_turns=1),
+        max_turns=4,
+        episode_sampling=ARSamplingParams(samples_per_prompt=1),
+        per_worker_concurrency=cap,
+    )
+    engine = _Counting(cfg, rank=0)
+    tasks = deque(_req(f"p{i}") for i in range(8))
+    out = _drive(engine, tasks)
+
+    assert len(out) == 8
+    assert engine.peak == cap  # 4 trajectories alive at once
+    assert engine._inner._backend.peak == concurrency  # but only 2 requests generate at once
+    engine.shutdown()
+
+
+def test_failure_isolation():
+    """A trajectory that raises (a failing tool) yields a partial and does NOT sink
+    the drain — the other trajectories still complete."""
+    env = FakeEnv(default_turns=2, fail_roots=("p1",))
+    engine = _make_engine(n=1, env=env)
+    tasks = deque(_req(r) for r in ("p0", "p1", "p2"))
+    out = _drive(engine, tasks)
+
+    assert len(out) == 3  # all three returned, including the failed one
+    by_root = {s.parts[0].sample_ids[0]: s for s in out}
+    # p1 failed on its first astep → partial: it never completed 2 turns
+    assert len(by_root["p1"].gen_parts()) < 2
+    # the others completed normally (2 turns each)
+    assert len(by_root["p0"].gen_parts()) == 2
+    assert len(by_root["p2"].gen_parts()) == 2
+    engine.shutdown()
+
+
+def test_next_task_is_fifo_with_none_sentinel():
+    """The coordinator's FIFO queue: pop in order, then ``None`` when drained."""
+    engine = _make_engine()
+    a, b = _req("p0"), _req("p1")
+    engine._queue = deque([a, b])
+    assert engine.next_task(0) is a
+    assert engine.next_task(7) is b  # worker_rank ignored (FIFO)
+    assert engine.next_task(0) is None  # drained
+    engine.shutdown()
+
+
+def test_pull_load_balancing_fast_worker_pulls_more():
+    """Two workers sharing one FIFO queue, run on one loop: the fast worker
+    (cheaper per-trajectory) pulls strictly more, and no task is lost. (The
+    emergent cross-worker balance; the per-worker greedy property is
+    test_cap_bounds_concurrent_trajectories.)"""
+    fast = _make_engine(cap=1, inner_yields=1, env=FakeEnv(default_turns=1))
+    slow = _make_engine(cap=1, inner_yields=40, env=FakeEnv(default_turns=1))
+
+    # Force both drains onto ONE event loop so they truly interleave.
+    shared = fast._inner._loop
+    slow._inner._backend._loop = shared
+    slow._inner._loop = shared
+    slow._loop = shared
+
+    queue = deque(_req(f"p{i}") for i in range(12))
+    n_fast, n_slow = [0], [0]
+
+    async def _pull_fast(_c: Any, _r: str) -> Optional[Sample]:
+        if not queue:
+            return None
+        n_fast[0] += 1
+        return queue.popleft()
+
+    async def _pull_slow(_c: Any, _r: str) -> Optional[Sample]:
+        if not queue:
+            return None
+        n_slow[0] += 1
+        return queue.popleft()
+
+    fast._pull = _pull_fast  # type: ignore[assignment]
+    slow._pull = _pull_slow  # type: ignore[assignment]
+
+    async def _both() -> None:
+        # Build the gather INSIDE the running loop so both drains bind to `shared`.
+        await asyncio.gather(fast._drain(None, ""), slow._drain(None, ""))
+
+    shared.run_until_complete(_both())
+
+    assert n_fast[0] + n_slow[0] == 12  # every task processed exactly once
+    assert n_fast[0] > n_slow[0]  # the fast worker pulled more (load balanced by capacity)
+    fast.shutdown()

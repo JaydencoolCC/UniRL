@@ -25,5 +25,15 @@ class Environment(Protocol):
         """
         ...
 
+    async def astep(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
+        """Async :meth:`step` — the non-blocking tool boundary (LIN-522).
+
+        Runs genuinely blocking tool I/O off the event loop (e.g. via
+        ``loop.run_in_executor``) so a slow tool yields the worker's shared loop to
+        sibling trajectories instead of stalling them. Must be re-entrant: one env
+        instance serves many concurrent trajectories on a worker.
+        """
+        ...
+
 
 __all__ = ["Environment"]

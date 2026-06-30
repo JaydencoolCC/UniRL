@@ -1,0 +1,54 @@
+"""Agentic rollout-engine configuration (LIN-522).
+
+Registered as a peer rollout engine (alongside ``sglang`` / ``composed`` /
+``vllm_omni`` / ``trainside``) whose ``_target_`` points at
+:class:`AgenticRolloutEngine`. The agentic engine wraps **one inner rollout
+engine** (the single-turn generator it awaits each turn) and **one environment**
+(the tool/world side), and drives multi-turn rollout across a DP-replicated slab
+with a rank-0 coordinator (see ``docs/async-rollout-service-design.md``).
+
+Like :class:`ComposedRolloutEngineConfig`, the ``inner`` and ``env`` fields are
+kept ``Any``: each carries its own ``_target_`` and is built by the worker walker
+(``Worker._resolve_init_kwargs``) before the engine is constructed — so each
+worker gets its **own local** inner engine + environment instance.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from unirl.rollout.engine.base import BaseEngineConfig
+
+
+@dataclass
+class AgenticRolloutEngineConfig(BaseEngineConfig):
+    """Config for the multi-turn (agentic) rollout engine."""
+
+    #: Inner single-turn rollout engine config (e.g. ``SGLangEngineConfig``); kept
+    #: ``Any`` so it is built from its own ``_target_`` via ``inner.make_engine``.
+    inner: Any
+    #: The environment (the world side of a turn) — an :class:`Environment`, kept
+    #: ``Any`` so a ``_target_`` (e.g. ``ToolEnvironment`` + tools) is instantiated
+    #: per worker by the walker. Must be re-entrant: one instance serves all of a
+    #: worker's concurrent trajectories (LIN-522).
+    env: Any
+
+    #: Hard per-trajectory turn bound (the loop's ``for _ in range(max_turns)``).
+    max_turns: int = 8
+    #: Per-turn sampling params (``BaseSamplingParams``); its ``samples_per_prompt``
+    #: is the GRPO group size ``n`` (read via ``total_samples_per_prompt``).
+    episode_sampling: Any = None
+    #: Max concurrent trajectories per worker — the pull gate / load-balance
+    #: granularity. Set a small multiple of the inner backend ``concurrency`` so
+    #: trajectories in tool-wait don't starve the GPU (see design §5).
+    per_worker_concurrency: int = 8
+
+    def make_engine(self, **deps: Any):
+        """Construct the runtime :class:`AgenticRolloutEngine` (lazy import)."""
+        from unirl.rollout.engine.agentic.engine import AgenticRolloutEngine
+
+        return AgenticRolloutEngine(config=self, **deps)
+
+
+__all__ = ["AgenticRolloutEngineConfig"]

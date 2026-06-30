@@ -14,13 +14,19 @@ from __future__ import annotations
 import asyncio
 import threading
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.sample import Sample
+
+#: The rollout batch contract (LIN-522). Single-turn engines return one ``Sample``;
+#: the agentic engine returns a list of variable-depth trajectory ``Sample``s (one
+#: per rollout). The ``generate`` façade is annotated with this union so both arms
+#: share one contract.
+RolloutOutput = Union[Sample, List[Sample]]
 
 
 class BaseEngineConfig(ABC):
@@ -172,13 +178,15 @@ class BaseRolloutEngine(Remote, ABC):
         return Sample.concat(groups)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, sample: Sample) -> Sample:
-        """Synchronous batch façade — the entry trainers call (unchanged contract).
+    def generate(self, sample: Sample) -> RolloutOutput:
+        """Synchronous batch façade — the entry trainers call.
 
-        Splits the batch into prompt-groups, runs them concurrently on the engine
-        loop via :meth:`agenerate`, and concatenates — byte-identical to the
-        pre-async whole-batch path. Engines needing bespoke batch handling may
-        override this (re-applying ``@distributed``); none do today.
+        Single-turn engines return a single ``Sample``: split the batch into
+        prompt-groups, run them concurrently on the engine loop via
+        :meth:`agenerate`, and concatenate — byte-identical to the pre-async
+        whole-batch path. The agentic engine (LIN-522) overrides this with a
+        ``BROADCAST + RANK_ZERO`` coordinator returning ``List[Sample]`` (one
+        variable-depth trajectory per rollout) — hence the ``RolloutOutput`` union.
         """
         return self._run_coro(self._agenerate_batch(sample))
 
@@ -303,4 +311,4 @@ class BaseRolloutEngine(Remote, ABC):
         raise NotImplementedError
 
 
-__all__ = ["BaseRolloutEngine"]
+__all__ = ["BaseRolloutEngine", "RolloutOutput"]

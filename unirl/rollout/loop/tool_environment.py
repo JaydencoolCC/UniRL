@@ -15,6 +15,7 @@ schemas for the prompt come from :meth:`ToolEnvironment.tool_schemas`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -117,15 +118,18 @@ class ToolEnvironment:
                 raise ValueError(f"duplicate tool name: {tool.name!r}")
             self._tools[tool.name] = tool
         self.max_turns = max_turns
-        self._turn = 0
 
     def tool_schemas(self) -> List[Dict[str, Any]]:
         """The tools' JSON schemas, for ``apply_chat_template(tools=...)`` prompt injection."""
         return [tool.json_schema() for tool in self._tools.values()]
 
     def reset(self, request: Sample) -> Sample:
-        """Per-episode setup: reset the turn counter; the request is returned unchanged."""
-        self._turn = 0
+        """Per-episode setup: the request is returned unchanged.
+
+        Stateless / re-entrant (LIN-522): the turn count is derived from the sample
+        in :meth:`step` (``len(sample.gen_parts())``), not held on the instance, so
+        one env instance can serve many concurrent trajectories on a worker.
+        """
         return request
 
     def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
@@ -134,8 +138,12 @@ class ToolEnvironment:
         Reads ``sample.parts[-1].primitive.texts`` (one text per frontier sample), executes any tool
         call per row, and returns a row-aligned :class:`Texts` observation. ``done`` once no row
         called a tool, or at ``max_turns``.
+
+        Stateless / re-entrant: the turn number is derived from the sample
+        (``len(sample.gen_parts())`` — one gen Part per turn so far), not a mutable
+        instance counter, so concurrent trajectories sharing one env don't clobber it.
         """
-        self._turn += 1
+        turn = len(sample.gen_parts())
         frontier = sample.parts[-1].primitive
         if not isinstance(frontier, Texts):
             raise TypeError(
@@ -149,13 +157,13 @@ class ToolEnvironment:
         any_call = any(c is not None for c in calls)
 
         info = {
-            "turn": self._turn,
+            "turn": turn,
             "tool_calls": calls,
             "results": results,
             "per_sample_done": per_sample_done,
         }
 
-        if (not any_call) or (self._turn >= self.max_turns):
+        if (not any_call) or (turn >= self.max_turns):
             return None, True, info
 
         # Row-aligned observation: the tool result for rows that called a tool; "" placeholder for
@@ -163,6 +171,15 @@ class ToolEnvironment:
         # case — a known follow-up that belongs to the loop/Sample layer, not the environment).
         observation = Texts(texts=[r if r is not None else "" for r in results])
         return observation, False, info
+
+    async def astep(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
+        """Async :meth:`step` (LIN-522): run the synchronous tool dispatch in the
+        event loop's default executor so a genuinely blocking tool yields the
+        worker's shared loop to sibling trajectories. Safe to call concurrently —
+        :meth:`step` is stateless (turn derived from the sample), and tools must be
+        thread-safe (the calculator is a pure function)."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.step, sample)
 
     def _run(self, call: Dict[str, Any]) -> str:
         """Dispatch one parsed call to its tool; surface any failure to the model as text."""
