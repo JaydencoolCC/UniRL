@@ -22,6 +22,7 @@ square.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from math import isqrt
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -100,12 +101,25 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         # per-image independent → numerically identical.
         self.decode_batch_size = max(1, int(decode_batch_size))
 
-    def decode(self, s: LatentSegment, *, image_shape: Optional[Tuple[int, int]] = None) -> Images:
+    def decode(
+        self,
+        s: LatentSegment,
+        *,
+        image_shape: Optional[Tuple[int, int]] = None,
+        grad: bool = False,
+        activation_checkpoint: bool = False,
+    ) -> Images:
         """Decode the final clean latent in *s* into ``[N, 3, H, W]`` pixels in ``[0, 1]``.
 
         Reads ``s.latents[:, -1]`` — the final clean latent ``diffuse`` stores
         (packed ``[N, seq, p²·z]``). ``image_shape`` (height, width) fixes the
         token grid; omitted ⇒ square grid from ``isqrt(seq)``.
+
+        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
+        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
+        flows from the reward through the frozen VAE into ``clean``; the VAE has no
+        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
+        (grad only) recomputes the decode in backward to trade compute for memory.
         """
         if s.latents is None:
             raise ValueError("BagelVAEDecodeStage.decode: segment.latents is None")
@@ -131,23 +145,32 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         if h * w != seq:
             raise ValueError(f"BagelVAEDecodeStage.decode: image_shape grid h*w={h * w} != packed seq={seq}.")
 
-        spatial = unpatchify_latent(clean.float(), h=h, w=w, patch_size=p, latent_channels=z)
-        bs = self.decode_batch_size
-        with torch.no_grad():
-            vae = self.bundle.vae
-            orig_dtype = next(vae.parameters()).dtype
-            vae.to(torch.float32)
+        def _decode(lat: torch.Tensor) -> torch.Tensor:
+            spatial = unpatchify_latent(lat.float(), h=h, w=w, patch_size=p, latent_channels=z)
+            vae_fp32 = self.bundle.vae.to(torch.float32)
+            bs = self.decode_batch_size
             if n <= bs:
-                decoded = vae.decode(spatial)
+                return vae_fp32.decode(spatial)
+            # Decode in batch-axis chunks to bound the fp32 upsample-conv peak
+            # (per-image independent; cat keeps the [N, 3, H, W] order).
+            return torch.cat([vae_fp32.decode(spatial[i : i + bs]) for i in range(0, n, bs)], dim=0)
+
+        vae = self.bundle.vae
+        orig_dtype = next(vae.parameters()).dtype
+        with nullcontext() if grad else torch.no_grad():
+            if grad and activation_checkpoint and clean.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+
+                decoded = checkpoint(_decode, clean, use_reentrant=False)
             else:
-                # Decode in batch-axis chunks to bound the fp32 upsample-conv peak
-                # (per-image independent; cat keeps the [N, 3, H, W] order).
-                decoded = torch.cat([vae.decode(spatial[i : i + bs]) for i in range(0, n, bs)], dim=0)
-            # Restore the VAE's loaded dtype: the image-edit path also ENCODES the
-            # source with this shared VAE on the next rollout, and a left-over fp32
-            # cast would make encode emit fp32 latents that mismatch the bf16 vae2llm.
-            if orig_dtype != torch.float32:
-                vae.to(orig_dtype)
+                decoded = _decode(clean)
+        # Restore the VAE's loaded dtype: the image-edit path also ENCODES the
+        # source with this shared VAE on the next rollout, and a left-over fp32
+        # cast would make encode emit fp32 latents that mismatch the bf16 vae2llm.
+        # (Under activation_checkpoint the backward recompute re-casts to fp32;
+        # the restore still holds for the grad=False rollout/eval path it guards.)
+        if orig_dtype != torch.float32:
+            vae.to(orig_dtype)
         pixels = (decoded * 0.5 + 0.5).clamp(0.0, 1.0)
         # Move to CPU before returning: decoded pixels are only ever consumed as
         # CPU PIL (reward scoring via tensor_frame_to_pil, rollout dump) and the flow
