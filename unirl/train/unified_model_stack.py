@@ -34,6 +34,7 @@ optimizer step, in contrast to the single-stage ``TrainStack``.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Dict, List, Mapping, Tuple
 
@@ -272,6 +273,16 @@ class UnifiedModelTrainStack(Remote):
         """Per-rollout-boundary hook — delegates to the FSDPBackend's EMA."""
         self.fsdp_backend.on_rollout_end()
 
+    def _train_step_profiler(self):
+        """Lazily build the per-worker train-step profiler (None unless UNIRL_PROFILE)."""
+        cached = getattr(self, "_profiler_cache", "unset")
+        if cached == "unset":
+            from unirl.utils.profiling import maybe_build_train_profiler
+
+            cached = maybe_build_train_profiler(int(getattr(self.fsdp_backend, "_rank", 0)))
+            self._profiler_cache = cached
+        return cached
+
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def train_track(
         self,
@@ -302,18 +313,25 @@ class UnifiedModelTrainStack(Remote):
         ar_track = ar_track.to_device(device)
         image_track = image_track.to_device(device)
 
-        tracks = {"ar": ar_track, "image": image_track}
-        # Freeze each track's π_old anchor once, before the multi-update loop.
-        for name in self.algorithms:
-            self.prepare_segment(name, tracks[name])
+        # Opt-in profiler (UNIRL_PROFILE=1): wraps ONLY the train compute
+        # (both algorithms' backward + the optimizer steps) — the rollout ran
+        # in the engine phase before this call, so this region is the pure train step.
+        profiler = self._train_step_profiler()
+        with profiler.record("train_track") if profiler is not None else nullcontext():
+            tracks = {"ar": ar_track, "image": image_track}
+            # Freeze each track's π_old anchor once, before the multi-update loop.
+            for name in self.algorithms:
+                self.prepare_segment(name, tracks[name])
 
-        # N optimizer steps over disjoint mini-batches (each track sliced by the same
-        # shared _optimizer_step_slices; M=1 keeps ar/image 1:1 and equally sized).
-        steps_by_track = {name: self._optimizer_step_slices(int(tracks[name].batch_size)) for name in self.algorithms}
-        per_update: List[Dict[str, TrainStepResult]] = []
-        for u in range(self.num_updates_per_batch):
-            slices_by_track = {name: steps_by_track[name][u] for name in self.algorithms}
-            per_update.append(self._train_one_step(tracks, slices_by_track, training_progress=float(training_progress)))
+            # N optimizer steps over disjoint mini-batches (each track sliced by the same
+            # shared _optimizer_step_slices; M=1 keeps ar/image 1:1 and equally sized).
+            steps_by_track = {name: self._optimizer_step_slices(int(tracks[name].batch_size)) for name in self.algorithms}
+            per_update: List[Dict[str, TrainStepResult]] = []
+            for u in range(self.num_updates_per_batch):
+                slices_by_track = {name: steps_by_track[name][u] for name in self.algorithms}
+                per_update.append(self._train_one_step(tracks, slices_by_track, training_progress=float(training_progress)))
+        if profiler is not None:
+            profiler.step()
 
         self.on_rollout_end()
 
