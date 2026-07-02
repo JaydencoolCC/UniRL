@@ -320,7 +320,7 @@ class UnifiedModelTrainStack(Remote):
         # unified stack does not use); UNIRL_PROFILE=one-update therefore no-ops here.
         from unirl.utils.profiling import profile_scope
 
-        profiler = self._train_step_profiler() if profile_scope() == "full-step" else None
+        profiler = self._train_step_profiler() if profile_scope() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             tracks = {"ar": ar_track, "image": image_track}
             # Freeze each track's π_old anchor once, before the multi-update loop.

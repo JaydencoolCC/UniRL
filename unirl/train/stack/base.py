@@ -347,14 +347,14 @@ class TrainStack(Remote):
             micro_batch_size=self.micro_batch_size,
         )
         # Opt-in profiler, region selected by UNIRL_PROFILE:
-        #   full-step  — profile the whole train compute (anchor-freeze forward + the N
+        #   train  — profile the whole train compute (anchor-freeze forward + the N
         #                optimizer updates); one profiler step() per rollout.
         #   one-update — profile only one optimizer update inside _run_update (backward +
         #                FSDP comm + optimizer), excluding the big SDE-replay prepare_segment.
         #                Smaller trace + the right window for compute/comm OVERLAP analysis.
         from unirl.utils.profiling import profile_scope
 
-        profiler = self._train_step_profiler() if profile_scope() == "full-step" else None
+        profiler = self._train_step_profiler() if profile_scope() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             self.prepare_segment(resp_track, plans=plans)
             result = self._run_updates(resp_track, plans=plans, training_progress=float(training_progress))

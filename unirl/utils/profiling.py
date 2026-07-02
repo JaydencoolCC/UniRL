@@ -12,7 +12,7 @@ hot path. ONE switch, whose value names the region recorded:
 * ``UNIRL_PROFILE=one-update`` — profile ONE optimizer update (backward + FSDP comm +
   optimizer), excluding the big anchor/SDE-replay forward. Small trace; for compute/comm
   OVERLAP analysis. Exports ``update_rank0.pt.trace.json.gz`` (opens directly in Perfetto).
-* ``UNIRL_PROFILE=full-step`` — profile the WHOLE train step (anchor forward + all N
+* ``UNIRL_PROFILE=train`` — profile the WHOLE train step (anchor forward + all N
   updates). Big trace; the complete picture of one training step.
 
 Optional knobs (sensible defaults; override any one):
@@ -21,8 +21,8 @@ Optional knobs (sensible defaults; override any one):
 * ``UNIRL_PROFILE_RANKS``   — ``0`` (default), ``all``, or a comma list ``0,8``.
 * ``UNIRL_PROFILE_CUDA``    — record CUDA kernels (default ``1``; ``0`` = CPU-only trace).
 * ``UNIRL_PROFILE_WARMUP``  — one-update: skip N updates before capturing (default ``2``);
-                              full-step: schedule warmup steps (default ``1``).
-* ``UNIRL_PROFILE_WAIT`` / ``_ACTIVE`` / ``_REPEAT`` — full-step schedule (default ``1``/``1``/``1``
+                              train: schedule warmup steps (default ``1``).
+* ``UNIRL_PROFILE_WAIT`` / ``_ACTIVE`` / ``_REPEAT`` — train schedule (default ``1``/``1``/``1``
                               = capture exactly ONE full step).
 * ``UNIRL_PROFILE_MEMORY`` / ``_SHAPES`` / ``_STACK`` — extra recording, OFF by default in both
                               modes (each balloons the trace; opt in only when you need it).
@@ -78,7 +78,7 @@ def profile_mode() -> str:
 
     * ``one-update`` — profile ONE optimizer update (backward + FSDP comm + optimizer),
       excluding the big anchor/SDE-replay forward. Small trace; for compute/comm OVERLAP.
-    * ``full-step``  — profile the WHOLE train step (anchor forward + all N updates).
+    * ``train``  — profile the WHOLE train step (anchor forward + all N updates).
       Big trace; the complete picture of one training step.
     * unset / ``0`` / ``false`` / ``off`` — disabled (a no-op).
 
@@ -88,11 +88,11 @@ def profile_mode() -> str:
     v = os.environ.get("UNIRL_PROFILE", "").strip().lower()
     if v in ("", "0", "false", "no", "off"):
         return "off"
-    if v in ("one-update", "full-step"):
+    if v in ("one-update", "train"):
         return v
     if v not in _MODE_WARNED:
         _MODE_WARNED.add(v)
-        logger.warning("UNIRL_PROFILE=%r not recognized; use 'one-update' or 'full-step'. Profiling disabled.", v)
+        logger.warning("UNIRL_PROFILE=%r not recognized; use 'one-update' or 'train'. Profiling disabled.", v)
     return "off"
 
 
@@ -101,7 +101,7 @@ def profile_enabled() -> bool:
 
 
 def profile_scope() -> str:
-    """The region being profiled: ``one-update`` or ``full-step`` (or ``off``).
+    """The region being profiled: ``one-update`` or ``train`` (or ``off``).
 
     Identical to the ``UNIRL_PROFILE`` value — the switch *is* the scope, no separate knob.
     """
@@ -164,7 +164,7 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
         return None
 
     # Default = capture ONE full step (wait1 + warmup1 + active1) so a bare
-    # UNIRL_PROFILE=full-step already produces a small, Perfetto-loadable trace.
+    # UNIRL_PROFILE=train already produces a small, Perfetto-loadable trace.
     wait = _int_env("UNIRL_PROFILE_WAIT", 1)
     warmup = _int_env("UNIRL_PROFILE_WARMUP", 1)
     active = _int_env("UNIRL_PROFILE_ACTIVE", 1)
