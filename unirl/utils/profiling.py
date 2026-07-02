@@ -140,6 +140,10 @@ class TrainStepProfiler:
                 logger.info("TrainStepProfiler: %d steps profiled; trace written to %s", self._n, self._out_dir)
         except Exception:
             self._stopped = True
+            try:
+                self._prof.stop()  # release CUPTI hooks so later steps carry no overhead
+            except Exception:
+                pass
             logger.warning("TrainStepProfiler: profiling/export failed; training continues", exc_info=True)
 
     @contextmanager
@@ -203,7 +207,11 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
         repeat,
         out_dir,
     )
-    return TrainStepProfiler(prof, total_steps=total, out_dir=out_dir)
+    try:
+        return TrainStepProfiler(prof, total_steps=total, out_dir=out_dir)  # __init__ calls prof.start()
+    except Exception:
+        logger.warning("TrainStepProfiler: profiler start failed (CUPTI init?); not profiling this run", exc_info=True)
+        return None
 
 
 @contextmanager
@@ -247,8 +255,18 @@ def maybe_profile_update(owner, rank: int) -> Iterator[None]:
         profile_memory=_truthy(os.environ.get("UNIRL_PROFILE_MEMORY"), default=False),
         with_stack=False,
     )
+    try:
+        prof.start()
+    except Exception:
+        owner._prof_update_done = True
+        logger.warning(
+            "maybe_profile_update[rank%d]: profiler start failed (CUPTI init?); update unprofiled",
+            int(rank),
+            exc_info=True,
+        )
+        yield
+        return
     logger.info("maybe_profile_update[rank%d]: profiling one optimizer update -> %s", int(rank), out_dir)
-    prof.start()
     try:
         yield
     finally:
