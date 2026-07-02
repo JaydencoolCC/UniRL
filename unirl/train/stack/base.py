@@ -346,12 +346,8 @@ class TrainStack(Remote):
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
         )
-        # Opt-in profiler, region selected by UNIRL_PROFILE:
-        #   train  — profile the whole train compute (anchor-freeze forward + the N
-        #                optimizer updates); one profiler step() per rollout.
-        #   one-update — profile only one optimizer update inside _run_update (backward +
-        #                FSDP comm + optimizer), excluding the big SDE-replay prepare_segment.
-        #                Smaller trace + the right window for compute/comm OVERLAP analysis.
+        # Opt-in profiler (UNIRL_PROFILE=train profiles this whole step; one-update is
+        # handled in _run_updates). See unirl/train/readme.md.
         from unirl.utils.profiling import profile_scope
 
         profiler = self._train_step_profiler() if profile_scope() == "train" else None
@@ -393,14 +389,18 @@ class TrainStack(Remote):
         :func:`_aggregate_update_results`).
         """
         # UNIRL_PROFILE=one-update: wrap each optimizer update in a one-shot profiler
-        # (fires once, on rank0, past warmup) so the trace captures ONLY the
-        # backward + FSDP comm + optimizer region — the compute/comm overlap window.
+        # (fires once, on rank0, past warmup) so the trace captures ONLY one update
+        # (forward + backward + cross-GPU comm + optimizer) — the compute/comm overlap window.
         from unirl.utils.profiling import maybe_profile_update, profile_scope
 
         scope_update = profile_scope() == "one-update"
         results = []
         for micros in plans:
-            cm = maybe_profile_update(self, int(getattr(self.fsdp_backend, "_rank", 0))) if scope_update else nullcontext()
+            cm = (
+                maybe_profile_update(self, int(getattr(self.fsdp_backend, "_rank", 0)))
+                if scope_update
+                else nullcontext()
+            )
             with cm:
                 results.append(self._run_update(resp_track, micros=micros, training_progress=training_progress))
         if len(results) == 1:

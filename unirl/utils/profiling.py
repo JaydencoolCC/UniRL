@@ -9,9 +9,9 @@ phase, so the profiled region here is the pure train step.
 Entirely env-gated; a no-op unless ``UNIRL_PROFILE`` is set, so it can ship in the
 hot path. ONE switch, whose value names the region recorded:
 
-* ``UNIRL_PROFILE=one-update`` — profile ONE optimizer update (backward + FSDP comm +
-  optimizer), excluding the big anchor/SDE-replay forward. Small trace; for compute/comm
-  OVERLAP analysis. Exports ``update_rank0.pt.trace.json.gz`` (opens directly in Perfetto).
+* ``UNIRL_PROFILE=one-update`` — profile ONE optimizer update (forward + backward +
+  cross-GPU comm + optimizer), excluding the big anchor/SDE-replay forward. Small trace; for
+  compute/comm OVERLAP. Exports ``update_rank0.pt.trace.json.gz`` (opens directly in Perfetto).
 * ``UNIRL_PROFILE=train`` — profile the WHOLE train step (anchor forward + all N
   updates). Big trace; the complete picture of one training step.
 
@@ -24,8 +24,7 @@ Optional knobs (sensible defaults; override any one):
                               train: schedule warmup steps (default ``1``).
 * ``UNIRL_PROFILE_WAIT`` / ``_ACTIVE`` / ``_REPEAT`` — train schedule (default ``1``/``1``/``1``
                               = capture exactly ONE full step).
-* ``UNIRL_PROFILE_MEMORY`` / ``_SHAPES`` / ``_STACK`` — extra recording, OFF by default in both
-                              modes (each balloons the trace; opt in only when you need it).
+* ``UNIRL_PROFILE_MEMORY``  — also record CUDA memory alloc/free (default off; bigger trace).
 
 Both modes export a gzipped Chrome/Perfetto trace, one file per profiled rank.
 """
@@ -76,8 +75,8 @@ _MODE_WARNED: set = set()
 def profile_mode() -> str:
     """Resolve the single switch ``UNIRL_PROFILE``. The value names the region recorded:
 
-    * ``one-update`` — profile ONE optimizer update (backward + FSDP comm + optimizer),
-      excluding the big anchor/SDE-replay forward. Small trace; for compute/comm OVERLAP.
+    * ``one-update`` — profile ONE optimizer update (forward + backward + cross-GPU comm +
+      optimizer), excluding the big anchor/SDE-replay forward. Small trace; for OVERLAP.
     * ``train``  — profile the WHOLE train step (anchor forward + all N updates).
       Big trace; the complete picture of one training step.
     * unset / ``0`` / ``false`` / ``off`` — disabled (a no-op).
@@ -185,9 +184,9 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
         activities=activities,
         schedule=sched,
         on_trace_ready=torch.profiler.tensorboard_trace_handler(out_dir, worker_name=f"rank{int(rank)}", use_gzip=True),
-        record_shapes=_truthy(os.environ.get("UNIRL_PROFILE_SHAPES"), default=False),
+        record_shapes=False,
         profile_memory=_truthy(os.environ.get("UNIRL_PROFILE_MEMORY"), default=False),
-        with_stack=_truthy(os.environ.get("UNIRL_PROFILE_STACK"), default=False),
+        with_stack=False,
     )
     total = max(1, (wait + warmup + active) * max(1, repeat))
     logger.info(
@@ -209,7 +208,7 @@ def maybe_profile_update(owner, rank: int) -> Iterator[None]:
     torch.profiler records continuously while active, so the schedule-based
     :class:`TrainStepProfiler` (which spans a whole rollout) always sweeps in the big
     SDE-replay ``prepare_segment`` too. For compute/comm OVERLAP analysis we want just
-    one optimizer update — backward + FSDP reduce-scatter/all-gather + optimizer_step.
+    one optimizer update — forward + backward + cross-GPU comm + optimizer_step.
     This wraps exactly that region in its own profiler and exports immediately, so the
     trace is small and contains only the overlap-relevant window.
 
@@ -239,9 +238,9 @@ def maybe_profile_update(owner, rank: int) -> Iterator[None]:
         activities.append(torch.profiler.ProfilerActivity.CUDA)
     prof = torch.profiler.profile(
         activities=activities,
-        record_shapes=_truthy(os.environ.get("UNIRL_PROFILE_SHAPES"), default=False),
+        record_shapes=False,
         profile_memory=_truthy(os.environ.get("UNIRL_PROFILE_MEMORY"), default=False),
-        with_stack=_truthy(os.environ.get("UNIRL_PROFILE_STACK"), default=False),
+        with_stack=False,
     )
     logger.info("maybe_profile_update[rank%d]: profiling one optimizer update -> %s", int(rank), out_dir)
     prof.start()
