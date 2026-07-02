@@ -6,10 +6,17 @@ backend — without the SGLang/vLLM rollout — wrap the per-rollout train call 
 the worker with :class:`TrainStepProfiler`. The rollout runs in a separate engine
 phase, so the profiled region here is the pure train step.
 
-Entirely env-gated; a no-op unless ``UNIRL_PROFILE`` is truthy, so it can ship in
-the hot path. Knobs (all optional):
+Entirely env-gated; a no-op unless ``UNIRL_PROFILE`` is set, so it can ship in the
+hot path. ONE switch selects a fully-configured preset:
 
-* ``UNIRL_PROFILE``         — ``1``/``true`` to enable (default off).
+* ``UNIRL_PROFILE=overlap`` — one optimizer update only (backward + FSDP comm +
+  optimizer), CUDA on, memory/shapes off, rank0. Best for compute/comm OVERLAP
+  analysis; small trace. Output goes to ``outputs/profiler`` (or ``UNIRL_PROFILE_DIR``).
+* ``UNIRL_PROFILE=1`` (or ``step``) — whole train step (anchor forward + updates).
+
+Everything below is auto-set by the preset but can still be overridden:
+
+* ``UNIRL_PROFILE``         — ``overlap`` / ``1`` / ``step`` to enable (default off).
 * ``UNIRL_PROFILE_DIR``     — trace output dir (default ``outputs/profiler``).
 * ``UNIRL_PROFILE_RANKS``   — ``0`` (default), ``all``, or a comma list ``0,8``.
 * ``UNIRL_PROFILE_WAIT``    — schedule wait steps   (default ``2``).
@@ -65,6 +72,43 @@ def _rank_enabled(rank: int) -> bool:
         return rank == 0
 
 
+def profile_mode() -> str:
+    """Resolve the single-switch mode from ``UNIRL_PROFILE``.
+
+    A single env var is all a caller needs: ``UNIRL_PROFILE=overlap`` auto-configures
+    the whole compute/comm-overlap preset (one optimizer update, CUDA on, memory/shapes
+    off, rank0, local output dir); ``UNIRL_PROFILE=1``/``step``/``true`` is the whole-step
+    preset; anything falsy/unset is off. Individual ``UNIRL_PROFILE_*`` vars still override.
+    """
+    v = os.environ.get("UNIRL_PROFILE", "").strip().lower()
+    if v in ("", "0", "false", "no", "off"):
+        return "off"
+    return "overlap" if v == "overlap" else "step"
+
+
+def profile_enabled() -> bool:
+    return profile_mode() != "off"
+
+
+def profile_scope() -> str:
+    """``step`` (whole train_track) or ``update`` (one optimizer update, for overlap).
+
+    Explicit ``UNIRL_PROFILE_SCOPE`` wins; otherwise ``overlap`` mode implies ``update``.
+    """
+    s = os.environ.get("UNIRL_PROFILE_SCOPE", "").strip().lower()
+    if s in ("step", "update"):
+        return s
+    return "update" if profile_mode() == "overlap" else "step"
+
+
+def _out_dir() -> str:
+    """Trace output dir. Defaults to ``outputs/profiler`` (relative to cwd, created if
+    missing); set ``UNIRL_PROFILE_DIR`` to write elsewhere. NOTE: writing a very large
+    (multi-GB) trace to a network FS can stall the export — point ``UNIRL_PROFILE_DIR``
+    at a node-local path for whole-step captures."""
+    return os.environ.get("UNIRL_PROFILE_DIR", "").strip() or "outputs/profiler"
+
+
 class TrainStepProfiler:
     """Thin wrapper: a torch profiler stepped once per rollout train call."""
 
@@ -99,7 +143,7 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     Called lazily on the worker the first time a train step runs (so the device
     is bound and the profiler attaches to the right CUDA context).
     """
-    if not _truthy(os.environ.get("UNIRL_PROFILE")):
+    if not profile_enabled():
         return None
     # The caller passes a backend-specific rank that is 0 on every worker for some
     # backends (e.g. FSDP colocate lacks `_rank`). Prefer the true global rank from
@@ -116,7 +160,7 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     warmup = _int_env("UNIRL_PROFILE_WARMUP", 2)
     active = _int_env("UNIRL_PROFILE_ACTIVE", 3)
     repeat = _int_env("UNIRL_PROFILE_REPEAT", 1)
-    out_dir = os.environ.get("UNIRL_PROFILE_DIR", "outputs/profiler").strip() or "outputs/profiler"
+    out_dir = _out_dir()
     os.makedirs(out_dir, exist_ok=True)
 
     activities = [torch.profiler.ProfilerActivity.CPU]
@@ -131,7 +175,7 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     prof = torch.profiler.profile(
         activities=activities,
         schedule=sched,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(out_dir, worker_name=f"rank{int(rank)}"),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(out_dir, worker_name=f"rank{int(rank)}", use_gzip=True),
         record_shapes=_truthy(os.environ.get("UNIRL_PROFILE_SHAPES"), default=True),
         profile_memory=_truthy(os.environ.get("UNIRL_PROFILE_MEMORY"), default=True),
         with_stack=_truthy(os.environ.get("UNIRL_PROFILE_STACK"), default=False),
@@ -164,7 +208,7 @@ def maybe_profile_update(owner, rank: int) -> Iterator[None]:
     updates (default 2) so the profiled step is past first-iter compile/allocation.
     A no-op context otherwise.
     """
-    enabled = _truthy(os.environ.get("UNIRL_PROFILE"))
+    enabled = profile_enabled()
     if enabled:
         import torch.distributed as dist
 
@@ -179,7 +223,7 @@ def maybe_profile_update(owner, rank: int) -> Iterator[None]:
         yield
         return
 
-    out_dir = os.environ.get("UNIRL_PROFILE_DIR", "outputs/profiler").strip() or "outputs/profiler"
+    out_dir = _out_dir()
     os.makedirs(out_dir, exist_ok=True)
     activities = [torch.profiler.ProfilerActivity.CPU]
     if _truthy(os.environ.get("UNIRL_PROFILE_CUDA"), default=True) and torch.cuda.is_available():
@@ -197,9 +241,24 @@ def maybe_profile_update(owner, rank: int) -> Iterator[None]:
     finally:
         prof.stop()
         owner._prof_update_done = True
-        out = os.path.join(out_dir, f"update_rank{int(rank)}.pt.trace.json")
-        prof.export_chrome_trace(out)
+        raw = os.path.join(out_dir, f"update_rank{int(rank)}.pt.trace.json")
+        prof.export_chrome_trace(raw)
+        # gzip in place -> opens directly in Perfetto and is small enough to download
+        import gzip
+        import shutil
+
+        out = raw + ".gz"
+        with open(raw, "rb") as fin, gzip.open(out, "wb") as fout:
+            shutil.copyfileobj(fin, fout)
+        os.remove(raw)
         logger.info("maybe_profile_update[rank%d]: trace written to %s", int(rank), out)
 
 
-__all__ = ["TrainStepProfiler", "maybe_build_train_profiler", "maybe_profile_update"]
+__all__ = [
+    "TrainStepProfiler",
+    "maybe_build_train_profiler",
+    "maybe_profile_update",
+    "profile_mode",
+    "profile_enabled",
+    "profile_scope",
+]

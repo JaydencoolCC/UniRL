@@ -41,7 +41,6 @@ update shares the same PPO anchor; this is only correct for algorithms with
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Dict, List, Mapping, Optional, Tuple
@@ -354,12 +353,13 @@ class TrainStack(Remote):
         #                      (backward + FSDP comm + optimizer), excluding the big
         #                      SDE-replay prepare_segment. Smaller trace + the right
         #                      window for compute/comm OVERLAP analysis.
-        profiler = self._train_step_profiler()
-        step_scope = profiler is not None and os.environ.get("UNIRL_PROFILE_SCOPE", "step").strip().lower() == "step"
-        with profiler.record("train_track") if step_scope else nullcontext():
+        from unirl.utils.profiling import profile_scope
+
+        profiler = self._train_step_profiler() if profile_scope() == "step" else None
+        with profiler.record("train_track") if profiler is not None else nullcontext():
             self.prepare_segment(resp_track, plans=plans)
             result = self._run_updates(resp_track, plans=plans, training_progress=float(training_progress))
-        if step_scope:
+        if profiler is not None:
             profiler.step()
         self.on_rollout_end()
         return result
@@ -396,15 +396,12 @@ class TrainStack(Remote):
         # UNIRL_PROFILE_SCOPE=update: wrap each optimizer update in a one-shot profiler
         # (fires once, on rank0, past warmup) so the trace captures ONLY the
         # backward + FSDP comm + optimizer region — the compute/comm overlap window.
-        scope_update = os.environ.get("UNIRL_PROFILE_SCOPE", "step").strip().lower() == "update"
+        from unirl.utils.profiling import maybe_profile_update, profile_scope
+
+        scope_update = profile_scope() == "update"
         results = []
         for micros in plans:
-            if scope_update:
-                from unirl.utils.profiling import maybe_profile_update
-
-                cm = maybe_profile_update(self, int(getattr(self.fsdp_backend, "_rank", 0)))
-            else:
-                cm = nullcontext()
+            cm = maybe_profile_update(self, int(getattr(self.fsdp_backend, "_rank", 0))) if scope_update else nullcontext()
             with cm:
                 results.append(self._run_update(resp_track, micros=micros, training_progress=training_progress))
         if len(results) == 1:
