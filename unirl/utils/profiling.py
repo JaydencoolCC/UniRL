@@ -21,9 +21,11 @@ Optional knobs (sensible defaults; override any one):
 * ``UNIRL_PROFILE_RANKS``   — ``0`` (default), ``all``, or a comma list ``0,8``.
 * ``UNIRL_PROFILE_CUDA``    — record CUDA kernels (default ``1``; ``0`` = CPU-only trace).
 * ``UNIRL_PROFILE_WARMUP``  — one-update: skip N updates before capturing (default ``2``);
-                              full-step: schedule warmup steps.
-* ``UNIRL_PROFILE_WAIT`` / ``_ACTIVE`` / ``_REPEAT`` — full-step schedule (default 2/3/1).
-* ``UNIRL_PROFILE_MEMORY`` / ``_SHAPES`` / ``_STACK`` — extra recording (heavier; off for one-update).
+                              full-step: schedule warmup steps (default ``1``).
+* ``UNIRL_PROFILE_WAIT`` / ``_ACTIVE`` / ``_REPEAT`` — full-step schedule (default ``1``/``1``/``1``
+                              = capture exactly ONE full step).
+* ``UNIRL_PROFILE_MEMORY`` / ``_SHAPES`` / ``_STACK`` — extra recording, OFF by default in both
+                              modes (each balloons the trace; opt in only when you need it).
 
 Both modes export a gzipped Chrome/Perfetto trace, one file per profiled rank.
 """
@@ -161,9 +163,11 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     if not _rank_enabled(int(rank)):
         return None
 
-    wait = _int_env("UNIRL_PROFILE_WAIT", 2)
-    warmup = _int_env("UNIRL_PROFILE_WARMUP", 2)
-    active = _int_env("UNIRL_PROFILE_ACTIVE", 3)
+    # Default = capture ONE full step (wait1 + warmup1 + active1) so a bare
+    # UNIRL_PROFILE=full-step already produces a small, Perfetto-loadable trace.
+    wait = _int_env("UNIRL_PROFILE_WAIT", 1)
+    warmup = _int_env("UNIRL_PROFILE_WARMUP", 1)
+    active = _int_env("UNIRL_PROFILE_ACTIVE", 1)
     repeat = _int_env("UNIRL_PROFILE_REPEAT", 1)
     out_dir = _out_dir()
     os.makedirs(out_dir, exist_ok=True)
@@ -181,8 +185,8 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
         activities=activities,
         schedule=sched,
         on_trace_ready=torch.profiler.tensorboard_trace_handler(out_dir, worker_name=f"rank{int(rank)}", use_gzip=True),
-        record_shapes=_truthy(os.environ.get("UNIRL_PROFILE_SHAPES"), default=True),
-        profile_memory=_truthy(os.environ.get("UNIRL_PROFILE_MEMORY"), default=True),
+        record_shapes=_truthy(os.environ.get("UNIRL_PROFILE_SHAPES"), default=False),
+        profile_memory=_truthy(os.environ.get("UNIRL_PROFILE_MEMORY"), default=False),
         with_stack=_truthy(os.environ.get("UNIRL_PROFILE_STACK"), default=False),
     )
     total = max(1, (wait + warmup + active) * max(1, repeat))
