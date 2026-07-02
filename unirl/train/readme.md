@@ -101,6 +101,10 @@ trace, not one per step; training keeps running). They differ in *which slice* t
 - **`train`** — the whole step: anchor forward (recompute old-policy log-probs; for diffusion
   it replays the denoising trajectory, so it's large) + all updates. **For step-time breakdown.**
 
+> The unified-model stack (HI3, AR+image) only supports `train` — it fuses each step into a
+> single update, so there is no per-update boundary for `one-update` to wrap (a warning is
+> logged and no trace is produced).
+
 ```bash
 UNIRL_PROFILE=one-update  python -m unirl.train_diffusion --config-name=<recipe> ...
 UNIRL_PROFILE=train       python -m unirl.train_diffusion --config-name=<recipe> ...
