@@ -36,6 +36,7 @@ from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
+from unirl.sde.noise import _derive_group_seed
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_req_sigmas
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts, Video, Videos
@@ -182,11 +183,36 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             params is not None,
             "fastvideo engine requires req.sampling_params['diffusion']",
         )
-        raw = self._drive_fastvideo(prompts, params, req.sigmas)
+        seeds = self._per_sample_seeds(req, params)
+        raw = self._drive_fastvideo(prompts, params, req.sigmas, seeds)
         return self._build_resp(req, params, raw)
 
+    def _per_sample_seeds(self, req: RolloutReq, params: Any) -> List[int]:
+        """Per-sample seeds so sibling samples of one prompt diverge.
+
+        Without this every sample of a prompt shared ``params.seed`` → identical
+        video → identical reward → zero GRPO advantage → zero loss/grad. We key
+        the seed the same way the driver keys x_T (``_derive_group_seed``):
+        per-sample ids when ``init_same_noise`` is false (siblings differ),
+        per-group ids when true (siblings share). Prefer the driver's
+        ``init_noise_group_ids`` (carries rollout id + same/diff policy); fall
+        back to sample/group ids, then to the flat seed.
+        NOTE: this only decorrelates siblings; full driver-authoritative x_T SSOT
+        (byte-identical to other engines via ``regen_initial_noise``) is a
+        separate follow-up.
+        """
+        bs = int(req.batch_size)
+        base_seed = int(params.seed)
+        keys = getattr(req, "init_noise_group_ids", None)
+        if not (isinstance(keys, (list, tuple)) and len(keys) == bs):
+            same = bool(getattr(params, "init_same_noise", False))
+            keys = list(req.group_ids) if same else list(req.sample_ids)
+        if not (isinstance(keys, (list, tuple)) and len(keys) == bs):
+            return [base_seed] * bs
+        return [_derive_group_seed(base_seed, str(k)) for k in keys]
+
     def _drive_fastvideo(
-        self, prompts: List[str], params: Any, sigmas: torch.Tensor,
+        self, prompts: List[str], params: Any, sigmas: torch.Tensor, seeds: List[int],
     ) -> Dict[str, Any]:
         """PR #1222 native-logprob path via executor.execute_forward + RLData.
 
@@ -204,7 +230,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         sp.num_frames = int(params.num_frames)
         sp.num_inference_steps = int(params.num_inference_steps)
         sp.guidance_scale = float(params.guidance_scale)
-        sp.seed = int(params.seed)
+        sp.seed = int(params.seed)  # per-sample override applied in the loop below
         sp.num_videos_per_prompt = 1
         sp.save_video = False
         sp.return_frames = False
@@ -223,9 +249,14 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         all_neg_embeds: List[torch.Tensor] = []
         all_neg_masks: List[Optional[torch.Tensor]] = []
 
-        for prompt in prompts:
+        require(
+            len(seeds) == len(prompts),
+            f"fastvideo engine expects one seed per prompt; got {len(seeds)} vs {len(prompts)}",
+        )
+        for prompt, seed in zip(prompts, seeds):
             one = deepcopy(sp)
             one.prompt = prompt
+            one.seed = int(seed)  # decorrelate sibling samples (see _per_sample_seeds)
             latents_size = [(one.num_frames - 1) // 4 + 1, one.height // 8, one.width // 8]
             n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
             sp_dict = shallow_asdict(one)
