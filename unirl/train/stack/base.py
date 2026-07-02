@@ -346,16 +346,15 @@ class TrainStack(Remote):
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
         )
-        # Opt-in profiler (UNIRL_PROFILE=1). Scope selected by UNIRL_PROFILE_SCOPE:
-        #   step   (default) — profile the whole train compute (anchor-freeze forward
-        #                      + the N optimizer updates); one step() per rollout.
-        #   update           — profile only one optimizer update inside _run_update
-        #                      (backward + FSDP comm + optimizer), excluding the big
-        #                      SDE-replay prepare_segment. Smaller trace + the right
-        #                      window for compute/comm OVERLAP analysis.
+        # Opt-in profiler, region selected by UNIRL_PROFILE:
+        #   full-step  — profile the whole train compute (anchor-freeze forward + the N
+        #                optimizer updates); one profiler step() per rollout.
+        #   one-update — profile only one optimizer update inside _run_update (backward +
+        #                FSDP comm + optimizer), excluding the big SDE-replay prepare_segment.
+        #                Smaller trace + the right window for compute/comm OVERLAP analysis.
         from unirl.utils.profiling import profile_scope
 
-        profiler = self._train_step_profiler() if profile_scope() == "step" else None
+        profiler = self._train_step_profiler() if profile_scope() == "full-step" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             self.prepare_segment(resp_track, plans=plans)
             result = self._run_updates(resp_track, plans=plans, training_progress=float(training_progress))
@@ -393,12 +392,12 @@ class TrainStack(Remote):
         each update's own metrics are attached on ``per_update`` (see
         :func:`_aggregate_update_results`).
         """
-        # UNIRL_PROFILE_SCOPE=update: wrap each optimizer update in a one-shot profiler
+        # UNIRL_PROFILE=one-update: wrap each optimizer update in a one-shot profiler
         # (fires once, on rank0, past warmup) so the trace captures ONLY the
         # backward + FSDP comm + optimizer region — the compute/comm overlap window.
         from unirl.utils.profiling import maybe_profile_update, profile_scope
 
-        scope_update = profile_scope() == "update"
+        scope_update = profile_scope() == "one-update"
         results = []
         for micros in plans:
             cm = maybe_profile_update(self, int(getattr(self.fsdp_backend, "_rank", 0))) if scope_update else nullcontext()

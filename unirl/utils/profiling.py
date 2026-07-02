@@ -7,29 +7,25 @@ the worker with :class:`TrainStepProfiler`. The rollout runs in a separate engin
 phase, so the profiled region here is the pure train step.
 
 Entirely env-gated; a no-op unless ``UNIRL_PROFILE`` is set, so it can ship in the
-hot path. ONE switch selects a fully-configured preset:
+hot path. ONE switch, whose value names the region recorded:
 
-* ``UNIRL_PROFILE=overlap`` — one optimizer update only (backward + FSDP comm +
-  optimizer), CUDA on, memory/shapes off, rank0. Best for compute/comm OVERLAP
-  analysis; small trace. Output goes to ``outputs/profiler`` (or ``UNIRL_PROFILE_DIR``).
-* ``UNIRL_PROFILE=1`` (or ``step``) — whole train step (anchor forward + updates).
+* ``UNIRL_PROFILE=one-update`` — profile ONE optimizer update (backward + FSDP comm +
+  optimizer), excluding the big anchor/SDE-replay forward. Small trace; for compute/comm
+  OVERLAP analysis. Exports ``update_rank0.pt.trace.json.gz`` (opens directly in Perfetto).
+* ``UNIRL_PROFILE=full-step`` — profile the WHOLE train step (anchor forward + all N
+  updates). Big trace; the complete picture of one training step.
 
-Everything below is auto-set by the preset but can still be overridden:
+Optional knobs (sensible defaults; override any one):
 
-* ``UNIRL_PROFILE``         — ``overlap`` / ``1`` / ``step`` to enable (default off).
-* ``UNIRL_PROFILE_DIR``     — trace output dir (default ``outputs/profiler``).
+* ``UNIRL_PROFILE_DIR``     — trace output dir (default ``outputs/profiler``, auto-created).
 * ``UNIRL_PROFILE_RANKS``   — ``0`` (default), ``all``, or a comma list ``0,8``.
-* ``UNIRL_PROFILE_WAIT``    — schedule wait steps   (default ``2``).
-* ``UNIRL_PROFILE_WARMUP``  — schedule warmup steps (default ``2``).
-* ``UNIRL_PROFILE_ACTIVE``  — schedule active steps (default ``3``).
-* ``UNIRL_PROFILE_REPEAT``  — schedule repeat cycles (default ``1``).
-* ``UNIRL_PROFILE_MEMORY``  — record CUDA mem (default ``1``).
-* ``UNIRL_PROFILE_SHAPES``  — record op input shapes (default ``1``).
-* ``UNIRL_PROFILE_STACK``   — record python stacks (default ``0``; heavy).
+* ``UNIRL_PROFILE_CUDA``    — record CUDA kernels (default ``1``; ``0`` = CPU-only trace).
+* ``UNIRL_PROFILE_WARMUP``  — one-update: skip N updates before capturing (default ``2``);
+                              full-step: schedule warmup steps.
+* ``UNIRL_PROFILE_WAIT`` / ``_ACTIVE`` / ``_REPEAT`` — full-step schedule (default 2/3/1).
+* ``UNIRL_PROFILE_MEMORY`` / ``_SHAPES`` / ``_STACK`` — extra recording (heavier; off for one-update).
 
-One profiler ``step()`` = one rollout's train call. After ``(wait+warmup+active)*
-repeat`` steps the trace is exported (Chrome/TensorBoard JSON, one file per rank
-worker) and the profiler stops itself — later steps are cheap no-ops.
+Both modes export a gzipped Chrome/Perfetto trace, one file per profiled rank.
 """
 
 from __future__ import annotations
@@ -72,18 +68,30 @@ def _rank_enabled(rank: int) -> bool:
         return rank == 0
 
 
-def profile_mode() -> str:
-    """Resolve the single-switch mode from ``UNIRL_PROFILE``.
+_MODE_WARNED: set = set()
 
-    A single env var is all a caller needs: ``UNIRL_PROFILE=overlap`` auto-configures
-    the whole compute/comm-overlap preset (one optimizer update, CUDA on, memory/shapes
-    off, rank0, local output dir); ``UNIRL_PROFILE=1``/``step``/``true`` is the whole-step
-    preset; anything falsy/unset is off. Individual ``UNIRL_PROFILE_*`` vars still override.
+
+def profile_mode() -> str:
+    """Resolve the single switch ``UNIRL_PROFILE``. The value names the region recorded:
+
+    * ``one-update`` — profile ONE optimizer update (backward + FSDP comm + optimizer),
+      excluding the big anchor/SDE-replay forward. Small trace; for compute/comm OVERLAP.
+    * ``full-step``  — profile the WHOLE train step (anchor forward + all N updates).
+      Big trace; the complete picture of one training step.
+    * unset / ``0`` / ``false`` / ``off`` — disabled (a no-op).
+
+    Any other value is unrecognized -> disabled (warned once). Individual ``UNIRL_PROFILE_*``
+    knobs (DIR, RANKS, CUDA, WARMUP, ...) still tune the run.
     """
     v = os.environ.get("UNIRL_PROFILE", "").strip().lower()
     if v in ("", "0", "false", "no", "off"):
         return "off"
-    return "overlap" if v == "overlap" else "step"
+    if v in ("one-update", "full-step"):
+        return v
+    if v not in _MODE_WARNED:
+        _MODE_WARNED.add(v)
+        logger.warning("UNIRL_PROFILE=%r not recognized; use 'one-update' or 'full-step'. Profiling disabled.", v)
+    return "off"
 
 
 def profile_enabled() -> bool:
@@ -91,14 +99,11 @@ def profile_enabled() -> bool:
 
 
 def profile_scope() -> str:
-    """``step`` (whole train_track) or ``update`` (one optimizer update, for overlap).
+    """The region being profiled: ``one-update`` or ``full-step`` (or ``off``).
 
-    Explicit ``UNIRL_PROFILE_SCOPE`` wins; otherwise ``overlap`` mode implies ``update``.
+    Identical to the ``UNIRL_PROFILE`` value — the switch *is* the scope, no separate knob.
     """
-    s = os.environ.get("UNIRL_PROFILE_SCOPE", "").strip().lower()
-    if s in ("step", "update"):
-        return s
-    return "update" if profile_mode() == "overlap" else "step"
+    return profile_mode()
 
 
 def _out_dir() -> str:

@@ -317,10 +317,10 @@ class UnifiedModelTrainStack(Remote):
         # the single optimizer step) — the rollout ran in the engine phase before this
         # call, so this region is the pure train step. Only the whole-step scope applies
         # here (the update-scope one-shot is wired in TrainStack._run_updates, which this
-        # unified stack does not use); UNIRL_PROFILE=overlap therefore no-ops here.
+        # unified stack does not use); UNIRL_PROFILE=one-update therefore no-ops here.
         from unirl.utils.profiling import profile_scope
 
-        profiler = self._train_step_profiler() if profile_scope() == "step" else None
+        profiler = self._train_step_profiler() if profile_scope() == "full-step" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             tracks = {"ar": ar_track, "image": image_track}
             # Freeze each track's π_old anchor once, before the multi-update loop.
