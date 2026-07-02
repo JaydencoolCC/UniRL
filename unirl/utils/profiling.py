@@ -127,15 +127,20 @@ class TrainStepProfiler:
         prof.start()
 
     def step(self) -> None:
-        """Advance the schedule by one rollout; auto-stop + export after the window."""
+        """Advance the schedule by one rollout; auto-stop + export after the window.
+        Export is best-effort — a failure is logged, never raised into training."""
         if self._stopped:
             return
-        self._prof.step()
-        self._n += 1
-        if self._n >= self._total:
-            self._prof.stop()
+        try:
+            self._prof.step()  # may trigger on_trace_ready (export) at the active->done edge
+            self._n += 1
+            if self._n >= self._total:
+                self._prof.stop()
+                self._stopped = True
+                logger.info("TrainStepProfiler: %d steps profiled; trace written to %s", self._n, self._out_dir)
+        except Exception:
             self._stopped = True
-            logger.info("TrainStepProfiler: %d steps profiled; trace written to %s", self._n, self._out_dir)
+            logger.warning("TrainStepProfiler: profiling/export failed; training continues", exc_info=True)
 
     @contextmanager
     def record(self, name: str) -> Iterator[None]:
@@ -203,7 +208,7 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
 
 @contextmanager
 def maybe_profile_update(owner, rank: int) -> Iterator[None]:
-    """One-shot profiler around a SINGLE ``_run_update`` (``UNIRL_PROFILE_SCOPE=update``).
+    """One-shot profiler around a SINGLE ``_run_update`` (``UNIRL_PROFILE=one-update``).
 
     torch.profiler records continuously while active, so the schedule-based
     :class:`TrainStepProfiler` (which spans a whole rollout) always sweeps in the big
@@ -247,19 +252,25 @@ def maybe_profile_update(owner, rank: int) -> Iterator[None]:
     try:
         yield
     finally:
-        prof.stop()
+        # Best-effort export: mark done, then log-and-swallow failures (never kill training).
         owner._prof_update_done = True
-        raw = os.path.join(out_dir, f"update_rank{int(rank)}.pt.trace.json")
-        prof.export_chrome_trace(raw)
-        # gzip in place -> opens directly in Perfetto and is small enough to download
-        import gzip
-        import shutil
+        try:
+            prof.stop()
+            raw = os.path.join(out_dir, f"update_rank{int(rank)}.pt.trace.json")
+            prof.export_chrome_trace(raw)
+            # gzip in place -> opens directly in Perfetto and is small enough to download
+            import gzip
+            import shutil
 
-        out = raw + ".gz"
-        with open(raw, "rb") as fin, gzip.open(out, "wb") as fout:
-            shutil.copyfileobj(fin, fout)
-        os.remove(raw)
-        logger.info("maybe_profile_update[rank%d]: trace written to %s", int(rank), out)
+            out = raw + ".gz"
+            with open(raw, "rb") as fin, gzip.open(out, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            os.remove(raw)
+            logger.info("maybe_profile_update[rank%d]: trace written to %s", int(rank), out)
+        except Exception:
+            logger.warning(
+                "maybe_profile_update[rank%d]: trace export failed; training continues", int(rank), exc_info=True
+            )
 
 
 __all__ = [

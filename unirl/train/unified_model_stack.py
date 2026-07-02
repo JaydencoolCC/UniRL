@@ -313,14 +313,18 @@ class UnifiedModelTrainStack(Remote):
         ar_track = ar_track.to_device(device)
         image_track = image_track.to_device(device)
 
-        # Opt-in profiler: wraps ONLY the train compute (both algorithms' backward +
-        # the single optimizer step) — the rollout ran in the engine phase before this
-        # call, so this region is the pure train step. Only the whole-step scope applies
-        # here (the update-scope one-shot is wired in TrainStack._run_updates, which this
-        # unified stack does not use); UNIRL_PROFILE=one-update therefore no-ops here.
+        # Only UNIRL_PROFILE=train applies here (one-update lives in TrainStack._run_updates);
+        # warn if one-update was set so it isn't silently ignored.
         from unirl.utils.profiling import profile_scope
 
-        profiler = self._train_step_profiler() if profile_scope() == "train" else None
+        scope = profile_scope()
+        if scope == "one-update" and not getattr(self, "_warned_one_update", False):
+            self._warned_one_update = True
+            logger.warning(
+                "UNIRL_PROFILE=one-update is not supported on the unified-model stack "
+                "(no _run_updates loop); use UNIRL_PROFILE=train. No trace produced."
+            )
+        profiler = self._train_step_profiler() if scope == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             tracks = {"ar": ar_track, "image": image_track}
             # Freeze each track's π_old anchor once, before the multi-update loop.
