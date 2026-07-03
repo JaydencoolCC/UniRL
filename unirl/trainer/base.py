@@ -100,6 +100,11 @@ class BaseTrainer:
             workers_per_device=int(cfg.get("workers_per_device", 1)),
             transport_kind=cfg.get("transport_kind", "colocate_store"),
             tq_handoff=init_transfer_queue(cfg),
+            # Default 1 keeps every existing trainer's single-threaded-actor
+            # semantics byte-identical; the agentic rollout's rank-0 coordinator
+            # opts in (>=3) so it can run generate + its own drain + serve
+            # next_task pulls concurrently on a threaded Worker (LIN-519/LIN-522).
+            worker_max_concurrency=int(cfg.get("worker_max_concurrency", 1)),
         )
         self.pool.setup()
 

@@ -40,7 +40,7 @@ from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
 from unirl.rollout.engine.agentic.config import AgenticRolloutEngineConfig
 from unirl.rollout.engine.base import BaseRolloutEngine
-from unirl.types.sample import Sample
+from unirl.types.sample import Sample, _part_with_field
 from unirl.types.sampling import total_samples_per_prompt
 
 logger = logging.getLogger(__name__)
@@ -73,9 +73,15 @@ class AgenticRolloutEngine(BaseRolloutEngine):
 
         deps = dict(device=device, rank=rank, model_config=model_config)
         # Each worker builds its OWN local inner engine + environment.
-        self._inner: BaseRolloutEngine = config.inner.make_engine(strategy=strategy, **deps)
         self._env = config.env  # an Environment (built per worker via its _target_); must be re-entrant
         require(self._env is not None, "AgenticRolloutEngine requires an env (config.env)")
+        # Single source of truth for tool schemas (LIN-519): advertise the env's
+        # tools to the model through the inner engine's chat template, so a recipe
+        # never restates the schema JSON (which could silently drift from the env's
+        # actual tools). Mutates the inner CONFIG before it is built; an explicit
+        # ``inner.chat_template_kwargs.tools`` in the recipe still wins.
+        self._maybe_inject_tool_schemas(config.inner, self._env)
+        self._inner: BaseRolloutEngine = config.inner.make_engine(strategy=strategy, **deps)
 
         self._sp = config.episode_sampling  # per-turn sampling params; carries n via samples_per_prompt
         self._n = total_samples_per_prompt(self._sp)  # GRPO group size
@@ -99,6 +105,19 @@ class AgenticRolloutEngine(BaseRolloutEngine):
     def _run_coro(self, coro: Any) -> Any:
         # Drive on the inner engine's loop under the inner's lock (shared quiesce).
         return self._inner._run_coro(coro)
+
+    @staticmethod
+    def _maybe_inject_tool_schemas(inner_cfg: Any, env: Any) -> None:
+        """Copy the env's tool JSON-schemas into the inner engine's chat-template
+        kwargs so the model is told about the tools without the recipe restating
+        them. No-op when the env exposes no ``tool_schemas`` or the inner config
+        has no ``chat_template_kwargs``; an explicit ``tools`` entry is preserved."""
+        get_schemas = getattr(env, "tool_schemas", None)
+        if not callable(get_schemas) or not hasattr(inner_cfg, "chat_template_kwargs"):
+            return
+        ctk = dict(inner_cfg.chat_template_kwargs or {})
+        ctk.setdefault("tools", get_schemas())
+        inner_cfg.chat_template_kwargs = ctk
 
     # ------------------------------------------------------------------
     # Coordinator (rank 0) — the NCCLWeightSync pattern
@@ -191,19 +210,42 @@ class AgenticRolloutEngine(BaseRolloutEngine):
     async def _run_one(self, task: Sample) -> Sample:
         """One trajectory's agent loop. Failure-isolated: never raises into the drain."""
         sample = task
+        env_reward: Optional[float] = None
         try:
             sample = self._env.reset(task)  # [input(1)], root id = prompt id
             for _ in range(self._max_turns):
                 sample = await self._inner.agenerate(sample.fork(1, sampling_params=self._sp))  # +[gen(1)]
-                observation, done, _info = await self._env.astep(sample)  # async tool boundary (§7)
+                observation, done, info = await self._env.astep(sample)  # async tool boundary (§7)
+                # Env-sourced reward (LIN-519): interactive envs (ALFWorld, …) return a
+                # per-trajectory return in ``info["reward"]`` (last value = the episode
+                # return); tool-only envs (calculator/search) omit it — a no-op here.
+                if isinstance(info, dict) and info.get("reward") is not None:
+                    env_reward = float(info["reward"])
                 if done:
                     break
                 if observation is not None:
                     sample = sample.observe(observation)  # +[obs(1)]
-            return sample
+            return self._attach_env_reward(sample, env_reward)
         except Exception as exc:  # noqa: BLE001 — isolate: one bad trajectory must not sink the drain
             logger.warning("AgenticRolloutEngine: trajectory failed, returning partial: %s", exc, exc_info=True)
+            return self._attach_env_reward(sample, env_reward)
+
+    @staticmethod
+    def _attach_env_reward(sample: Sample, reward: Optional[float]) -> Sample:
+        """Attach an env-sourced trajectory return to the LAST generated Part so the
+        trainer (:class:`~unirl.trainer.agentic_env.AgenticEnvTrainer`) can read it
+        directly — env tasks bypass ``RewardService``. No-op when the env supplied no
+        reward, so tool-only envs (calculator/search) are byte-identical."""
+        if reward is None:
             return sample
+        gens = sample.gen_parts()
+        if not gens:
+            return sample
+        last = gens[-1]
+        rewarded = _part_with_field(
+            last, "rewards", torch.full((int(last.batch_size),), float(reward), dtype=torch.float32)
+        )
+        return sample.with_parts([rewarded if p is last else p for p in sample.parts])
 
     async def _pull(self, coordinator: Any, role_name: str) -> Optional[Sample]:
         """Pull the next task from the coordinator. Bridges the Ray RPC onto the
