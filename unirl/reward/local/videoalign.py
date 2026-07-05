@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
 from unirl.reward.base import BaseRewardComponentSpec
@@ -85,7 +84,9 @@ def _build_prompt(prompt: str, dimension, template_type: str) -> str:
         dim_desc = _DIMENSION_DESCRIPTIONS[dimension][1]
     if template_type == "none":
         return prompt
-    return _SIMPLE_PROMPT.format(dimension_name=dim_name, dimension_description=dim_desc).replace("{text_prompt}", prompt)
+    return _SIMPLE_PROMPT.format(dimension_name=dim_name, dimension_description=dim_desc).replace(
+        "{text_prompt}", prompt
+    )
 
 
 # ============================================================================
@@ -110,9 +111,7 @@ def _smart_resize(
 ) -> Tuple[int, int]:
     """Resize dimensions to the nearest factor while respecting pixel constraints."""
     if max(height, width) / min(height, width) > 200:
-        raise ValueError(
-            f"aspect ratio too extreme {height}x{width}"
-        )
+        raise ValueError(f"aspect ratio too extreme {height}x{width}")
     h_bar = max(factor, round(height / factor) * factor)
     w_bar = max(factor, round(width / factor) * factor)
     if h_bar * w_bar > max_pixels:
@@ -223,7 +222,9 @@ def _build_vl_inputs(
 
     # Handle processor return from qwen_vl_utils.process_vision_info
     if video_inputs is not None:
-        video_grid_thw, second_per_grid_ts = zip(*(processor.video_processor.preprocess(video_inputs, return_tensors="pt")))
+        video_grid_thw, second_per_grid_ts = zip(
+            *(processor.video_processor.preprocess(video_inputs, return_tensors="pt"))
+        )
         video_grid_thw = torch.cat(video_grid_thw, dim=0)
         second_per_grid_ts = list(second_per_grid_ts)
     else:
@@ -418,7 +419,7 @@ def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, d
     if any("model.language_model" in k for k in flat_model_keys):
         keys_to_remap = [k for k in flat_filtered_keys if k.startswith("model.layers.")]
         for old_key in keys_to_remap:
-            new_key = "model.language_model." + old_key[len("model."):]
+            new_key = "model.language_model." + old_key[len("model.") :]
             if new_key in flat_model_keys:
                 filtered_state[new_key] = filtered_state.pop(old_key)
 
