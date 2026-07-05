@@ -481,7 +481,6 @@ class _VideoAlignInference:
 
         data_cfg = cfg["data_config"]
         model_cfg = cfg["model_config"]
-        peft_cfg = cfg["peft_lora_config"]
         self._inference_cfg = cfg.get("inference_config")
 
         # Data config
