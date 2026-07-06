@@ -247,9 +247,22 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         sp.return_frames = False
         sp.return_trajectory_latents = True
         sp.return_trajectory_decoded = False
-        # σ SSOT: hand FastVideo the trainer-pinned schedule verbatim (drop the
-        # terminal 0 — FastVideo's scheduler appends its own endpoint).
-        sp.sigmas = [float(x) for x in sigmas.detach().cpu().tolist()[:-1]]
+        # σ SSOT — AVOID the double-shift bug. ``req.sigmas`` is ALREADY the
+        # shift-applied flow-match schedule (σ = shift·t/(1+(shift-1)·t)), but
+        # FastVideo's FlowMatchEulerDiscreteScheduler.set_timesteps re-applies
+        # the SAME shift to whatever sigmas we hand it (no guard). Feeding
+        # req.sigmas directly makes FastVideo denoise on a *doubly*-shifted grid
+        # while the trainer replays on the single-shift grid — the trajectory's
+        # true noise level then mismatches the σ used to score its log-prob,
+        # corrupting the GRPO gradient. So hand FastVideo the shift PRE-IMAGE g,
+        # for which FastVideo's own shift reproduces req.sigmas exactly:
+        #     g = s / (shift - s·(shift-1))   ⇒   shift·g/(1+(shift-1)·g) == s
+        # (valid because FastVideo's WAN flow_shift == model_config.shift). Drop
+        # the terminal 0 — FastVideo appends its own endpoint.
+        _f = float(self.model_config.shift)
+        _s = sigmas.detach().cpu().double()
+        _g = _s / (_f - _s * (_f - 1.0))
+        sp.sigmas = [float(x) for x in _g.tolist()[:-1]]
 
         all_log_probs: List[torch.Tensor] = []
         all_traj: List[torch.Tensor] = []
