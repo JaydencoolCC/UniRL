@@ -333,11 +333,15 @@ class UnifiedModelTrainStack(Remote):
 
             # N optimizer steps over disjoint mini-batches (each track sliced by the same
             # shared _optimizer_step_slices; M=1 keeps ar/image 1:1 and equally sized).
-            steps_by_track = {name: self._optimizer_step_slices(int(tracks[name].batch_size)) for name in self.algorithms}
+            steps_by_track = {
+                name: self._optimizer_step_slices(int(tracks[name].batch_size)) for name in self.algorithms
+            }
             per_update: List[Dict[str, TrainStepResult]] = []
             for u in range(self.num_updates_per_batch):
                 slices_by_track = {name: steps_by_track[name][u] for name in self.algorithms}
-                per_update.append(self._train_one_step(tracks, slices_by_track, training_progress=float(training_progress)))
+                per_update.append(
+                    self._train_one_step(tracks, slices_by_track, training_progress=float(training_progress))
+                )
         if profiler is not None:
             profiler.step()
 
