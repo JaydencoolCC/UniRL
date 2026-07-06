@@ -1,0 +1,226 @@
+# @package _global_
+# HunyuanImage-3.0-Instruct (80B MoE) image-EDIT (it2i) GRPO — trainside + remote EditReward.
+#
+# Text + source image -> edited image on the DiT track ONLY: the shared HI3 backbone
+# runs mode="gen_image" with the source image scattered into the fused sequence
+# (VAE latents + SigLIP2 ViT semantics), FlowGRPO trains a LoRA on the decoder's
+# attention, and the edit is scored remotely by EditReward. This is the BAGEL
+# editreward recipe (diffusion/bagel/bagel_editreward.yaml) transplanted onto the
+# HI3 multi-mode package + its 80B meta-init/materialize path:
+#   - bundle: from_meta_config — NO per-rank full load (~160GB would OOM);
+#       FSDPBackend wraps the meta decoder, then bundle.materialize() DCP-loads
+#       each rank's shard. backend.with_aux [vae, vit] additionally materializes
+#       the frozen 3D-VAE + SigLIP2 ViT in-process — trainside it2i needs both
+#       (source-image encode + output decode) with no separate rollout engine.
+#   - stage_config.task pins it2i: a dataset row missing its source image FAILS
+#       LOUDLY (modes/it2i.generate raises) instead of degrading to t2i.
+#   - rollout -> TrainsideRolloutEngine: the FSDP-wrapped train model IS the
+#       sampler; no weight sync. forward_batch_size=1 — HI3 it2i sequences differ
+#       in length per source-image aspect preset, so one sample per generate call.
+#   - reward -> RemoteRewardBackend (HTTP to an EditReward service on its own GPU
+#       OFF the training pool; it builds the [source, edited] pair from the
+#       request's input image — no HI3 code on the reward side).
+#   - sampling: guidance_scale=1 single-forward is REQUIRED for training — CFG
+#       doubles the fused batch axis, which breaks per-sample micro-batch slicing
+#       of the stored conditions (and doubles memory). Exploration comes from the
+#       SDE window (eta=1) like the validated BAGEL run. 1024x1024 is an HI3
+#       preset (the image processor snaps everything to ~1MP presets).
+#
+# Sized for 16 GPUs = 2x8 (H20-class). Per-rank sample counts must be EQUAL
+# (batch_size * samples_per_prompt divisible by num_devices, likewise the eval
+# chunk) — trainside FSDP forwards are collectives, an uneven split deadlocks.
+#
+# Deploy (keep EditReward OFF the training GPUs):
+#   reward node:  cd unirl-reward-service && ray start --head --num-gpus=1 \
+#                 && python -m reward_service --config configs/editreward_service.yaml
+#   train nodes:  export REWARD_SERVICE_URL=http://<reward_node_ip>:8080
+#                 export PRETRAINED_MODEL=/path/to/HunyuanImage-3.0-Instruct
+#                 # optional: EDIT_DATA_PATH / EDIT_EVAL_DATA_PATH
+#                 LAUNCH=ssh bash examples/run_experiment_multinode_taiji.sh \
+#                     diffusion/hunyuan_image3/hi3_it2i_editreward
+#
+# Compose check (CPU):  python -m unirl.train_diffusion \
+#   --config-name diffusion/hunyuan_image3/hi3_it2i_editreward --cfg job --resolve
+# Smoke first (16 GPUs, 1 sample/rank, ~2 rollouts):
+#   ... hi3_it2i_editreward batch_size=4 sampling.samples_per_prompt=4 \
+#       num_rollouts=2 eval_interval=0
+
+num_devices: 16
+batch_size: 8                  # prompts/rollout; x samples_per_prompt=8 -> 64 images
+                               # = 4/rank on 16 GPUs. Keep divisible by num_devices.
+adv_use_global_std: false      # per-group GRPO normalization
+num_rollouts: 10000            # intentionally large; stop manually
+
+# Periodic eval (deterministic: eval_eta=0), logged under eval/*. Chunked so one
+# generate holds at most eval_chunk_prompts x eval_samples_per_prompt samples
+# (16 = 1/rank). eval_cfg_text_scale maps onto guidance_scale for HI3's standard
+# DiffusionSamplingParams; 1 keeps eval single-forward (CFG-batched eval at 2.5
+# is upstream-faithful but doubles the fused sequence memory).
+eval_interval: 25
+eval_num_prompts: 16
+eval_samples_per_prompt: 4
+eval_chunk_prompts: 4
+eval_cfg_text_scale: 1
+eval_eta: 0.0
+
+transport_kind: colocate_store
+workers_per_device: 1
+
+# Pin the it2i edit task (see header). bot_task stays the modes/it2i default.
+stage_config:
+  task: it2i
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,hi3-editreward}
+  run_name: hi3_it2i_editreward_lora
+  # entity: set via the WANDB_ENTITY env var (wandb picks it up automatically)
+  tags: [hi3, it2i, edit, editreward, lora, trainside, fp32master]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 5
+
+bundle:
+  # 80B path: meta-init (no per-rank full load) -> FSDPBackend wraps the meta
+  # decoder and calls bundle.materialize(), which loads each rank's shard via
+  # DCP (~10GB/card on 16 ranks). ``from_config`` (the .to(device) path) would
+  # try to put the full ~160GB model on one GPU -> OOM.
+  _target_: unirl.models.hunyuan_image3.bundle.HunyuanImage3Bundle.from_meta_config
+  config:
+    _target_: unirl.models.hunyuan_image3.config.HunyuanImage3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,tencent/HunyuanImage-3.0-Instruct}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp32   # keep diffuse<->replay bit-exact (ratio=1); do NOT lower
+    logprob_precision: fp32
+    shift: 3.0
+    guidance_scale: 1.0
+
+pipeline:
+  # Assemble from the SHARED bundle (auto-injected by the trainer) so replay and
+  # the trainside sampler read the FSDP-trained weights. from_config /
+  # from_meta_config would build a SECOND, unshared bundle — wrong here.
+  _target_: unirl.models.hunyuan_image3.pipeline.HunyuanImage3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["HunyuanImage3DecoderLayer"]
+  trainable_attr: transformer    # resolve_trainable_module prefers bundle.trainable_module()
+                                 # -> the bare decoder (transformer.model); frozen VAE/ViT
+                                 # stay OUTSIDE the wrap.
+  # Trainside it2i runs the whole pipeline in-process: materialize the frozen
+  # 3D-VAE (cond-image encode + output decode) and SigLIP2 ViT (source-image
+  # semantics) alongside the decoder. Off-process-rollout recipes omit this.
+  with_aux: [vae, vit]
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16                  # COMPUTE dtype (FSDP all-gather + forward/backward)
+    master_dtype: fp32                 # load-bearing: fp32 LoRA master + Adam (reward-collapse fix)
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true     # 80B + multi-step replay: required
+    use_torch_compile: false
+    root_wrap: false                   # LoRA params all live inside decoder blocks; the
+                                       # decoder root (wte/norm) stays frozen outside groups
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:                    # decoder attention only (fused qkv + o); MoE experts,
+      - qkv_proj                       # router, shared expert, embeddings stay frozen —
+      - o_proj                         # same surface as the hi3_vllmomni recipe.
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1                # variable-length it2i sequences; one sample per generate
+
+# Remote EditReward (own GPU/node). RemoteRewardBackend builds the [source, edited]
+# pair from the request's input image -> model-agnostic, no HI3 code on the reward side.
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.remote.RemoteRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.RemoteRewardSpec
+      base_url: ${oc.env:REWARD_SERVICE_URL,http://localhost:8080}
+      required_rewards: [editreward]
+      reward_weights:
+        editreward: 1.0
+      batch_size: 8
+      timeout: 300.0
+      sub_metric_reduce: mean
+      aggregation_method: weighted_sum
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion                # DiT track ONLY — the AR path is never exercised
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay              # recompute pi_old via replay -> ratio!=1 on update 2 = real gradient signal
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.hunyuan_image3.conditions.HunyuanImage3DiffusionConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2             # 2 optimizer updates/rollout (disjoint mini-batches)
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      # Editing instruction + SOURCE image (role: condition -> the request's input image).
+      data_path: ${oc.env:EDIT_DATA_PATH,datasets/image_edit/train.jsonl}
+      eval_data_path: ${oc.env:EDIT_EVAL_DATA_PATH,datasets/image_edit/test.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# HI3 it2i sampling (standard DiffusionSamplingParams — HI3 has no negative-prompt
+# text; CFG would derive from guidance_scale > 1.0, which training keeps OFF).
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 16
+  guidance_scale: 1.0                  # 1 = No-CFG single forward. REQUIRED for training
+                                       # (CFG doubles the fused batch -> breaks micro-batch
+                                       # slicing of stored conditions) — eval may raise it.
+  eta: 1.0                             # SDE noise scale (per-step stochasticity = GRPO exploration)
+  samples_per_prompt: 8                # GRPO group size
+  height: 1024                         # HI3 preset (~1MP); non-presets get snapped anyway
+  width: 1024
+  seed: 42
+  init_same_noise: true                # siblings share x_T (driver-authored NoiseRecipe ids,
+                                       # stable across the DP split); in-group diversity comes
+                                       # from the SDE noise (eta>0)
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.WindowScheduler
+    num_timesteps: 8                   # SDE window drawn from the first half of the 16 steps
+    config:
+      _target_: unirl.utils.scheduler_utils.WindowConfig
+      strategy: random
+      window_size: 3                   # a random contiguous 3-step SDE window per rollout

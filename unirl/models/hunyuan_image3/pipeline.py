@@ -22,7 +22,7 @@ the pipeline's concern — the engine adapter pins ``req.sigmas`` via
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional, Tuple
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import CPSSDEStrategy, StepStrategy
@@ -98,6 +98,22 @@ class HunyuanImage3Pipeline(Pipeline):
         self.ar = ar
         self.vit_encode = vit_encode
         self.shift = shift
+
+    @classmethod
+    def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, int, int]:
+        """Per-sample x_T shape ``(C, H/16, W/16)`` for the driver NoiseRecipe.
+
+        Returning a concrete shape (rather than raising) opts HI3 into the
+        driver-authored x_T recipe: the trainer authors per-sample
+        ``init_noise_group_ids`` and the it2i mode hands them to
+        ``HunyuanImage3DiffusionStage.diffuse`` via ``params.noise_group_ids``.
+        The stage sizes x_T from its OWN image-processor-snapped token grid and
+        consumes only the recipe's ids + seed, so this shape never reaches the
+        latent math — it only needs to be a valid geometry. Constants mirror
+        the stage defaults (``latent_channels=32``, ``vae_scale_factor=16``).
+        """
+        H, W = int(sampling_spec.height), int(sampling_spec.width)
+        return (32, H // 16, W // 16)
 
     @classmethod
     def from_config(

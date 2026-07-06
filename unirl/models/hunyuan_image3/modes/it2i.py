@@ -18,6 +18,7 @@ those slots via the ``HunyuanStaticCache``.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 from unirl.config.require import require
@@ -57,6 +58,16 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     )
 
     params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
+    # Driver-authored x_T: adopt the request's per-sample noise-recipe ids so
+    # ``diffuse`` regenerates the byte-stable initial latent via ``NoiseRecipe``
+    # (the same ``for_batch(...).resolve(...)`` path the vLLM HI3 worker takes;
+    # the stage sizes x_T from its own snapped grid, so only the ids matter).
+    # The ids are CONCAT-sliced with the request, which is what keeps
+    # ``init_same_noise=True`` group-sharing correct when a GRPO group is split
+    # across DP shards. Absent ids (DISABLE_DRIVER_XT) keep the stage's RNG
+    # fallback.
+    if req.init_noise_group_ids:
+        params = dataclasses.replace(params, noise_group_ids=[str(g) for g in req.init_noise_group_ids])
     if req.sigmas is None:
         raise ValueError(
             "HunyuanImage3 it2i: req.sigmas is None. Engine adapter must call "
