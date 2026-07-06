@@ -39,7 +39,6 @@ class CheckpointWeightSync(FullWeightSync):
         rollout: Any,
         sync_dir: str = "/tmp/unirl_fastvideo_weight_sync",
         wait_timeout_s: float = 1200.0,
-        bucket_size_mb: int = 512,
         flush_cache: bool = True,
         lora_merged: bool = False,
         adapter_name: Optional[str] = None,
@@ -47,9 +46,11 @@ class CheckpointWeightSync(FullWeightSync):
         track_prefix: str = "",
         wire_dtype: Any = None,
     ) -> None:
+        # NOTE: no ``bucket_size_mb`` — the base's size-bounded bucketing
+        # (``_iter_buckets``) is for streaming transports; this handler writes the
+        # whole state_dict in one ``torch.save``, so bucketing never runs.
         super().__init__(
             backend=backend,
-            bucket_size_mb=bucket_size_mb,
             flush_cache=flush_cache,
             lora_merged=lora_merged,
             adapter_name=adapter_name,
