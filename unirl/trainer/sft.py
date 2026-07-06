@@ -25,6 +25,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement
+from unirl.distributed.tensor.ref import hydrate
 from unirl.trainer.base import BaseTrainer
 from unirl.utils.hydra import remote_hydra
 
@@ -86,6 +87,7 @@ class SFTTrainer(BaseTrainer):
             outputs = next((o for o in outputs if o is not None), None)
         if outputs is None:
             return
+        outputs = hydrate(outputs)  # materialize worker-side TensorRef proxies
         out_dir = os.path.join(save_dir or ".", "samples")
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"step_{step}.pt")
