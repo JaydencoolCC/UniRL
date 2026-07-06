@@ -80,6 +80,11 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self._is_offloaded = False
         self._generator: Any = None
         self._fastvideo_args: Any = None
+        # Last checkpoint pushed by the weight sync. ``VideoGenerator`` loads the
+        # PRETRAINED weights from ``model_path`` on every (re)build, so a sleep/wake
+        # would silently roll back to pretrained; we re-apply this on wake. None
+        # until the first ``update_weights_from_path``.
+        self._last_weights_path: Optional[str] = None
 
         if ports is None:
             ports = FastVideoPorts.reserve()
@@ -456,6 +461,15 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
 
         self._generator = VideoGenerator.from_fastvideo_args(self._fastvideo_args)
         self._is_offloaded = False
+        # ``from_fastvideo_args`` reloads the PRETRAINED transformer from
+        # ``model_path``; without this the engine would sample under pretrained
+        # weights on every wake that isn't immediately followed by a weight sync
+        # (i.e. any ``weight_sync_interval > 1`` step). Re-apply the last synced
+        # checkpoint so wake is weight-preserving, matching the other engines'
+        # sleep/wake contract (sglang resume_memory keeps weights resident).
+        if self._last_weights_path is not None:
+            self._generator.update_transformer_weights_from_path(self._last_weights_path)
+            logger.info("fastvideo wake_up: re-applied synced weights from %s", self._last_weights_path)
 
     @property
     def is_offloaded(self) -> bool:
@@ -479,6 +493,8 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         require(bool(checkpoint_path), "update_weights_from_path requires a non-empty path")
         require(self._generator is not None, "fastvideo engine is offloaded/not initialized")
         self._generator.update_transformer_weights_from_path(checkpoint_path)
+        # Remember it so ``wake_up`` can re-apply after a rebuild (see wake_up).
+        self._last_weights_path = checkpoint_path
         logger.info("fastvideo transformer weights updated from %s", checkpoint_path)
 
 
