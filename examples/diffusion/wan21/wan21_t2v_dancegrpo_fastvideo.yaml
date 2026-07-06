@@ -117,7 +117,8 @@ rollout:
     tp_size: 1
     sp_size: 1
     local_mode: true
-    forward_batch_size: 4           # 720p caps activation (mirrors trainside fbs=4)
+    forward_batch_size: 4           # CPU-output concat cadence (NOT a GPU batch: the
+                                    # forward runs one video at a time regardless)
     fastvideo_path: ${oc.env:FASTVIDEO_PATH,null}
   model_config: ${model_config}
   strategy: ${strategy}

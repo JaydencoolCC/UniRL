@@ -157,6 +157,12 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         # σ SSOT: pin once on the full batch (shared field, survives req.slice).
         ensure_req_sigmas(req, self.schedule_policy)
 
+        # ``forward_batch_size`` here is a CHUNKING cadence, NOT a GPU batch size:
+        # ``_drive_fastvideo`` runs FastVideo one video at a time (per-sample seeds
+        # preclude a batched forward), so peak GPU activation is fixed at one video
+        # regardless of ``fbs``. What ``fbs`` bounds is how many per-sample outputs
+        # (trajectory/decoded tensors, already on CPU) accumulate before a concat +
+        # ``empty_cache``. Leave it None to run the whole shard in one go.
         fbs = self.cfg.forward_batch_size
         bs = int(req.batch_size)
         if fbs is None or bs <= fbs:
@@ -329,6 +335,14 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                 lp = rl.log_probs if rl is not None else None
                 require(torch.is_tensor(lp), "FastVideo native rollout returned no log_probs")
                 all_log_probs.append(lp.detach().cpu())
+
+            # Per-video: outputs are already copied to CPU above, so drop this
+            # video's GPU tensors before the next iteration. This — not
+            # ``forward_batch_size`` — is what actually bounds peak GPU memory,
+            # since the forward runs one video at a time.
+            del out, rl, traj, samples, dec
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         return {
             "trajectory": torch.cat(all_traj, dim=0),

@@ -66,7 +66,11 @@ class FastVideoEngineConfig(BaseEngineConfig):
     local_mode: bool = True
     disable_autocast: bool = False
 
-    # --- Forward chunking (None = whole batch in one VideoGenerator call) ---
+    # --- Output concat cadence (None = collect the whole shard, concat once).
+    #     NOT a GPU batch size: _drive_fastvideo runs FastVideo one video at a
+    #     time (per-sample seeds preclude batching), so peak GPU activation is one
+    #     video regardless. This only bounds how many CPU-side outputs accumulate
+    #     before a concat + empty_cache. ---
     forward_batch_size: Optional[int] = None
 
     # --- Weight sync target submodule(s) on the FastVideo transformer ---
