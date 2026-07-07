@@ -74,6 +74,15 @@ elif [ -n "${VENV_DIR:-}" ] && [ -f "${VENV_DIR}/bin/activate" ]; then
     source "${VENV_DIR}/bin/activate"
 fi
 
+# IB (RDMA) memory registration needs locked pages, but taiji exec/ssh shells
+# default to a 64KB RLIMIT_MEMLOCK — NCCL's first cross-node collective then
+# dies with "ibv_reg_mr failed: Invalid argument" (host-staged transfers, e.g.
+# the meta-init DCP broadcast, register pinned host buffers). The pod runs as
+# root, so raise it for this shell; the ray daemons and every worker they spawn
+# inherit it. Must run BEFORE the RAY_JOIN_ONLY early-exit below so joined
+# workers get it too.
+ulimit -l unlimited 2>/dev/null || true
+
 # --- ssh fan-out worker join (LAUNCH=ssh) -----------------------------------
 # In LAUNCH=ssh the head ssh-invokes THIS script with RAY_JOIN_ONLY=1 on each
 # worker. The Python env is already activated above; here we just join Ray with
