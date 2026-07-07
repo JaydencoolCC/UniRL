@@ -7,6 +7,7 @@ Uses the vendored configs, model, prompts, and vision_process modules.
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -139,8 +140,12 @@ class EditRewardInferencer:
                 is_train=False,
             )
         )
+        # The vendored config yamls ship ``output_dir:`` empty (None) — it is a
+        # training-run artifact dir that inference never writes to, but the path
+        # join below still needs a string. Default to the system tmp dir.
         training_args.output_dir = os.path.join(
-            training_args.output_dir, config_path.split("/")[-1].split(".")[0]
+            training_args.output_dir or tempfile.gettempdir(),
+            config_path.split("/")[-1].split(".")[0],
         )
 
         model, processor, _ = _create_model_and_processor(
