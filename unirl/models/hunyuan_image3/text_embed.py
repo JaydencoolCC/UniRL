@@ -107,6 +107,12 @@ class HunyuanImage3TextEmbedStage:
         # object. Newer (Instruct) snapshots expose the wrapper as
         # ``_tokenizer``; older ones auto-populate ``_tkwrapper``.
         if getattr(transformer, "_tkwrapper", None) is None and getattr(transformer, "_tokenizer", None) is None:
+            # Instruct snapshots read ``config.model_version`` inside
+            # ``load_tokenizer``, but neither their config.json nor the config
+            # class defines it (the tokenizer just absorbs it via **kwargs).
+            # Default it so the attribute lookup can't raise.
+            if getattr(config, "model_version", None) is None:
+                config.model_version = None
             transformer.load_tokenizer(self.bundle.pretrained_path)
         tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
         # transformers 5.x loads HunyuanImage3TokenizerFast's Rust backend
