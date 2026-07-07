@@ -200,8 +200,11 @@ class Qwen2_5_VLRewardModelBT_MultiHead(Qwen2_5_VLForConditionalGeneration):
         hidden_states = outputs[0]
         batch_size = input_ids.shape[0]
 
-        with torch.autocast(device_type="cuda", dtype=torch.float32):
-            logits = head_module(hidden_states)
+        # torch.autocast(device_type="cuda", dtype=torch.float32) is invalid
+        # (CUDA autocast supports fp16/bf16 only) — torch silently disables it,
+        # so the fp32 rm_head got bf16 hidden states and addmm raised a dtype
+        # mismatch. Cast the input up to the head's own dtype explicitly.
+        logits = head_module(hidden_states.to(next(head_module.parameters()).dtype))
 
         return self._pool_logits(logits, input_ids, batch_size)
 
@@ -257,8 +260,9 @@ class Qwen2_5_VLRewardModelBT_MultiHead(Qwen2_5_VLForConditionalGeneration):
             hidden_states = outputs[0]
             batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
 
-            with torch.autocast(device_type="cuda", dtype=torch.float32):
-                logits = self.rm_head(hidden_states)
+            # Same invalid-fp32-CUDA-autocast fix as
+            # _run_single_batch_through_model_and_head above.
+            logits = self.rm_head(hidden_states.to(next(self.rm_head.parameters()).dtype))
 
             pooled = self._pool_logits(logits, input_ids, batch_size)
             return {"logits": pooled}

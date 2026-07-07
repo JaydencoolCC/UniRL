@@ -10,7 +10,10 @@
 server:
   host: 0.0.0.0
   port: 8080
-  score_timeout_s: 300.0
+  # Single replica serializes concurrent posts from many DP ranks; the tail
+  # request queues for minutes at GRPO-scale rollouts (e.g. 16 ranks x 4
+  # samples). Match the trainer-side RemoteRewardSpec.timeout.
+  score_timeout_s: 1200.0
 
 rewards:
   - name: editreward

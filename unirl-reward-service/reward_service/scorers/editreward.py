@@ -13,12 +13,15 @@ The text prompt (editing instruction) is taken from history[0][0].
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
 
 from reward_service.scorers.base import BaseScorer, ScoreItem
 from reward_service.scorers.registry import register
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -70,6 +73,10 @@ class EditRewardScorer(BaseScorer):
             try:
                 result = self._score_single(item)
             except Exception:
+                # nan propagates to the caller as an explicit per-sample
+                # failure; log the cause — a silent nan is undebuggable from
+                # the training side.
+                logger.warning("EditReward scoring failed for prompt %r", getattr(item, "prompt", None), exc_info=True)
                 result = {k: float("nan") for k in self.sub_metric_names}
             results.append(result)
 
