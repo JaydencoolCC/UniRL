@@ -169,7 +169,9 @@ reward:
       reward_weights:
         editreward: 1.0
       batch_size: 8
-      timeout: 300.0
+      timeout: 1200.0                # single-replica service serializes 16 ranks'
+                                     # concurrent posts; the tail request queues
+                                     # for minutes at 64 samples/rollout
       sub_metric_reduce: mean
       aggregation_method: weighted_sum
 

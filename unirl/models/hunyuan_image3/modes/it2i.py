@@ -21,6 +21,8 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
+import torch
+
 from unirl.config.require import require
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.primitives import Images, Texts
@@ -98,6 +100,25 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
             "spatial_shapes": vit_kwargs["spatial_shapes"] * cfg_factor,
             "attention_mask": vit_kwargs["attention_mask"] * cfg_factor,
         }
+
+    # The image_processor emits CPU tensors and ``_encode_cond_image`` defers
+    # the ViT/VAE scatter to the first gen_image forward — move every cond
+    # tensor to the bundle device now, or that forward feeds CPU inputs into
+    # CUDA Linears. (The upstream device_map="auto" path relied on HF hooks
+    # for this; the trainside FSDP build has none.)
+    _dev = pipeline.bundle.device
+
+    def _to_dev(x):
+        if torch.is_tensor(x):
+            return x.to(_dev)
+        if isinstance(x, list):
+            return [_to_dev(t) for t in x]
+        return x
+
+    cond_vae_images = _to_dev(cond_vae_images)
+    cond_timestep = _to_dev(cond_timestep)
+    cond_vit_images = _to_dev(cond_vit_images)
+    vit_kwargs = {k: _to_dev(v) for k, v in vit_kwargs.items()}
 
     # 4. Build the unified-MM tensors with cond-image markers spliced in.
     bot_task = str(req.stage_config.get("bot_task", "image"))

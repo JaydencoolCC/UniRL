@@ -184,37 +184,77 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         # The original replay passed EMPTY rope_image_info, so build_2d_rope gives
         # image tokens plain 1-D sequential positions — wrong for a 2-D model and
         # the confirmed cause of the ~40% vllm-vs-HF noise_pred divergence (image
-        # ratio 0.95 → 0.996 once fixed). We reconstruct per sample:
-        #   - slice: the contiguous image-token run from gen_image_mask.
-        #   - (token_h, token_w): the patchified token grid. Patchify uses uniform
-        #     square patches, so the token grid preserves the LATENT aspect ratio:
-        #     token_h/token_w == H_lat/W_lat and token_h*token_w == n. Solving:
+        # ratio 0.95 → 0.996 once fixed). We reconstruct per sample and per image
+        # REGION — an it2i sequence carries cond VAE + cond ViT + gen regions, and
+        # upstream's build_batch_rope_image_info (cond_token_attn_type=joint_full)
+        # emits an entry for EVERY one of them; a gen-only list breaks
+        # build_2d_rope's position bookkeeping (its trailing arange gets
+        # lower>upper) besides dropping cond tokens to 1-D positions:
+        #   - cond VAE run(s) from fused.cond_vae_image_mask; each cond image's
+        #     token grid is its latent (h, w) — one token per latent position.
+        #   - cond ViT run(s) from fused.cond_vit_image_mask; grids come from
+        #     conditions.cond_vit.spatial_shapes (the SigLIP2 patch grid).
+        #   - the gen run from fused.gen_image_mask; patchify uses uniform square
+        #     patches, so the token grid preserves the LATENT aspect ratio:
         #       token_w = round(sqrt(n * W_lat / H_lat)), token_h = n // token_w.
-        #     This is general (handles non-square aspect ratios) and self-contained
-        #     — no need to plumb (h,w) from the rollout capture. Square images
-        #     degenerate to token_h==token_w==isqrt(n). ``sample`` is
-        #     [n, C, H_lat, W_lat]; H_lat/W_lat are uniform across the batch.
-        # Then the transformer builds its native 128-dim 2-D rope (no tensor
-        # injection → no head-dim mismatch).
+        #     ``sample`` is [n, C, H_lat, W_lat]; H_lat/W_lat are batch-uniform.
+        # Entries are sorted by slice start (upstream iterates them in order).
+        # Malformed regions (run/grid count mismatch, h*w != n) are skipped —
+        # those tokens fall back to 1-D positions instead of crashing the forward.
+        # t2i has no cond masks, so it degenerates to the original gen-only entry.
         _B = int(fused.input_ids.shape[0])
         rope_image_info_val: List[List[Any]] = [[] for _ in range(_B)]
-        if fused.gen_image_mask is not None:
-            _h_lat = int(sample.shape[-2])
-            _w_lat = int(sample.shape[-1])
-            _gm = fused.gen_image_mask
-            for _b in range(_B):
-                _idx = _gm[_b].nonzero(as_tuple=False).flatten()
-                if _idx.numel() == 0:
-                    continue
-                _start = int(_idx[0].item())
-                _n = int(_idx.numel())
-                _contig = (int(_idx[-1].item()) - _start + 1) == _n
-                if not _contig or _w_lat <= 0 or _h_lat <= 0:
-                    continue
-                _tw = int(round((_n * _w_lat / _h_lat) ** 0.5))
-                _th = _n // _tw if _tw > 0 else 0
-                if _tw > 0 and _th * _tw == _n:
-                    rope_image_info_val[_b] = [(slice(_start, _start + _n), (_th, _tw))]
+
+        def _mask_runs(row: torch.Tensor) -> List[Tuple[int, int]]:
+            idx = row.nonzero(as_tuple=False).flatten().tolist()
+            runs: List[Tuple[int, int]] = []
+            if idx:
+                s = p = idx[0]
+                for v in idx[1:]:
+                    if v == p + 1:
+                        p = v
+                        continue
+                    runs.append((s, p - s + 1))
+                    s = p = v
+                runs.append((s, p - s + 1))
+            return runs
+
+        for _b in range(_B):
+            _entries: List[Tuple[int, int, Tuple[int, int]]] = []
+            # cond VAE region(s): grid = latent (h, w) per cond image.
+            if fused.cond_vae_image_mask is not None and conditions.cond_vae is not None:
+                lat = conditions.cond_vae.latents[_b] if conditions.cond_vae.latents is not None else None
+                if lat is not None and torch.is_tensor(lat):
+                    lat4 = lat.unsqueeze(0) if lat.dim() == 3 else lat
+                    grids = [(int(t.shape[-2]), int(t.shape[-1])) for t in lat4]
+                    runs = _mask_runs(fused.cond_vae_image_mask[_b])
+                    if len(runs) == len(grids):
+                        for (s, n), (gh, gw) in zip(runs, grids):
+                            if gh * gw == n:
+                                _entries.append((s, n, (gh, gw)))
+            # cond ViT region(s): grid = SigLIP2 patch grid per cond image.
+            if fused.cond_vit_image_mask is not None and conditions.cond_vit is not None:
+                ss = conditions.cond_vit.spatial_shapes[_b] if conditions.cond_vit.spatial_shapes is not None else None
+                if ss is not None and torch.is_tensor(ss):
+                    grids = [(int(h), int(w)) for h, w in ss.reshape(-1, 2).tolist()]
+                    runs = _mask_runs(fused.cond_vit_image_mask[_b])
+                    if len(runs) == len(grids):
+                        for (s, n), (gh, gw) in zip(runs, grids):
+                            if gh * gw == n:
+                                _entries.append((s, n, (gh, gw)))
+            # gen region: aspect-solved from the latent shape.
+            if fused.gen_image_mask is not None:
+                _h_lat = int(sample.shape[-2])
+                _w_lat = int(sample.shape[-1])
+                runs = _mask_runs(fused.gen_image_mask[_b])
+                if len(runs) == 1 and _w_lat > 0 and _h_lat > 0:
+                    s, n = runs[0]
+                    _tw = int(round((n * _w_lat / _h_lat) ** 0.5))
+                    _th = n // _tw if _tw > 0 else 0
+                    if _tw > 0 and _th * _tw == n:
+                        _entries.append((s, n, (_th, _tw)))
+            _entries.sort(key=lambda e: e[0])
+            rope_image_info_val[_b] = [(slice(s, s + n), g) for s, n, g in _entries]
         # Forward-scatter index for the timestep continuous embedding: on is_first
         # the model scatters into the full sequence; on decode steps it scatters
         # into the [timestep, image] slice where the timestep is the first token
@@ -264,7 +304,28 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         # is_first it uses image_mask instead (None is correct there).
         transformer.num_special_tokens = None if is_first else (int(input_ids_in.shape[1]) - n_img)
 
-        output = transformer(**model_inputs, first_step=is_first)
+        try:
+            output = transformer(**model_inputs, first_step=is_first)
+        except RuntimeError:
+            # Surface the 2-D rope layout on failure — build_2d_rope errors
+            # ("upper bound and lower bound inconsistent") are otherwise opaque.
+            _shape = tuple(input_ids_in.shape) if input_ids_in is not None else None
+            _sums = {
+                name: (int(m[0].sum().item()) if m is not None else None)
+                for name, m in (
+                    ("gen", fused.gen_image_mask),
+                    ("cond_vae", fused.cond_vae_image_mask),
+                    ("cond_vit", fused.cond_vit_image_mask),
+                )
+            }
+            logger.error(
+                "HI3 predict_noise forward failed: input_ids=%s mask_sums=%s training=%s rope_image_info[0]=%s",
+                _shape,
+                _sums,
+                getattr(getattr(transformer, "model", transformer), "training", None),
+                rope_image_info_val[0] if rope_image_info_val else None,
+            )
+            raise
 
         # Restore _check_inputs
         if _orig_check is not None:
@@ -684,32 +745,47 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         # meaningless.
         state = HunyuanImage3DiffusionState()
 
-        for i in range(T):
-            sigma = schedule[i].to(device)
-            sigma_next = schedule[i + 1].to(device)
-            step_eta = float(params.eta) if i in sde_set else 0.0
+        # The upstream forward sizes its 2-D rope cache off ``self.training``
+        # of the WRAPPER (``HunyuanImage3ForCausalMM``): train mode uses the
+        # input length, which is wrong on KV-cached decode steps — inputs are
+        # gathered down to the [timestep + gen image] slice while position_ids
+        # keep full-sequence values, so ``build_2d_rope`` dies with a reversed
+        # arange. The hosting engine eval-scopes only ``trainable_module()``
+        # (the bare decoder); eval the wrapper for the sampling loop and
+        # restore after (``train(mode)`` is recursive, and the engine restores
+        # the decoder's own mode after generate anyway).
+        transformer = self.model.transformer
+        _prev_wrapper_mode = transformer.training
+        transformer.eval()
+        try:
+            for i in range(T):
+                sigma = schedule[i].to(device)
+                sigma_next = schedule[i + 1].to(device)
+                step_eta = float(params.eta) if i in sde_set else 0.0
 
-            with torch.no_grad(), autocast_ctx:
-                new_latents, log_prob, _ = self.step.step_with_logp(
-                    self.model,
-                    conditions,
-                    strategy=self.strategy,
-                    sample=latents,
-                    sigma=sigma,
-                    sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
-                    eta=step_eta,
-                    sigma_max=sigma_max,
-                    step_index=i,
-                    state=state,
-                )
-            latents = new_latents.to(dtype=self.trajectory_dtype)
+                with torch.no_grad(), autocast_ctx:
+                    new_latents, log_prob, _ = self.step.step_with_logp(
+                        self.model,
+                        conditions,
+                        strategy=self.strategy,
+                        sample=latents,
+                        sigma=sigma,
+                        sigma_next=sigma_next,
+                        guidance_scale=float(params.guidance_scale),
+                        eta=step_eta,
+                        sigma_max=sigma_max,
+                        step_index=i,
+                        state=state,
+                    )
+                latents = new_latents.to(dtype=self.trajectory_dtype)
 
-            if (i + 1) in needed:
-                stored_pairs.append((i + 1, latents.detach().clone()))
+                if (i + 1) in needed:
+                    stored_pairs.append((i + 1, latents.detach().clone()))
 
-            if log_prob is not None:
-                sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
+                if log_prob is not None:
+                    sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
+        finally:
+            transformer.train(_prev_wrapper_mode)
 
         positions_collected = [p for p, _ in stored_pairs]
         # latents_stacked: [B, K, C, H, W]

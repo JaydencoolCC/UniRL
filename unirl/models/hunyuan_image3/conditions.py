@@ -152,9 +152,18 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
 
         max_L = max(seq_lens)
 
+        # On the ragged path every padded field must be a REAL tensor: under
+        # worker-local transports (colocate_store) the values arriving here are
+        # TensorRefs, which expose ``.shape`` but cannot be F.pad'ed — and a
+        # per-field mix of refs (max-L items) and padded tensors would break the
+        # base concat's type dispatch. Hydrate-and-pad everything L-shaped;
+        # fields that are never padded stay refs.
+        from unirl.distributed.tensor import hydrate
+
         def _pad_seq(t, dim=-1, value=0):
             if t is None:
                 return None
+            t = hydrate(t)
             cur = t.shape[dim]
             if cur >= max_L:
                 return t
@@ -169,6 +178,7 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
         def _pad_attn(mask):
             if mask is None:
                 return None
+            mask = hydrate(mask)
             if mask.shape[-1] >= max_L:
                 return mask
             N, H, L, _ = mask.shape
@@ -178,33 +188,30 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
 
         padded_items = []
         for item in items:
-            if item.input_ids is not None and item.input_ids.shape[-1] < max_L:
-                rope = item.rope_cache
-                if rope is not None and isinstance(rope, tuple) and len(rope) == 2:
-                    rope = (
-                        _pad_seq(rope[0], dim=-2, value=0.0),
-                        _pad_seq(rope[1], dim=-2, value=0.0),
-                    )
-                padded_items.append(
-                    cls(
-                        input_ids=_pad_seq(item.input_ids, dim=-1, value=0),
-                        attention_mask=_pad_attn(item.attention_mask),
-                        position_ids=_pad_seq(item.position_ids, dim=-1, value=0),
-                        rope_cache=rope,
-                        gen_image_mask=_pad_seq(item.gen_image_mask, dim=-1, value=False),
-                        gen_timestep_scatter_index=item.gen_timestep_scatter_index,
-                        cond_vae_image_mask=_pad_seq(item.cond_vae_image_mask, dim=-1, value=False)
-                        if item.cond_vae_image_mask is not None
-                        else None,
-                        cond_vit_image_mask=_pad_seq(item.cond_vit_image_mask, dim=-1, value=False)
-                        if item.cond_vit_image_mask is not None
-                        else None,
-                        cond_timestep_scatter_index=item.cond_timestep_scatter_index,
-                        prompt_lengths=item.prompt_lengths,  # [B] — not L-padded
-                    )
+            rope = item.rope_cache
+            if rope is not None and isinstance(rope, tuple) and len(rope) == 2:
+                rope = (
+                    _pad_seq(rope[0], dim=-2, value=0.0),
+                    _pad_seq(rope[1], dim=-2, value=0.0),
                 )
-            else:
-                padded_items.append(item)
+            padded_items.append(
+                cls(
+                    input_ids=_pad_seq(item.input_ids, dim=-1, value=0),
+                    attention_mask=_pad_attn(item.attention_mask),
+                    position_ids=_pad_seq(item.position_ids, dim=-1, value=0),
+                    rope_cache=rope,
+                    gen_image_mask=_pad_seq(item.gen_image_mask, dim=-1, value=False),
+                    gen_timestep_scatter_index=item.gen_timestep_scatter_index,
+                    cond_vae_image_mask=_pad_seq(item.cond_vae_image_mask, dim=-1, value=False)
+                    if item.cond_vae_image_mask is not None
+                    else None,
+                    cond_vit_image_mask=_pad_seq(item.cond_vit_image_mask, dim=-1, value=False)
+                    if item.cond_vit_image_mask is not None
+                    else None,
+                    cond_timestep_scatter_index=item.cond_timestep_scatter_index,
+                    prompt_lengths=item.prompt_lengths,  # [B] — not L-padded
+                )
+            )
 
         from unirl.distributed.tensor.batch import Batch
 

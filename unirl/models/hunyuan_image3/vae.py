@@ -64,7 +64,27 @@ class HunyuanImage3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
         def _decode(lat: torch.Tensor) -> torch.Tensor:
             latents_f32 = lat.to(dtype=torch.float32) / scaling_factor  # [B, C, H, W]
             latents_f32 = latents_f32.unsqueeze(2)  # [B, C, 1, H, W]
-            decoded = self.bundle.vae.to(torch.float32).decode(latents_f32).sample
+            vae = self.bundle.vae.to(torch.float32)
+            if hasattr(vae, "decoder"):
+                # Upstream ``AutoencoderKL3D.decode`` carries a multi-rank
+                # inference gate: with torch.distributed initialized, every
+                # rank != 0 returns ``self.empty_cache`` (a bare tensor)
+                # instead of decoding. Trainside DP has EVERY rank decode its
+                # own samples, so mirror the decode internals (tiling
+                # dispatch + the single-frame squeeze) without the gate.
+                z = latents_f32
+                if getattr(vae, "use_temporal_tiling", False) and z.shape[-3] > vae.tile_latent_min_tsize:
+                    decoded = vae.temporal_tiled_decode(z)
+                elif getattr(vae, "use_spatial_tiling", False) and (
+                    z.shape[-1] > vae.tile_latent_min_size or z.shape[-2] > vae.tile_latent_min_size
+                ):
+                    decoded = vae.spatial_tiled_decode(z)
+                else:
+                    decoded = vae.decoder(z)
+                if z.shape[-3] == 1:
+                    decoded = decoded[:, :, -1:]
+            else:
+                decoded = vae.decode(latents_f32).sample
             # decoded: [B, 3, T_out, H_out, W_out]; T_out is 1 for still images.
             if decoded.dim() == 5:
                 decoded = decoded.squeeze(2)  # [B, 3, H_out, W_out]
