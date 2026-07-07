@@ -36,7 +36,11 @@ model_config:
   _target_: unirl.models.wan21.config.WAN21PipelineConfig
   pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
   model_precision: bf16
-  shift: 5.0
+  shift: 3.0   # MUST match the model's native scheduler flow_shift (Wan2.1-1.3B=3.0);
+               # FastVideo generates at the model's flow_shift, so a mismatched shift
+               # here desyncs the σ schedule between rollout (FastVideo) and train
+               # (replay) -> importance ratio != 1. Verified: 5.0 gave native ratio
+               # 0.94; 3.0 gives ratio 1.0000.
   max_sequence_length: 512
   # LoRA is configured via backend.lora_cfg only (faithful to the official
   # wan21_t2v_dancegrpo recipe — bundle.config sets no use_lora). The
@@ -52,7 +56,11 @@ bundle:
 
 pipeline:
   _target_: unirl.models.wan21.pipeline.WAN21Pipeline
-  shift: 5.0
+  shift: 3.0   # MUST match the model's native scheduler flow_shift (Wan2.1-1.3B=3.0);
+               # FastVideo generates at the model's flow_shift, so a mismatched shift
+               # here desyncs the σ schedule between rollout (FastVideo) and train
+               # (replay) -> importance ratio != 1. Verified: 5.0 gave native ratio
+               # 0.94; 3.0 gives ratio 1.0000.
   autocast_precision: bf16
   trajectory_precision: fp16
   logprob_precision: fp32
