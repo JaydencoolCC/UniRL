@@ -234,15 +234,18 @@ class DiffusionTrainer(BaseTrainer):
         if reward_cfg is not None:
             self.reward = remote_hydra(reward_cfg)
         # DiffusionNFT resolves its frozen reference adapter off ``backend.ema`` (the
-        # FSDPBackend owns the dual-adapter EMA), so it needs the backend sibling
-        # injected alongside ``pipeline``. GRPO takes neither and would reject the
-        # extra kwarg, so gate on the algorithm's declared ``requires_ema_rollout``
-        # (off-policy algorithms set it True). The same flag drives the eval-EMA
-        # swap around ``generate`` in ``train_step``: on-policy algorithms MUST
-        # sample with the trainable weights so the first-step importance ratio is 1.
+        # FSDPBackend owns the dual-adapter EMA), and FlowGRPO / FlowDPPO reach the
+        # trainable model directly (LoRA disabled = the ``beta`` KL reference policy),
+        # so both need the backend sibling injected alongside ``pipeline``. GRPO takes
+        # neither and would reject the extra kwarg, so gate on the algorithms' declared
+        # flags (``requires_ema_rollout`` / ``requires_backend``).
+        # ``requires_ema_rollout`` additionally drives the eval-EMA swap around
+        # ``generate`` in ``train_step``: on-policy algorithms MUST sample with the
+        # trainable weights so the first-step importance ratio is 1.
         algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
-        algo_extra = {"backend": self.backend} if self._uses_ema else {}
+        needs_backend = self._uses_ema or getattr(algo_cls, "requires_backend", False)
+        algo_extra = {"backend": self.backend} if needs_backend else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
@@ -460,6 +463,10 @@ class DiffusionTrainer(BaseTrainer):
             # Hydrate in place so the wandb reward/advantage stats reuse this
             # fetch instead of re-pulling the TensorRef from the worker.
             track.rewards = hydrate(track.rewards)
+            # component_rewards values are also TensorRef after DP_SCATTER;
+            # hydrate them so wandb_metrics can read real tensors.
+            if isinstance(track.component_rewards, dict):
+                track.component_rewards = {k: hydrate(v) for k, v in track.component_rewards.items()}
             mean_reward = float(track.rewards.to(torch.float32).mean().item())
             break  # single-track for now; revisit if multi-track lands
 
@@ -485,13 +492,20 @@ class DiffusionTrainer(BaseTrainer):
         the KV/decoded on the driver.
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict
-        # (mirrors the AR trainer's evaluate()).
-        eval_diffusion = dataclasses.replace(
-            self.sampling_params.get("diffusion"),
+        # (mirrors the AR trainer's evaluate()). ``cfg_text_scale`` only exists
+        # on Bagel's sampling params; for the standard DiffusionSamplingParams
+        # (Qwen-Image, SD3, ...) the CFG strength lives in ``guidance_scale``,
+        # so fall back to that when the field is absent.
+        base_diffusion = self.sampling_params.get("diffusion")
+        replace_kwargs = dict(
             samples_per_prompt=self.eval_samples_per_prompt,
-            cfg_text_scale=self.eval_cfg_text_scale,
             eta=self.eval_eta,
         )
+        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
+            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
+        else:
+            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
+        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
         all_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
         n_prompts = len(all_inputs.sample_ids)
