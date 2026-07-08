@@ -229,6 +229,17 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         except Exception as exc:  # noqa: BLE001 — isolate: one bad trajectory must not sink the drain
             logger.warning("AgenticRolloutEngine: trajectory failed, returning partial: %s", exc, exc_info=True)
             return self._attach_env_reward(sample, env_reward)
+        finally:
+            # Guaranteed teardown (LIN-533): end any open tool sessions / episodes for this
+            # trajectory — on success, crash, AND cancellation/abort. Duck-typed like
+            # ``tool_schemas`` so envs without ``aclose`` are unaffected, and wrapped so a teardown
+            # error can never re-raise into the drain's ``fut.result()`` (``_run_one`` must not raise).
+            aclose = getattr(self._env, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose(sample)
+                except Exception:  # noqa: BLE001 — teardown must not sink the drain
+                    logger.warning("AgenticRolloutEngine: env.aclose failed during teardown", exc_info=True)
 
     @staticmethod
     def _attach_env_reward(sample: Sample, reward: Optional[float]) -> Sample:

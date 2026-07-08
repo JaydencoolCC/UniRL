@@ -11,7 +11,7 @@ from unirl.rollout.loop.agent_loop import AgentLoop
 from unirl.rollout.loop.engine_port import RolloutEnginePort
 from unirl.rollout.loop.environment import Environment
 from unirl.rollout.loop.tool_environment import ToolEnvironment, parse_tool_call
-from unirl.rollout.loop.tools import CalculatorTool, Tool
+from unirl.rollout.loop.tools import CalculatorTool, StatefulTool, Tool
 
 __all__ = [
     "AgentLoop",
@@ -20,5 +20,6 @@ __all__ = [
     "ToolEnvironment",
     "parse_tool_call",
     "Tool",
+    "StatefulTool",
     "CalculatorTool",
 ]

@@ -9,6 +9,8 @@ trajectories (even siblings with the SAME sample id) get isolated episodes.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 pytest.importorskip("torch")
@@ -120,3 +122,20 @@ def test_same_sample_id_siblings_isolated(monkeypatch):
     assert e1 not in env._episodes and e2 in env._episodes
     obs_b, done_b, _ = env.step(_turn(s2, "Action: look"))
     assert not done_b and obs_b is not None
+
+
+def test_aclose_reclaims_episode_and_template(monkeypatch):
+    """Leak regression (LIN-533): a trajectory that dies IN THE ENGINE never reaches ``step``'s
+    done-path, so its episode stays in ``_episodes`` and its pooled template stays checked out.
+    The engine's ``finally`` hook (``aclose``) reclaims both — idempotently."""
+    env = _env(monkeypatch)
+    template = object()  # a sentinel pooled template to prove it returns to _free
+    monkeypatch.setattr(env, "_open_episode", lambda gi: (_FakeTW("win"), template))
+    s = env.reset(_request("r0:g0", 0))
+    assert len(env._episodes) == 1 and env._free == []  # leased, not yet released
+
+    asyncio.run(env.aclose(s))
+    assert env._episodes == {} and env._free == [template]  # episode popped, template pooled
+
+    asyncio.run(env.aclose(s))  # idempotent: no double-release, no error
+    assert env._episodes == {} and env._free == [template]

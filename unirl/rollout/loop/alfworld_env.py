@@ -308,6 +308,27 @@ class AlfworldEnv:
         observation = Texts(texts=[self._format(obs, infos, first=False)])
         return observation, False, {"reward": ep.reward}
 
+    async def aclose(self, sample: Sample) -> None:
+        """Guaranteed teardown (LIN-533): reclaim this trajectory's episode + pooled template.
+
+        ``step`` already pops + releases on clean ``done`` (and pops-without-reusing on a game
+        error), so this only does work for a trajectory that died **in the engine** between turns —
+        closing the leak that would otherwise grow ``self._episodes`` and starve the ``_free``
+        template pool. Idempotent (a no-op once the episode is gone, so no double-release); runs the
+        release in the executor, off the shared loop, same as :meth:`astep`.
+        """
+        eid = self._episode_id(sample)
+        if eid is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._teardown_episode, eid)
+
+    def _teardown_episode(self, eid: str) -> None:
+        with self._lock:
+            ep = self._episodes.pop(eid, None)
+        if ep is not None:
+            self._release_template(ep.template)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

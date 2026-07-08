@@ -35,5 +35,15 @@ class Environment(Protocol):
         """
         ...
 
+    async def aclose(self, sample: Sample) -> None:
+        """Optional guaranteed teardown (LIN-533), called from the engine's ``finally`` on every
+        path — success, crash, and abort. The engine invokes it via ``getattr(env, "aclose", None)``,
+        so an env holding no per-trajectory resource need not implement it (default: no-op). Stateful
+        envs use it to release handles exactly once — tool sessions
+        (:meth:`~unirl.rollout.loop.tool_environment.ToolEnvironment.aclose`) or ALFWorld episodes/
+        pooled templates. Must be idempotent and **must not raise**.
+        """
+        ...
+
 
 __all__ = ["Environment"]

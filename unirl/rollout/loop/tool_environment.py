@@ -17,12 +17,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from uuid import uuid4
 
-from unirl.rollout.loop.tools.tool import Tool
+from unirl.rollout.loop.tools.tool import StatefulTool, Tool
 from unirl.types.primitives import Texts
-from unirl.types.sample import Primitive, Sample
+from unirl.types.sample import Primitive, Sample, _part_with_field
+
+logger = logging.getLogger(__name__)
 
 # ``<tool_call>{...}</tool_call>`` — the Hermes/Qwen convention (matches relax/slime/areal).
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
@@ -117,6 +121,11 @@ class ToolEnvironment:
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool name: {tool.name!r}")
             self._tools[tool.name] = tool
+        # Tools that hold per-trajectory session state (LIN-533); the stateless path skips all
+        # session plumbing whenever this list is empty (zero regression for calculator/search).
+        self._stateful_tools: List[StatefulTool] = [
+            t for t in self._tools.values() if isinstance(t, StatefulTool)
+        ]
         self.max_turns = max_turns
 
     def tool_schemas(self) -> List[Dict[str, Any]]:
@@ -124,13 +133,33 @@ class ToolEnvironment:
         return [tool.json_schema() for tool in self._tools.values()]
 
     def reset(self, request: Sample) -> Sample:
-        """Per-episode setup: the request is returned unchanged.
+        """Per-episode setup.
 
-        Stateless / re-entrant (LIN-522): the turn count is derived from the sample
-        in :meth:`step` (``len(sample.gen_parts())``), not held on the instance, so
-        one env instance can serve many concurrent trajectories on a worker.
+        Stateless tools: the request is returned **unchanged** (re-entrant, LIN-522 — the turn
+        count is derived from the sample in :meth:`step`, not held on the instance, so one env
+        instance serves many concurrent trajectories on a worker).
+
+        Stateful tools (LIN-533): mint a per-trajectory ``session_id`` (``uuid4``) for each
+        :class:`~unirl.rollout.loop.tools.tool.StatefulTool`, call ``session_start`` (cheap — the
+        handle opens lazily in :meth:`step`), and stamp the ids into the root Part's *control* bag
+        under ``"tool_sessions"`` so :meth:`step`/:meth:`aclose` recover them position-independently
+        across the fork/observe chain. ``uuid4`` avoids collisions between the ``n`` GRPO siblings
+        that share a root ``sample_id``.
         """
-        return request
+        if not self._stateful_tools:
+            return request
+        root = request.parts[0]
+        context = (root.metadata or [None])[0] or {}
+        sessions: Dict[str, str] = {}
+        for tool in self._stateful_tools:
+            sid = uuid4().hex
+            tool.session_start(sid, context)
+            sessions[tool.name] = sid
+        control = dict(root.control or {})
+        control["tool_sessions"] = sessions
+        # ``_part_with_field`` swaps only ``control`` — preserving the encoded prompt
+        # (``primitive``/``segment``/``metadata``), unlike a ``Part.input`` rebuild.
+        return Sample.request(_part_with_field(root, "control", control))
 
     def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
         """Consume the frontier action; return ``(observation, done, info)``.
@@ -151,8 +180,9 @@ class ToolEnvironment:
             )
         texts = frontier.texts
 
+        sessions = (sample.parts[0].control or {}).get("tool_sessions", {})
         calls = [parse_tool_call(t) for t in texts]
-        results: List[Optional[str]] = [self._run(c) if c is not None else None for c in calls]
+        results: List[Optional[str]] = [self._run(c, sessions) if c is not None else None for c in calls]
         per_sample_done = [c is None for c in calls]
         any_call = any(c is not None for c in calls)
 
@@ -181,15 +211,52 @@ class ToolEnvironment:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.step, sample)
 
-    def _run(self, call: Dict[str, Any]) -> str:
-        """Dispatch one parsed call to its tool; surface any failure to the model as text."""
-        tool = self._tools.get(call["name"])
+    def _run(self, call: Dict[str, Any], sessions: Dict[str, str]) -> str:
+        """Dispatch one parsed call to its tool; surface any failure to the model as text.
+
+        Stateful tools (LIN-533) go through ``execute_session`` with the ``session_id`` recovered
+        from the root control bag; stateless tools keep the pure ``execute`` path.
+        """
+        name = call["name"]
+        tool = self._tools.get(name)
         if tool is None:
-            return f"Error: unknown tool {call['name']!r}. Available tools: {sorted(self._tools)}."
+            return f"Error: unknown tool {name!r}. Available tools: {sorted(self._tools)}."
+        args = call.get("arguments") or {}
         try:
-            return tool.execute(call.get("arguments") or {})
+            if isinstance(tool, StatefulTool):
+                sid = sessions.get(name)
+                if sid is None:
+                    return f"Error: no active session for stateful tool {name!r}."
+                return tool.execute_session(sid, args)
+            return tool.execute(args)
         except Exception as exc:  # noqa: BLE001 — tool errors are fed back to the model, not raised
             return f"Error: {exc}"
+
+    async def aclose(self, sample: Sample) -> None:
+        """Guaranteed teardown (LIN-533): end every open tool session for this trajectory.
+
+        The engine calls this from ``_run_one``'s ``finally`` on every path — success, crash, and
+        abort. Runs the (possibly blocking) ``session_end`` calls in the loop's executor, same as
+        :meth:`astep`, and swallows per-session errors so teardown can never destabilize the drain
+        loop (``_run_one`` must not raise). A no-op for stateless tools / sessionless trajectories.
+        """
+        if not self._stateful_tools:
+            return
+        sessions = (sample.parts[0].control or {}).get("tool_sessions", {}) if sample.parts else {}
+        if not sessions:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._end_sessions, sessions)
+
+    def _end_sessions(self, sessions: Dict[str, str]) -> None:
+        """Run ``session_end`` for each open session; swallow + log failures (idempotent)."""
+        for name, sid in sessions.items():
+            tool = self._tools.get(name)
+            if isinstance(tool, StatefulTool):
+                try:
+                    tool.session_end(sid)
+                except Exception:  # noqa: BLE001 — teardown must not raise into the drain loop
+                    logger.warning("session_end failed for tool %r session %s", name, sid, exc_info=True)
 
 
 __all__ = ["ToolEnvironment", "parse_tool_call"]

@@ -34,4 +34,53 @@ class Tool(ABC):
         ...
 
 
-__all__ = ["Tool"]
+class StatefulTool(Tool):
+    """A :class:`Tool` that holds **per-trajectory state** behind a session handle (LIN-533).
+
+    Where :class:`Tool` is a pure function (args in, text out, holds nothing), a ``StatefulTool``
+    carries state across turns — a code-interpreter namespace, an editing canvas, a connection.
+    :class:`~unirl.rollout.loop.tool_environment.ToolEnvironment` dispatches on
+    ``isinstance(tool, StatefulTool)`` (one protocol, no code fork), so the stateless ``Tool`` path
+    is byte-for-byte unchanged.
+
+    Lifecycle per trajectory, keyed by a ``session_id`` minted at ``reset`` and carried in the root
+    Sample's *control* bag:
+
+    - ``session_start(session_id, context)`` — once, on the loop thread. Cheap and infallible:
+      record the session and stash ``context``. Do **no** blocking I/O here (spawning a subprocess
+      or opening a connection would stall the shared worker loop) — open the handle lazily in
+      ``execute_session``, which runs off-loop in an executor.
+    - ``execute_session(session_id, arguments)`` — per turn. Operates on the (lazily opened)
+      per-session handle; runs in the executor via
+      :meth:`~unirl.rollout.loop.tool_environment.ToolEnvironment.astep`.
+    - ``session_end(session_id)`` — once, guaranteed: the engine's ``finally`` hook calls it even on
+      a crashed/aborted trajectory (via ``ToolEnvironment.aclose``). Must be **idempotent**, a no-op
+      on an unknown/never-opened id, and **must not raise**.
+
+    Implementations own a handle store keyed by ``session_id`` and guarded by a lock (``reset`` runs
+    on the loop thread; ``execute_session``/``session_end`` on executor threads) — never keep
+    per-trajectory state unkeyed on ``self``, since one instance serves many concurrent trajectories.
+    """
+
+    def session_start(self, session_id: str, context: Dict[str, Any]) -> None:
+        """Open a session. Default no-op — a light tool may allocate lazily in ``execute_session``."""
+
+    @abstractmethod
+    def execute_session(self, session_id: str, arguments: Dict[str, Any]) -> str:
+        """Run the tool for ``session_id`` on parsed ``arguments``; return the result as text.
+
+        May raise on bad input — :class:`~unirl.rollout.loop.tool_environment.ToolEnvironment`
+        catches and surfaces the error to the model as the observation.
+        """
+        ...
+
+    def session_end(self, session_id: str) -> None:
+        """Tear down a session. Default no-op. Idempotent, no-op on unknown ids, never raises."""
+
+    def execute(self, arguments: Dict[str, Any]) -> str:  # pragma: no cover - guard
+        """Stateless entrypoint — a programming error for a session-scoped tool; use
+        :meth:`execute_session`. ``ToolEnvironment`` never routes here for a ``StatefulTool``."""
+        raise NotImplementedError("StatefulTool is session-scoped; call execute_session(session_id, ...)")
+
+
+__all__ = ["Tool", "StatefulTool"]
