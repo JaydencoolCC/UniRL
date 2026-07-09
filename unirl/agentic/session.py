@@ -95,10 +95,39 @@ class Session:
     nodes: List[MsgNode] = field(default_factory=list)
     status: Literal["running", "completed", "aborted"] = "running"
     weight_version: int = 0
+    # Prompt-group identity, used by the fully-async resident pool (v5) to harvest
+    # carry-over sessions by group (GRPO groups by ``group_id``, not ``sample_id``,
+    # so a carried-over session may be re-assigned a new sample_id at harvest as
+    # long as its group matches the output window). ``None`` for the half-async
+    # path, which binds one session to one pre-expanded request sample.
+    group_id: Optional[str] = None
 
     def append(self, node: MsgNode) -> "Session":
         self.nodes.append(node)
         return self
+
+    # ---- version / staleness (fully-async resident pool) ---------------------
+
+    def trainable_versions(self) -> List[int]:
+        """Policy versions of this session's trainable (think + gen) nodes."""
+        return [int(n.weight_version) for n in self.nodes if n.kind in ("think", "gen")]
+
+    def version_spread(self, current_version: Optional[int] = None) -> int:
+        """``max - min`` policy version over trainable nodes (folding in
+        ``current_version`` when given, to bound a still-running session)."""
+        vs = self.trainable_versions()
+        if current_version is not None:
+            vs = vs + [int(current_version)]
+        return (max(vs) - min(vs)) if vs else 0
+
+    def think_versions(self) -> List[List[int]]:
+        """Per-turn think token versions (one list per think node, broadcast to
+        the node's token count) — packs alongside ``TextSegment.token_versions``."""
+        out: List[List[int]] = []
+        for n in self.think_turns():
+            ntok = int(n.tokens.numel()) if n.tokens is not None else 0
+            out.append([int(n.weight_version)] * ntok)
+        return out
 
     # ---- structural views --------------------------------------------------
 

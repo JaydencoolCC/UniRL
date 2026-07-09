@@ -62,6 +62,12 @@ class LatentSegment(Segment):
     sigmas: Optional[torch.Tensor] = shared_field(default=None)
     indices: Optional[torch.Tensor] = shared_field(default=None)
     sde_logp: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    # Per-SDE-step policy version (shape ``[N_segs, S]``, same layout as
+    # ``sde_logp``): the weight version each stored SDE transition was sampled
+    # under. Metadata only for the agentic fully-async resident pool's staleness /
+    # audit; FlowGRPO's ratio anchor stays ``sde_logp``. CONCAT so it stacks with
+    # the latents along the batch axis. ``None`` for every non-agentic path.
+    sde_versions: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     sde_means: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     sde_indices: Optional[torch.Tensor] = shared_field(default=None)
     log_probs: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)

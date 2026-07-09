@@ -37,6 +37,12 @@ class TextSegment(Segment):
     tokens: Optional[torch.Tensor] = packed_field(default=None)
     log_probs: Optional[torch.Tensor] = packed_field(default=None)
     loss_mask: Optional[torch.Tensor] = packed_field(default=None)
+    # Per-token policy version (the weight version each token was sampled under).
+    # Pure metadata for staleness / audit in the agentic fully-async resident pool;
+    # NOT consumed by GRPO (the PPO ratio anchor stays ``log_probs``). Packed
+    # alongside ``tokens`` so it transports through pack/concat/select/DP_SCATTER
+    # with the same cu_seqlens. ``None`` for every non-agentic rollout path.
+    token_versions: Optional[torch.Tensor] = packed_field(default=None)
 
     def as_condition_with(self, encoder: Callable[..., Any]) -> Condition:
         """Re-embed packed tokens via the supplied encoder into a TextEmbedCondition.

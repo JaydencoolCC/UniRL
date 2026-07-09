@@ -21,7 +21,9 @@ from unirl.agentic.config import (
     AgenticWorkflowConfig,
 )
 from unirl.agentic.env import AgenticEnv, Observation, RuleEnv
+from unirl.agentic.pool import FullyAsyncPool
 from unirl.agentic.session import MsgNode, NodeKind, Session
+from unirl.agentic.version import should_admit, staleness_capacity, version_spread
 from unirl.agentic.workflow import AgenticBackend, AgenticWorkflow, ThinkGenWorkflow
 
 __all__ = [
@@ -39,4 +41,8 @@ __all__ = [
     "Session",
     "THINK_TRACK",
     "ThinkGenWorkflow",
+    "FullyAsyncPool",
+    "should_admit",
+    "staleness_capacity",
+    "version_spread",
 ]

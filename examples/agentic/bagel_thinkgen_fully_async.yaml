@@ -1,0 +1,240 @@
+# @package _global_
+# BAGEL-7B-MoT FULLY-ASYNC AGENTIC RL (v5 fully-async resident pool) — multi-turn
+# think→gen→obs, trainside colocate. Builds on the half-async recipe
+# (bagel_thinkgen_rulenv.yaml); the only changes are the resident-pool rollout
+# engine + the version/staleness knobs + the fully-async trainer entry.
+#
+# v5 layer over half-async:
+#   * BagelAgenticEngineFullyAsync — a resident FullyAsyncPool that carries
+#     sessions over across generate() calls and stamps per-token / per-SDE-step
+#     POLICY VERSION metadata into the standard segments (behavior-logprob anchor
+#     unchanged → GRPO/FlowGRPO math untouched).
+#   * FullyAsyncAgenticTrainer — bumps the policy version after each optimizer step
+#     (the shared live model changed) and logs version/pool staleness metrics.
+#
+# turns_per_window controls carry-over aggression: == max_turns (default here)
+# completes each group in-window (on-policy, robust E2E); 1 maximizes carry-over
+# (a T-turn session spans T versions — the disaggregated/off-policy regime, bounded
+# by max_staleness).
+#
+# Divisibility (DP_SCATTER): the pool harvests WHOLE groups per shard, so keep
+# batch_size (prompt groups) divisible by num_devices, and
+# batch_size*sessions_per_prompt*max_turns divisible by num_devices.
+# Smoke: B=4, N=2, T=2, D=4 → 1 group/worker, 16 think+image rows.
+#
+# Launch (single node, 4xH20):
+#   DATA_PATH=/abs/train.txt BAGEL_PATH=/abs/BAGEL-7B-MoT \
+#   python -m unirl.train_agentic_fully_async --config-name agentic/bagel_thinkgen_fully_async num_devices=4
+
+num_devices: 4
+batch_size: 4                  # P prompt GROUPS trained per rollout (÷ num_devices)
+sessions_per_prompt: 2         # N sessions per prompt (GRPO group size)
+max_turns: 2                   # T fixed think→gen→obs turns per session
+max_staleness: 1               # max trainable version spread before abort (0 = on-policy)
+turns_per_window: 2            # == max_turns → in-window completion (robust); 1 → max carry-over
+over_sample_ratio: 1.0
+reward_std_eps: 1.0e-6
+buffer_max_staleness: 1        # buffered groups may cross 1 weight-sync
+
+num_rollouts: 2000
+adv_normalization_scope: group
+normalize_adv_by_std: true
+
+save_interval: 50
+save_dir: ${oc.env:CKPT_DIR,tmp/ckpt_bagel_agentic_fully_async}
+save_mode: auto
+
+transport_kind: colocate_store
+workers_per_device: 1
+
+logging:
+  report_to_wandb: ${oc.env:REPORT_WANDB,false}
+  project_name: ${oc.env:WANDB_PROJECT,bagel-agentic}
+  run_name: ${oc.env:WANDB_RUN_NAME,bagel_thinkgen_fully_async}
+  tags: [bagel, agentic, thinkgen, multiturn, pickscore, trainside, fully-async]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 5
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    shift: 3.0
+    enable_vit: false
+    use_lora: true
+    lora_target_modules:
+      - self_attn.q_proj
+      - self_attn.k_proj
+      - self_attn.v_proj
+      - self_attn.o_proj
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
+      - self_attn.q_proj_moe_gen
+      - self_attn.k_proj_moe_gen
+      - self_attn.v_proj_moe_gen
+      - self_attn.o_proj_moe_gen
+      - mlp_moe_gen.gate_proj
+      - mlp_moe_gen.up_proj
+      - mlp_moe_gen.down_proj
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelPipeline
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  replay_mode: ${oc.env:REPLAY_MODE,inference}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - self_attn.q_proj
+      - self_attn.k_proj
+      - self_attn.v_proj
+      - self_attn.o_proj
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
+      - self_attn.q_proj_moe_gen
+      - self_attn.k_proj_moe_gen
+      - self_attn.v_proj_moe_gen
+      - self_attn.o_proj_moe_gen
+      - mlp_moe_gen.gate_proj
+      - mlp_moe_gen.up_proj
+      - mlp_moe_gen.down_proj
+
+# Trainside fully-async resident-pool engine (shares the live pipeline).
+rollout:
+  _target_: unirl.agentic.engine_fully_async.BagelAgenticEngineFullyAsync
+  max_turns: ${max_turns}
+  sessions_per_prompt: ${sessions_per_prompt}
+  max_staleness: ${max_staleness}
+  turns_per_window: ${turns_per_window}
+  system_prompt: null
+  honor_done: false
+  env_instructions:
+    - "Reflect on the previous attempt and revise the plan to improve visual fidelity, composition, and prompt alignment. Then describe the refined image."
+    - "Critique the latest image for missing or distorted details and rewrite the plan to fix them while staying faithful to the original request."
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+ar_algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 1.0e-2
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelARConditions
+  sampling_temperature: 1.0
+
+image_algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelDiffusionConditions
+  params: ${sampling.diffusion}
+
+stack:
+  _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,datasets/pickscore/train.txt}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,datasets/pickscore/test.txt}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 1
+    temperature: 1.0
+    top_p: 1.0
+    top_k: 0
+    max_new_tokens: 256
+  diffusion:
+    _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
+    samples_per_prompt: 1
+    num_inference_steps: 14
+    guidance_scale: 1.0
+    cfg_text_scale: 1
+    cfg_img_scale: 1.0
+    cfg_interval: [0.4, 1.0]
+    cfg_renorm_min: 0.0
+    cfg_renorm_type: text_channel
+    eta: 1.0
+    height: 512
+    width: 512
+    seed: 42
+    init_same_noise: false
+    autocast_precision: bf16
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    scheduler:
+      _target_: unirl.utils.scheduler_utils.WindowScheduler
+      num_timesteps: 7
+      config:
+        _target_: unirl.utils.scheduler_utils.WindowConfig
+        strategy: random
+        window_size: 3
