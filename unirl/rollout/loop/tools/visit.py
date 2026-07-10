@@ -1,30 +1,60 @@
-"""VisitTool — read webpage(s) and summarize toward a goal (LIN-519).
+"""VisitTool — read webpage(s) and summarize toward a goal (LIN-519, hardened).
 
 A concrete :class:`~unirl.rollout.loop.tools.tool.Tool` for the deep-research
 agent: fetch a URL's content with the Jina reader (needs ``$JINA_API_KEYS``) and
 summarize the parts relevant to a stated goal with an OpenAI-compatible LLM
 (hosted out-of-band; ``$SUMMARY_URL`` / ``$SUMMARY_MODEL`` or the constructor
-args — the same endpoint as the judge works). ``execute`` is synchronous and
+args — the same endpoint the judge uses). ``execute`` is synchronous and
 thread-safe so it runs under :meth:`ToolEnvironment.astep`'s executor across
 concurrent trajectories. If no summarizer is configured it returns the truncated
 raw page content, so the tool is usable without a summarizer for smoke tests.
+
+Hardened toward AReaL's tongyi_deepresearch ``tool_visit.py``: Jina reads and the
+summarizer call retry on transient failures, and the summarizer returns a
+structured ``evidence`` / ``summary`` extraction (JSON-tolerant parse) rather than
+free text — higher-signal observations for the policy.
 """
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 import requests
 
 from unirl.rollout.loop.tools.tool import Tool
 
 _JINA_READ = "https://r.jina.ai/"
+# Structured extractor (mirrors AReaL's EXTRACTOR_PROMPT): evidence + summary.
 _EXTRACT_PROMPT = (
-    "Extract and summarize the information from the webpage that is relevant to the goal. "
-    "Keep concrete facts, figures, dates, and quotes; drop boilerplate.\n\n"
-    "## Goal\n{goal}\n\n## Webpage content\n{content}\n\n## Summary:"
+    "Process the following webpage content and extract the information relevant "
+    "to the goal.\n\n"
+    "## Webpage content\n{content}\n\n"
+    "## Goal\n{goal}\n\n"
+    "## Task\n"
+    "1. evidence: extract the most relevant facts, figures, dates, and quotes "
+    "from the content — keep the full original context where possible.\n"
+    "2. summary: organize it into a concise paragraph, judging its contribution "
+    "to the goal.\n\n"
+    'Output ONLY a JSON object with string keys "evidence" and "summary".'
 )
+
+
+def _extract_json(raw: str) -> Optional[dict]:
+    """Best-effort JSON parse: strip code fences, else grab the outer ``{...}``."""
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        left, right = raw.find("{"), raw.rfind("}")
+        if left != -1 and right != -1 and left <= right:
+            try:
+                return json.loads(raw[left : right + 1])
+            except Exception:
+                return None
+    return None
 
 
 class VisitTool(Tool):
@@ -40,12 +70,16 @@ class VisitTool(Tool):
         endpoint: str = "",
         model: str = "",
         timeout: float = 60.0,
-        max_content_chars: int = 60000,
+        max_content_chars: int = 90000,
+        max_read_retries: int = 3,
+        max_summary_retries: int = 2,
     ) -> None:
         self._endpoint = endpoint
         self._model = model
         self._timeout = float(timeout)
         self._max_content_chars = int(max_content_chars)
+        self._max_read_retries = max(1, int(max_read_retries))
+        self._max_summary_retries = max(1, int(max_summary_retries))
 
     def json_schema(self) -> Dict[str, Any]:
         return {
@@ -82,37 +116,60 @@ class VisitTool(Tool):
     def _visit_one(self, url: str, goal: str) -> str:
         content = self._read(url)
         if content.startswith("[visit] "):
-            return f"{url}: {content}"
+            return f"The useful information in {url} for goal {goal}:\n{content}"
         summary = self._summarize(content[: self._max_content_chars], goal)
-        return f"Content of {url} for goal {goal!r}:\n{summary}"
+        return f"The useful information in {url} for goal {goal}:\n{summary}"
 
     def _read(self, url: str) -> str:
+        """Fetch page text via Jina, retrying on transient failures. Errors are
+        returned as ``[visit] ...`` text (surfaced to the model), never raised."""
         key = os.environ.get("JINA_API_KEYS", "")
         headers = {"Authorization": f"Bearer {key}"} if key else {}
-        try:
-            resp = requests.get(_JINA_READ + url, headers=headers, timeout=self._timeout)
-            resp.raise_for_status()
-            return resp.text
-        except Exception as exc:  # noqa: BLE001 — surfaced to the model as text
-            return f"[visit] failed to read {url}: {exc}"
+        last = f"[visit] failed to read {url}"
+        for _ in range(self._max_read_retries):
+            try:
+                resp = requests.get(_JINA_READ + url, headers=headers, timeout=self._timeout)
+                resp.raise_for_status()
+                text = resp.text
+                if text and text.strip():
+                    return text
+                last = f"[visit] empty content for {url}"
+            except Exception as exc:  # noqa: BLE001 — surfaced to the model as text, not raised
+                last = f"[visit] failed to read {url}: {exc}"
+            time.sleep(0.5)
+        return last
 
     def _summarize(self, content: str, goal: str) -> str:
+        """Summarize toward the goal via the out-of-band LLM into a structured
+        evidence/summary block. No endpoint -> raw (truncated) content. On repeated
+        failure -> raw content, so a dead summarizer degrades rather than crashes."""
         endpoint = os.environ.get("SUMMARY_URL", self._endpoint)
         model = os.environ.get("SUMMARY_MODEL", self._model)
         if not endpoint:
             return content  # no summarizer configured — return raw (truncated) content
+        headers = {"Content-Type": "application/json"}
+        key = os.environ.get("SUMMARY_API_KEY", "")
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": _EXTRACT_PROMPT.format(goal=goal, content=content)}],
             "temperature": 0.2,
         }
-        headers = {"Content-Type": "application/json"}
-        key = os.environ.get("SUMMARY_API_KEY", "")
-        if key:
-            headers["Authorization"] = f"Bearer {key}"
-        try:
-            resp = requests.post(endpoint, json=payload, headers=headers, timeout=self._timeout)
-            resp.raise_for_status()
-            return str(resp.json()["choices"][0]["message"]["content"]).strip()
-        except Exception:  # noqa: BLE001 — fall back to raw content on summarizer failure
-            return content
+        for _ in range(self._max_summary_retries):
+            try:
+                resp = requests.post(endpoint, json=payload, headers=headers, timeout=self._timeout)
+                resp.raise_for_status()
+                raw = str(resp.json()["choices"][0]["message"]["content"]).strip()
+                obj = _extract_json(raw)
+                if obj is not None:
+                    evidence = str(obj.get("evidence", "")).strip()
+                    summary = str(obj.get("summary", "")).strip()
+                    if evidence or summary:
+                        return f"Evidence:\n{evidence}\n\nSummary:\n{summary}"
+                if raw:
+                    return raw  # not JSON, but the model's text is still a usable summary
+            except Exception:  # noqa: BLE001 — retry, then fall back to raw content
+                pass
+            time.sleep(0.5)
+        return content  # summarizer failed after retries — raw truncated content

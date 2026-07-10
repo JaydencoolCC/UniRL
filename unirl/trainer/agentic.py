@@ -29,6 +29,7 @@ from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from omegaconf import OmegaConf
 
 from unirl.algorithms.normalizers import build_group_index_map
 from unirl.distributed.tensor import hydrate
@@ -53,10 +54,57 @@ def _extract_answer(text: Optional[str]) -> str:
     return matches[-1].group(1).strip() if matches else text.strip()
 
 
+def _validate_agentic_cfg(kw: dict) -> None:
+    """Fail fast on cross-config invariants only jointly visible at the trainer.
+
+    The recipes assert these in prose comments but nothing enforced them, so a
+    mismatch silently broke the on-policy ratio or DP scatter. Each check is
+    skipped when either side is absent, so it never rejects a config that merely
+    omits a key. (The ``env.max_turns == config.max_turns`` check lives in
+    ``AgenticRolloutEngine.__init__``, where the built env is in scope.)
+    """
+    rollout_cfg = kw.get("rollout_cfg")
+    ep = OmegaConf.select(rollout_cfg, "config.episode_sampling") if rollout_cfg is not None else None
+    if ep is None:
+        return
+    n_ep = int(OmegaConf.select(ep, "samples_per_prompt") or 1)
+    t_ep = OmegaConf.select(ep, "temperature")
+
+    sampling_cfg = kw.get("sampling_cfg")
+    if sampling_cfg is not None:
+        n_s = int(OmegaConf.select(sampling_cfg, "samples_per_prompt") or 1)
+        if n_s != n_ep:
+            raise ValueError(
+                f"sampling.samples_per_prompt ({n_s}) must equal "
+                f"rollout.config.episode_sampling.samples_per_prompt ({n_ep})"
+            )
+        t_s = OmegaConf.select(sampling_cfg, "temperature")
+        if t_ep is not None and t_s is not None and abs(float(t_s) - float(t_ep)) > 1e-9:
+            raise ValueError(f"sampling.temperature ({t_s}) must equal episode_sampling.temperature ({t_ep})")
+
+    algorithm_cfg = kw.get("algorithm_cfg")
+    t_a = OmegaConf.select(algorithm_cfg, "sampling_temperature") if algorithm_cfg is not None else None
+    if t_ep is not None and t_a is not None and abs(float(t_a) - float(t_ep)) > 1e-9:
+        raise ValueError(
+            f"algorithm.sampling_temperature ({t_a}) must equal episode_sampling.temperature "
+            f"({t_ep}) — else replay's tempered log-softmax diverges from the sampler (ratio != 1)"
+        )
+
+    cfg = kw.get("cfg")
+    batch_size = kw.get("batch_size")
+    nd = OmegaConf.select(cfg, "num_devices") if cfg is not None else None
+    if nd is not None and batch_size is not None and (int(batch_size) * n_ep) % int(nd) != 0:
+        raise ValueError(
+            f"batch_size*samples_per_prompt ({int(batch_size) * n_ep}) must be divisible "
+            f"by num_devices ({int(nd)}) for the DP scatter"
+        )
+
+
 class AgenticTrainer(ARTrainer):
     """Agentic (multi-turn tool-use) RL trainer over the ``AgenticRolloutEngine``."""
 
     def __init__(self, *, stop: Optional[List[str]] = None, **kwargs) -> None:
+        _validate_agentic_cfg(kwargs)
         super().__init__(**kwargs)
         # Per-turn stop: a tool-call turn ends at ``</tool_call>`` and yields to the
         # tool; a final-answer turn runs to EOS. Rides the request root's control bag

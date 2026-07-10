@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import List
 
@@ -40,6 +41,26 @@ _DEFAULT_JUDGE_PROMPT = (
     "Reply with a single word: 'correct' if they are equivalent, otherwise "
     "'incorrect'."
 )
+
+# Verdict patterns, checked NEGATIVE-first: "incorrect" contains the substring
+# "correct", and a verbose judge may write "not correct" / "wrong" — the old
+# ``"correct" in content and "incorrect" not in content`` test misreads both
+# ("not correct" -> scored 1.0). The prompt asks for a single word, so
+# double-negatives ("not incorrect") are out of scope; ambiguous replies score
+# 0.0 (under-reward on uncertainty, matching the judge-failure convention).
+_INCORRECT_RE = re.compile(r"\b(?:incorrect|not\s+correct|isn'?t\s+correct|wrong|not\s+equivalent)\b")
+_CORRECT_RE = re.compile(r"\b(?:correct|equivalent|yes)\b")
+
+
+def _parse_verdict(content: str) -> float:
+    """Parse a judge reply into 1.0 (equivalent) / 0.0 (not), robust to the
+    "incorrect"⊃"correct" substring trap and to "not correct" / "wrong" phrasings."""
+    c = (content or "").strip().lower()
+    if _INCORRECT_RE.search(c):
+        return 0.0
+    if _CORRECT_RE.search(c):
+        return 1.0
+    return 0.0
 
 
 class LLMJudgeRewardScorer(LocalRewardBackend):
@@ -85,9 +106,8 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
             try:
                 resp = requests.post(self._endpoint, json=payload, headers=headers, timeout=self._spec.timeout)
                 resp.raise_for_status()
-                content = str(resp.json()["choices"][0]["message"]["content"]).strip().lower()
-                # "incorrect" contains "correct" as a substring — test it first.
-                return 1.0 if ("incorrect" not in content and "correct" in content) else 0.0
+                content = str(resp.json()["choices"][0]["message"]["content"])
+                return _parse_verdict(content)
             except Exception as exc:  # noqa: BLE001 — judge failures score 0, never crash training
                 logger.warning("LLM judge attempt %d/%d failed: %s", attempt + 1, self._spec.max_retries, exc)
         logger.warning("LLM judge failed after %d attempts; scoring 0.", self._spec.max_retries)
