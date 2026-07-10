@@ -43,6 +43,14 @@ class AgenticRolloutEngineConfig(BaseEngineConfig):
     #: granularity. Set a small multiple of the inner backend ``concurrency`` so
     #: trajectories in tool-wait don't starve the GPU (see design §5).
     per_worker_concurrency: int = 8
+    #: Partial rollout (LIN-531): expose the coordinator as a ``submit``/``poll``/
+    #: ``abort`` interface so the *trainer* can over-sample, commit the first
+    #: ``batch_size`` complete GRPO groups, checkpoint the unfinished tail at a
+    #: **turn boundary**, and carry it to the next round (resumed under new
+    #: weights). ``False`` ⇒ ``abort`` never fires, so behaviour is byte-identical
+    #: to the barrier ``generate``. The engine provides the mechanism; the policy
+    #: (how many, when to sync) lives in the trainer.
+    partial_rollout: bool = False
 
     def make_engine(self, **deps: Any):
         """Construct the runtime :class:`AgenticRolloutEngine` (lazy import)."""

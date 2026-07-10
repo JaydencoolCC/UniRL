@@ -29,9 +29,20 @@ from unirl.rollout.engine.sglang.utils import (
 )
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
+from unirl.types.segments.base import SegmentStatus
 from unirl.types.segments.text import TextSegment
 
 logger = logging.getLogger(__name__)
+
+#: SGLang ``finish_reason`` → terminal :class:`SegmentStatus` (LIN-531). The agentic
+#: rollout engine reads this per-candidate status to tell a *terminal* turn
+#: (COMPLETED / TRUNCATED / ABORTED) apart from an unfinished one; unknown reasons
+#: (or a partial carrying none) fall back to PENDING.
+_FINISH_TO_STATUS = {
+    "stop": SegmentStatus.COMPLETED,
+    "length": SegmentStatus.TRUNCATED,
+    "abort": SegmentStatus.ABORTED,
+}
 
 
 @register_adapter("text")
@@ -177,6 +188,7 @@ class TextLMAdapter(ModelAdapter):
             segment=self.build_segment(sample, prepared, raw),
             primitive=self.build_decoded(sample, prepared, raw),
             conditions=self.build_conditions(sample, prepared, raw),
+            status=self.build_status(raw),
         )
         # Preserve every input Part: multi-input multimodal chains image / cot_text
         # input Parts before the gen shell, so the filled gen Part's parent id must
@@ -188,6 +200,16 @@ class TextLMAdapter(ModelAdapter):
         return TextSegment.pack(
             tokens=[torch.tensor(list(r.token_ids or []), dtype=torch.long) for r in raw],
             log_probs=[torch.tensor(list(r.logprobs or []), dtype=torch.float32) for r in raw],
+        )
+
+    @staticmethod
+    def build_status(raw: List[RawResult]) -> torch.Tensor:
+        """Per-candidate terminal status (LIN-531) from the seam's ``finish_reason``:
+        ``stop`` → COMPLETED, ``length`` → TRUNCATED, ``abort`` → ABORTED, else PENDING.
+        A ``[n_candidates]`` long tensor (one ``SegmentStatus`` value per row)."""
+        return torch.tensor(
+            [int(_FINISH_TO_STATUS.get(str(r.finish_reason), SegmentStatus.PENDING)) for r in raw],
+            dtype=torch.long,
         )
 
     def build_decoded(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Texts:

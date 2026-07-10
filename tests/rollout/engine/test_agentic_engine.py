@@ -127,8 +127,14 @@ def _patch_pull(engine: AgenticRolloutEngine, queue: deque) -> None:
 
 
 def _drive(engine: AgenticRolloutEngine, queue: deque) -> List[Sample]:
+    """Run the background drain to quiescence and return the COMPLETED trajectories.
+
+    The drain now writes into the worker-side ``_completed`` / ``_checkpointed``
+    buffers (LIN-531) instead of returning a list, so read the completed buffer.
+    """
     _patch_pull(engine, queue)
-    return engine._run_coro(engine._drain(None, ""))
+    engine._run_coro(engine._drain(None, ""))
+    return list(engine._completed)
 
 
 # --------------------------------------------------------------------------- #
@@ -138,10 +144,11 @@ def _drive(engine: AgenticRolloutEngine, queue: deque) -> List[Sample]:
 
 def test_run_one_builds_a_multi_turn_trajectory():
     """``_run_one`` forks-generates-observes until the env says done; weight_version
-    is stamped on each gen Part."""
+    is stamped on each gen Part. Contract (LIN-531): returns ``(sample, done)``."""
     engine = _make_engine(env=FakeEnv(turns_by_prompt={"p0": 3}))
-    traj = engine._run_coro(engine._run_one(_req("p0")))
+    traj, done = engine._run_coro(engine._run_one(_req("p0")))
 
+    assert done is True  # env said done → terminal
     assert traj.parts[0].sample_ids == ["p0"]  # root prompt id preserved
     assert len(traj.gen_parts()) == 3  # 3 turns
     # [input, gen, obs, gen, obs, gen]
@@ -327,3 +334,89 @@ def test_pull_load_balancing_fast_worker_pulls_more():
     assert n_fast[0] + n_slow[0] == 12  # every task processed exactly once
     assert n_fast[0] > n_slow[0]  # the fast worker pulled more (load balanced by capacity)
     fast.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Partial rollout (LIN-531): turn-boundary checkpoint + resume + buffer routing
+# --------------------------------------------------------------------------- #
+
+
+class _StopAfterEnv(FakeEnv):
+    """Flips ``engine._stopping`` True (once) during the astep of turn ``stop_after``,
+    so the NEXT turn-top check checkpoints — a deterministic mid-trajectory interrupt."""
+
+    def __init__(self, engine: AgenticRolloutEngine, stop_after: int, **kw: Any) -> None:
+        super().__init__(**kw)
+        self._engine = engine
+        self._stop_after = int(stop_after)
+        self._fired = False
+
+    async def astep(self, sample: Sample) -> Tuple[Optional[Texts], bool, dict]:
+        out = await super().astep(sample)
+        if not self._fired and len(sample.gen_parts()) == self._stop_after:
+            self._engine._stopping = True
+            self._fired = True
+        return out
+
+
+def test_run_one_checkpoints_on_stopping_then_resumes_to_completion():
+    """THE partial-rollout case: ``_stopping`` flips mid-trajectory → ``_run_one``
+    checkpoints at the next turn boundary (``done=False``, k turns, no ``env.astep`` on
+    the truncated turn); the carried partial resumes from turn k and runs to the env's
+    terminal turn (``done=True``), so its turn count spans the checkpoint."""
+    engine = _make_engine(n=1, max_turns=8)
+    engine._env = _StopAfterEnv(engine, stop_after=2, turns_by_prompt={"p0": 5})
+
+    partial, done = engine._run_coro(engine._run_one(_req("p0")))
+    assert done is False  # checkpointed, not terminal
+    assert len(partial.gen_parts()) == 2  # stopped at the turn boundary after turn 2
+
+    engine._stopping = False  # the trainer clears the flag before resubmitting
+    resumed, done2 = engine._run_coro(engine._run_one(partial))
+    assert done2 is True
+    assert len(resumed.gen_parts()) == 5  # 2 carried + 3 more = the env's terminal turn
+    assert resumed.parts[0].sample_ids == ["p0"]  # same trajectory (root id preserved)
+    engine.shutdown()
+
+
+def test_drain_conserves_trajectories_under_mid_drive_stopping():
+    """A background drain flipped to stopping mid-drive loses nothing: every submitted
+    trajectory ends up completed, checkpointed, or still-queued (conservation), and any
+    checkpointed one is a genuine partial (fewer than the env's turns)."""
+    engine = _make_engine(n=1, cap=8, env=FakeEnv(default_turns=4, astep_sleep=0.002))
+    queue = deque(_req(r) for r in ("a", "b", "c", "d"))
+    _patch_pull(engine, queue)
+
+    async def scenario() -> None:
+        drain = asyncio.ensure_future(engine._drain(None, ""))
+        for _ in range(20):
+            await asyncio.sleep(0)  # let trajectories start + advance a turn or two
+        engine._stopping = True
+        await drain
+
+    engine._run_coro(scenario())
+
+    accounted = len(engine._completed) + len(engine._checkpointed) + len(queue)
+    assert accounted == 4  # nothing lost or duplicated
+    for s in engine._checkpointed:
+        assert len(s.gen_parts()) < 4  # a checkpoint is an unfinished (partial) trajectory
+    engine.shutdown()
+
+
+def test_worker_buffers_read_clear_and_reset():
+    """``drain_completed`` / ``collect_carried`` read+clear their buffers (so ``poll``
+    is incremental); ``reset_round`` clears both + the stop flag for the next drive."""
+    engine = _make_engine(n=1, env=FakeEnv(default_turns=1))
+    _patch_pull(engine, deque([_req("a"), _req("b")]))
+    engine._run_coro(engine._drain(None, ""))
+
+    first = engine.drain_completed()
+    assert len(first) == 2 and all(isinstance(s, Sample) for s in first)
+    assert engine.drain_completed() == []  # cleared — a second poll sees nothing new
+    assert engine.collect_carried() == []  # nothing checkpointed on a clean drive
+
+    engine._stopping = True
+    engine._checkpointed = [_req("x")]  # sentinel carried
+    engine.reset_round()
+    assert engine._stopping is False and engine._completed == [] and engine._checkpointed == []
+    engine.shutdown()
