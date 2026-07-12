@@ -21,14 +21,12 @@ import pytest
 pytest.importorskip("torch")  # the unirl types import torch at module load
 
 from tests.rollout.engine._fakes import FakeEngine  # noqa: E402
-
 from unirl.rollout.engine.agentic.config import AgenticRolloutEngineConfig  # noqa: E402
 from unirl.rollout.engine.agentic.engine import AgenticRolloutEngine  # noqa: E402
 from unirl.rollout.engine.base import BaseEngineConfig  # noqa: E402
 from unirl.types.primitives import Texts  # noqa: E402
 from unirl.types.sample import Part, Sample  # noqa: E402
 from unirl.types.sampling import ARSamplingParams  # noqa: E402
-
 
 # --------------------------------------------------------------------------- #
 # Fakes: an inner-engine config that builds a FakeEngine, and a re-entrant env
@@ -44,6 +42,12 @@ class _FakeInnerConfig(BaseEngineConfig):
 
     def make_engine(self, **deps: Any) -> FakeEngine:  # deps (device/rank/...) ignored
         return FakeEngine(concurrency=self.concurrency, yields=self.yields)
+
+
+@dataclass
+class _InvalidInnerConfig(BaseEngineConfig):
+    def make_engine(self, **deps: Any) -> object:
+        return object()
 
 
 class FakeEnv:
@@ -117,6 +121,33 @@ def _req(root_id: str) -> Sample:
     return Sample.request(Part.input([root_id], primitive=Texts(texts=[f"prompt-{root_id}"])))
 
 
+def test_constructor_rejects_inner_without_single_turn_async_contract():
+    cfg = AgenticRolloutEngineConfig(
+        inner=_InvalidInnerConfig(),
+        env=FakeEnv(),
+        max_turns=1,
+        episode_sampling=ARSamplingParams(samples_per_prompt=1),
+    )
+    with pytest.raises(ValueError, match="single-turn async engine contract"):
+        AgenticRolloutEngine(cfg, rank=0)
+
+
+def test_agenerate_is_an_independent_async_coordinator_path():
+    engine = _make_engine(n=1)
+    expected = [_req("done")]
+    engine._workers = [object()]
+    engine._reset_all = lambda: None  # type: ignore[method-assign]
+    engine._fire_drain = lambda: setattr(engine, "_drain_refs", [])  # type: ignore[method-assign]
+    engine._fan = lambda method: expected if method == "drain_completed" else []  # type: ignore[method-assign]
+
+    def forbidden(_request: Sample) -> List[Sample]:
+        raise AssertionError("agenerate must not call synchronous generate")
+
+    engine.generate = forbidden  # type: ignore[method-assign]
+    assert asyncio.run(engine.agenerate(sample=_req("p0"))) == expected
+    engine.shutdown()
+
+
 def _patch_pull(engine: AgenticRolloutEngine, queue: deque) -> None:
     """Replace ``_pull`` with an in-process pop (no Ray); FIFO, ``None`` sentinel."""
 
@@ -133,7 +164,7 @@ def _drive(engine: AgenticRolloutEngine, queue: deque) -> List[Sample]:
     buffers (LIN-531) instead of returning a list, so read the completed buffer.
     """
     _patch_pull(engine, queue)
-    engine._run_coro(engine._drain(None, ""))
+    engine.run_drain(None, "")
     return list(engine._completed)
 
 
@@ -146,7 +177,7 @@ def test_run_one_builds_a_multi_turn_trajectory():
     """``_run_one`` forks-generates-observes until the env says done; weight_version
     is stamped on each gen Part. Contract (LIN-531): returns ``(sample, done)``."""
     engine = _make_engine(env=FakeEnv(turns_by_prompt={"p0": 3}))
-    traj, done = engine._run_coro(engine._run_one(_req("p0")))
+    traj, done = engine._inner.run_session(lambda: engine._run_one(_req("p0")))
 
     assert done is True  # env said done → terminal
     assert traj.parts[0].sample_ids == ["p0"]  # root prompt id preserved
@@ -301,12 +332,6 @@ def test_pull_load_balancing_fast_worker_pulls_more():
     fast = _make_engine(cap=1, inner_yields=1, env=FakeEnv(default_turns=1))
     slow = _make_engine(cap=1, inner_yields=40, env=FakeEnv(default_turns=1))
 
-    # Force both drains onto ONE event loop so they truly interleave.
-    shared = fast._inner._loop
-    slow._inner._backend._loop = shared
-    slow._inner._loop = shared
-    slow._loop = shared
-
     queue = deque(_req(f"p{i}") for i in range(12))
     n_fast, n_slow = [0], [0]
 
@@ -326,14 +351,15 @@ def test_pull_load_balancing_fast_worker_pulls_more():
     slow._pull = _pull_slow  # type: ignore[assignment]
 
     async def _both() -> None:
-        # Build the gather INSIDE the running loop so both drains bind to `shared`.
+        # Drive both independent workers concurrently on this test loop.
         await asyncio.gather(fast._drain(None, ""), slow._drain(None, ""))
 
-    shared.run_until_complete(_both())
+    asyncio.run(_both())
 
     assert n_fast[0] + n_slow[0] == 12  # every task processed exactly once
     assert n_fast[0] > n_slow[0]  # the fast worker pulled more (load balanced by capacity)
     fast.shutdown()
+    slow.shutdown()
 
 
 # --------------------------------------------------------------------------- #
@@ -367,12 +393,12 @@ def test_run_one_checkpoints_on_stopping_then_resumes_to_completion():
     engine = _make_engine(n=1, max_turns=8)
     engine._env = _StopAfterEnv(engine, stop_after=2, turns_by_prompt={"p0": 5})
 
-    partial, done = engine._run_coro(engine._run_one(_req("p0")))
+    partial, done = engine._inner.run_session(lambda: engine._run_one(_req("p0")))
     assert done is False  # checkpointed, not terminal
     assert len(partial.gen_parts()) == 2  # stopped at the turn boundary after turn 2
 
     engine._stopping = False  # the trainer clears the flag before resubmitting
-    resumed, done2 = engine._run_coro(engine._run_one(partial))
+    resumed, done2 = engine._inner.run_session(lambda: engine._run_one(partial))
     assert done2 is True
     assert len(resumed.gen_parts()) == 5  # 2 carried + 3 more = the env's terminal turn
     assert resumed.parts[0].sample_ids == ["p0"]  # same trajectory (root id preserved)
@@ -394,7 +420,7 @@ def test_drain_conserves_trajectories_under_mid_drive_stopping():
         engine._stopping = True
         await drain
 
-    engine._run_coro(scenario())
+    engine._inner.run_session(scenario)
 
     accounted = len(engine._completed) + len(engine._checkpointed) + len(queue)
     assert accounted == 4  # nothing lost or duplicated
@@ -408,7 +434,7 @@ def test_worker_buffers_read_clear_and_reset():
     is incremental); ``reset_round`` clears both + the stop flag for the next drive."""
     engine = _make_engine(n=1, env=FakeEnv(default_turns=1))
     _patch_pull(engine, deque([_req("a"), _req("b")]))
-    engine._run_coro(engine._drain(None, ""))
+    engine.run_drain(None, "")
 
     first = engine.drain_completed()
     assert len(first) == 2 and all(isinstance(s, Sample) for s in first)

@@ -1,9 +1,8 @@
-"""Control-plane + provenance tests for the async rollout engine (LIN-499).
+"""Control-plane + provenance tests for engine-owned async sessions.
 
 The control verbs (``abort``/``pause``/``resume``) are sync methods reached via
 the raw ``Worker.call`` RPC on a *different* thread than the in-flight
-``generate``; they schedule their backend coroutine onto the running engine loop
-with ``run_coroutine_threadsafe`` (``_run_coro_threadsafe``). Weight-version
+``generate``; the backend-owned session schedules control work onto its active loop. Weight-version
 provenance is stamped onto the frontier gen ``Part`` by ``_stamp_weight_version``
 (bumped per weight sync). Streaming is the consumer composing ``agenerate``
 coroutines as-completed (the deferred driver), overlapping a finished group's
@@ -22,7 +21,6 @@ from tests.rollout.engine._fakes import FakeEngine, build_request_batch  # noqa:
 from unirl.types.primitives import Texts  # noqa: E402
 from unirl.types.sample import Part, Sample  # noqa: E402
 from unirl.types.sampling import ARSamplingParams  # noqa: E402
-
 
 # --------------------------------------------------------------------------- #
 # abort / pause / resume
@@ -45,7 +43,7 @@ def test_abort_sets_flag_and_inflight_groups_still_complete():
 
         return await asyncio.gather(engine.agenerate(g0), engine.agenerate(g1), driver())
 
-    r0, r1, _ = engine._run_coro(scenario())
+    r0, r1, _ = engine.run_session(scenario)
 
     assert engine._backend.aborted is True
     # Both groups completed despite the abort (best-effort cancel returns partials).
@@ -59,8 +57,8 @@ def test_control_verbs_scheduled_threadsafe_while_generate_drives_loop():
     """The worker_max_concurrency>1 overlap: a control RPC interleaves with an
     in-flight generate. While generate drives the loop on one (worker) thread,
     pause/resume/abort called from a second thread schedule their backend coroutine
-    onto that running loop via _run_coro_threadsafe (which takes NO loop-driving
-    lock) — flags flip and the parked generate is released."""
+    onto that running loop without taking the session-driving lock — flags flip
+    and the parked generate is released."""
     engine = FakeEngine(concurrency=8)
     engine._backend.block_until_released = True
     batch = build_request_batch(P=1, n=2)
@@ -96,14 +94,8 @@ def test_control_verbs_scheduled_threadsafe_while_generate_drives_loop():
     engine.shutdown()
 
 
-# When the loop is idle, the inherited _run_coro_threadsafe returns early and the
-# unscheduled backend coroutine is dropped unawaited (the faithful real no-op path
-# in sglang/engine.py) — that "coroutine was never awaited" RuntimeWarning is
-# incidental to what this test asserts (flags untouched), so scope it out here.
-@pytest.mark.filterwarnings("ignore::RuntimeWarning")
 def test_control_verbs_noop_when_loop_idle():
-    """_run_coro_threadsafe returns without scheduling when nothing drives the loop
-    — pause/resume/abort are safe no-ops with no generate in flight."""
+    """Control coroutine factories are never constructed while the session is idle."""
     engine = FakeEngine(concurrency=8)
 
     engine.pause()
@@ -146,7 +138,7 @@ def test_streaming_consumes_agenerate_as_completed_with_score_overlap():
             await asyncio.sleep(0)  # a trivial async "score" step over the finished group
             scored.append(result.parts[0].primitive.texts[0])
 
-    engine._run_coro(consume())
+    engine.run_session(consume)
 
     # Consumed in completion order (fast group first), NOT submission order.
     assert scored == [prompts[2], prompts[1], prompts[0]]

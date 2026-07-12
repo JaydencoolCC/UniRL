@@ -1,32 +1,31 @@
 """Rollout engine base class for the ``Sample`` → ``Sample`` path.
 
-Subclasses (``VLLMOmniRolloutEngine``, ``SGLangDiffusionRolloutEngine``,
-``SGLangRolloutEngine``, ``ComposedRolloutEngine``) take all runtime deps as ``__init__`` kwargs
-and complete construction in one shot — no separate ``initialize(device)``
-step. After ``__init__`` returns the engine is fully usable: model loaded,
-worker subprocesses spawned, dist groups brought up. This matches the
-actor flow where ``_setup_distributed_env`` runs before the engine is
-built.
+Concrete engines take all runtime deps as ``__init__`` kwargs and complete
+construction in one shot — no separate ``initialize(device)`` step. After
+``__init__`` returns the engine is fully usable: model loaded, worker
+subprocesses spawned, dist groups brought up. This matches the actor flow where
+``_setup_distributed_env`` runs before the engine is built.
 """
 
 from __future__ import annotations
 
-import asyncio
-import threading
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TypeVar, Union
 
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
+from unirl.rollout.engine.runtime import CoroutineFactory
 from unirl.types.sample import Sample
 
 #: The rollout batch contract (LIN-522). Single-turn engines return one ``Sample``;
 #: the agentic engine returns a list of variable-depth trajectory ``Sample``s (one
-#: per rollout). The ``generate`` façade is annotated with this union so both arms
-#: share one contract.
+#: per rollout). The broad generation methods use this union; the single-turn
+#: subclass refines both returns to ``Sample``.
 RolloutOutput = Union[Sample, List[Sample]]
+
+_SessionResult = TypeVar("_SessionResult")
 
 
 class BaseEngineConfig(ABC):
@@ -101,94 +100,21 @@ class BaseRolloutEngine(Remote, ABC):
         }
 
     # ------------------------------------------------------------------
-    # Generation — async per-group core + sync batch façade
+    # Generation
     # ------------------------------------------------------------------
-    #
-    # The contract is async and per-GROUP: ``agenerate(group) -> group`` (one
-    # prompt-group in, the filled group out — direct return, no iterator).
-    # ``generate`` is the unchanged synchronous batch entry the trainers call; it
-    # fans the batch over its groups (``Sample.split``) and reassembles
-    # (``Sample.concat``), running the per-request work concurrently on the
-    # engine's own event loop, so it stays byte-identical to the pre-async path.
-    # Streaming is the *consumer* composing many ``agenerate`` coroutines
-    # as-completed (the deferred driver); stopping is the ``abort``/``pause``
-    # control plane below.
 
-    #: The asyncio loop this engine's coroutines run on. Installed by
-    #: :meth:`_init_async_loop` in the engine ctor — SGLang adopts the rollout
-    #: backend's ``engine.loop`` (the loop its awaitables are bound to); loop-less
-    #: engines get a fresh on-demand loop. ``generate`` drives it with
-    #: ``run_until_complete`` (serialized by ``_loop_lock``); control RPCs schedule
-    #: onto it with ``run_coroutine_threadsafe`` while it is being driven.
-    _loop: Optional[asyncio.AbstractEventLoop] = None
-    #: Policy weight version the current weights correspond to (bumped on each
-    #: weight sync; stamped onto generated Parts by :meth:`_stamp_weight_version`).
-    _weight_version: int = 0
-
-    def _init_async_loop(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
-        """Install the coroutine loop + the lock that serializes driving it.
-
-        Call once from the engine ctor. Pass the rollout backend's own loop
-        (SGLang: ``self._backend.loop``) so generation coroutines run on the loop
-        the backend awaitables are bound to; pass ``None`` for a loop-less engine
-        (trainside / vllm_omni / composed) to create a fresh on-demand loop.
-        """
-        self._loop = loop if loop is not None else asyncio.new_event_loop()
-        self._loop_lock = threading.Lock()
-
-    def _run_coro(self, coro: Any) -> Any:
-        """Drive ``coro`` to completion on the engine loop (one driver at a time).
-
-        ``_loop_lock`` serializes ``run_until_complete`` (two concurrent drives of
-        one loop would raise). A control RPC (``abort``/``pause``) does NOT take
-        the lock — it schedules onto the same loop with
-        :meth:`_run_coro_threadsafe`, which runs because a generation is driving
-        the loop. Engines whose backend owns the lock (SGLang) override this.
-        """
-        loop, lock = getattr(self, "_loop", None), getattr(self, "_loop_lock", None)
-        if loop is None or lock is None:
-            raise RuntimeError(f"{type(self).__name__}: call _init_async_loop() in __init__ before generation")
-        with lock:
-            return loop.run_until_complete(coro)
-
-    def _run_coro_threadsafe(self, coro: Any) -> Any:
-        """Schedule a control coro onto the engine loop from another thread, wait.
-
-        Returns ``None`` if the loop is not currently being driven (nothing in
-        flight to act on). Used by :meth:`abort`/:meth:`pause`, which run on a
-        different (threaded-Worker) actor thread than the in-flight ``generate``.
-        """
-        loop = getattr(self, "_loop", None)
-        if loop is None or not loop.is_running():
-            return None
-        return asyncio.run_coroutine_threadsafe(coro, loop).result()
-
-    async def agenerate(self, sample: Sample) -> Sample:
-        """Run ONE prompt-group: fill its gen Part(s) and return the group.
-
-        The async per-group core every concrete engine implements. The default
-        raises so a not-yet-migrated engine fails loudly only if the async path
-        is actually exercised.
-        """
-        raise NotImplementedError(f"{type(self).__name__} does not implement async agenerate()")
-
-    async def _agenerate_batch(self, sample: Sample) -> Sample:
-        """Fan a batch over its groups and reassemble — the body of :meth:`generate`."""
-        groups = await asyncio.gather(*(self.agenerate(g) for g in sample.split()))
-        return Sample.concat(groups)
-
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @abstractmethod
     def generate(self, sample: Sample) -> RolloutOutput:
-        """Synchronous batch façade — the entry trainers call.
+        """Synchronously run rollout generation for one request batch.
 
-        Single-turn engines return a single ``Sample``: split the batch into
-        prompt-groups, run them concurrently on the engine loop via
-        :meth:`agenerate`, and concatenate — byte-identical to the pre-async
-        whole-batch path. The agentic engine (LIN-522) overrides this with a
-        ``BROADCAST + RANK_ZERO`` coordinator returning ``List[Sample]`` (one
-        variable-depth trajectory per rollout) — hence the ``RolloutOutput`` union.
+        Dispatch belongs to each concrete contract: single-turn engines use
+        ``DP_SCATTER`` and return one ``Sample``; the agentic coordinator uses
+        ``BROADCAST + RANK_ZERO`` and returns a trajectory list.
         """
-        return self._run_coro(self._agenerate_batch(sample))
+
+    @abstractmethod
+    async def agenerate(self, sample: Sample) -> RolloutOutput:
+        """Asynchronously run the engine's native generation unit."""
 
     # ------------------------------------------------------------------
     # Control plane — sync methods reached via the raw ``Worker.call`` RPC (the
@@ -210,18 +136,6 @@ class BaseRolloutEngine(Remote, ABC):
 
     def resume(self) -> None:
         """Resume generation after :meth:`pause`. Default no-op."""
-
-    # ------------------------------------------------------------------
-    # Provenance
-    # ------------------------------------------------------------------
-
-    def _stamp_weight_version(self, sample: Sample) -> Sample:
-        """Stamp ``self._weight_version`` onto the frontier (last) gen Part."""
-        v = getattr(self, "_weight_version", None)
-        if v is None or not sample.parts:
-            return sample
-        gen = sample.parts[-1].fill(weight_version=int(v))
-        return sample.with_parts([*sample.parts[:-1], gen])
 
     # ------------------------------------------------------------------
     # Weight sync — bucketed CUDA-IPC (verl-omni pattern)
@@ -311,4 +225,48 @@ class BaseRolloutEngine(Remote, ABC):
         raise NotImplementedError
 
 
-__all__ = ["BaseRolloutEngine", "RolloutOutput"]
+class BaseSingleTurnRolloutEngine(BaseRolloutEngine, ABC):
+    """Nominal contract for engines that fill and return one ``Sample``.
+
+    The class intentionally does not prescribe batching or provide a synchronous
+    ``generate`` wrapper. Each engine owns those semantics and applies its own
+    ``@distributed`` decorator. Sync-backed engines own a local runtime;
+    backend-driven engines delegate to their backend runtime.
+    """
+
+    #: Policy weight version the current weights correspond to (bumped on each
+    #: weight sync; stamped onto generated Parts by :meth:`_stamp_weight_version`).
+    _weight_version: int = 0
+
+    @abstractmethod
+    def run_session(self, factory: CoroutineFactory[_SessionResult]) -> _SessionResult:
+        """Run one local coroutine session from a synchronous worker method.
+
+        This method is deliberately not distributed: an agentic engine calls it
+        on its local inner single-turn engine to keep a whole trajectory drain on
+        that engine's runtime.
+        """
+
+    @abstractmethod
+    def generate(self, sample: Sample) -> Sample:
+        """Synchronously fill and return one request ``Sample``."""
+
+    @abstractmethod
+    async def agenerate(self, sample: Sample) -> Sample:
+        """Asynchronously fill and return one request ``Sample``.
+
+        Loop-bound implementations are awaited inside :meth:`run_session`; an
+        implementation backed by synchronous work may also support any caller
+        event loop directly.
+        """
+
+    def _stamp_weight_version(self, sample: Sample) -> Sample:
+        """Stamp ``self._weight_version`` onto the frontier (last) gen Part."""
+        v = getattr(self, "_weight_version", None)
+        if v is None or not sample.parts:
+            return sample
+        gen = sample.parts[-1].fill(weight_version=int(v))
+        return sample.with_parts([*sample.parts[:-1], gen])
+
+
+__all__ = ["BaseRolloutEngine", "BaseSingleTurnRolloutEngine", "RolloutOutput"]

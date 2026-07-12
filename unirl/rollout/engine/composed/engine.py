@@ -24,23 +24,36 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+import threading
+from typing import Any, Dict, List, Optional, TypeVar
 
 import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.pe.instruction import postprocess_pe_texts
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
+from unirl.rollout.engine.runtime import CoroutineFactory, LocalAsyncRuntime
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
 logger = logging.getLogger(__name__)
+_SessionResult = TypeVar("_SessionResult")
 
 
-class ComposedRolloutEngine(BaseRolloutEngine):
+def _cleanup_constructed_child(name: str, child: Any) -> None:
+    shutdown = getattr(child, "shutdown", None)
+    if not callable(shutdown):
+        return
+    try:
+        shutdown()
+    except Exception as exc:
+        logger.warning("Child %r cleanup after construction failure raised: %s", name, exc)
+
+
+class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
     """Two-child rollout engine for prompt-enhancement (PE) serial flow."""
 
     _component_name = "composed"
@@ -70,24 +83,58 @@ class ComposedRolloutEngine(BaseRolloutEngine):
 
         deps = dict(device=device, rank=rank, model_config=model_config)
 
-        self._ar: BaseRolloutEngine = config.ar.make_engine(strategy=None, **deps)
-        self._diffusion: BaseRolloutEngine = config.diffusion.make_engine(strategy=strategy, **deps)
+        ar = config.ar.make_engine(strategy=None, **deps)
+        try:
+            require(
+                isinstance(ar, BaseSingleTurnRolloutEngine),
+                f"ComposedRolloutEngine ar child must be a BaseSingleTurnRolloutEngine; got {type(ar).__name__}",
+            )
+        except BaseException:
+            _cleanup_constructed_child("ar", ar)
+            raise
 
-        self._child_by_name: Dict[str, BaseRolloutEngine] = {
+        try:
+            diffusion = config.diffusion.make_engine(strategy=strategy, **deps)
+        except BaseException:
+            _cleanup_constructed_child("ar", ar)
+            raise
+        try:
+            require(
+                isinstance(diffusion, BaseSingleTurnRolloutEngine),
+                "ComposedRolloutEngine diffusion child must be a BaseSingleTurnRolloutEngine; "
+                f"got {type(diffusion).__name__}",
+            )
+        except BaseException:
+            _cleanup_constructed_child("diffusion", diffusion)
+            _cleanup_constructed_child("ar", ar)
+            raise
+
+        self._ar = ar
+        self._diffusion = diffusion
+
+        self._child_by_name: Dict[str, BaseSingleTurnRolloutEngine] = {
             "ar": self._ar,
             "diffusion": self._diffusion,
         }
 
-        # Async path: composed drives its OWN fresh loop (loop-less orchestrator —
-        # each child drives its own loop). ``generate`` (the sync DP_SCATTER façade)
-        # is inherited; ``_agenerate_batch`` is overridden below so the whole shard
-        # runs as one wake/sleep transition. ``_weight_version`` is the base-surface
-        # default — composed owns no weights and propagates each child's stamp.
+        # The whole AR→diffusion transition is one serialized operation because
+        # the children share wake/sleep state. Composed owns no weights and
+        # propagates each child's stamp rather than stamping its own version.
         self._weight_version = 0
-        self._init_async_loop()
-
-        if config.sleep_diffusion_on_start:
-            self._diffusion.sleep()
+        self._generate_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
+        self._shutdown_complete = False
+        runtime = LocalAsyncRuntime()
+        try:
+            if config.sleep_diffusion_on_start:
+                self._diffusion.sleep()
+        except BaseException:
+            runtime.close()
+            _cleanup_constructed_child("diffusion", diffusion)
+            _cleanup_constructed_child("ar", ar)
+            raise
+        self._runtime = runtime
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -95,11 +142,24 @@ class ComposedRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
-        for name, child in self._child_by_name.items():
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            with self._generate_lock:
+                self._shutdown_requested = True
             try:
-                child.shutdown()
-            except Exception as exc:
-                logger.warning("Child %r shutdown raised: %s", name, exc)
+                self._runtime.close()
+            except BaseException:
+                with self._generate_lock:
+                    self._shutdown_requested = False
+                raise
+            with self._generate_lock:
+                for name, child in self._child_by_name.items():
+                    try:
+                        child.shutdown()
+                    except Exception as exc:
+                        logger.warning("Child %r shutdown raised: %s", name, exc)
+            self._shutdown_complete = True
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
@@ -135,20 +195,32 @@ class ComposedRolloutEngine(BaseRolloutEngine):
     # Generation — PE serial flow
     # ------------------------------------------------------------------
 
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def generate(self, sample: Sample) -> Sample:
+        """Run the whole PE serial flow for one DP shard synchronously."""
+        return self._generate_locked(sample)
+
     async def agenerate(self, sample: Sample) -> Sample:
-        """Run the PE serial flow for the whole shard → filled 3-part ``Sample``.
+        """Run the whole PE serial flow without blocking the session loop."""
+        return await asyncio.to_thread(self._generate_locked, sample)
+
+    def _generate_locked(self, sample: Sample) -> Sample:
+        with self._generate_lock:
+            if self._shutdown_requested:
+                raise RuntimeError("ComposedRolloutEngine.generate called after shutdown")
+            return self._generate_core(sample)
+
+    def run_session(self, factory: CoroutineFactory[_SessionResult]) -> _SessionResult:
+        return self._runtime.run(factory)
+
+    def _generate_core(self, sample: Sample) -> Sample:
+        """Run the PE serial flow for a whole ``Sample`` → filled 3-part output.
 
         Composed's children share wake/sleep state, so the shard is processed as ONE
-        atomic unit: :meth:`_agenerate_batch` overrides the base split→gather and feeds
-        the whole batch here, giving a single AR→diffusion wake/sleep transition.
+        atomic unit, giving a single AR→diffusion wake/sleep transition.
         ``sample`` is the pre-forked request ``[input, ar_shell, diffusion_shell]`` for
         P prompts: the AR shell carries ``ARSamplingParams`` (branch N), the diffusion
         shell ``DiffusionSamplingParams`` (branch M, σ / x_T recipe).
-
-        Each child is driven through its SYNC ``generate`` façade off a worker thread
-        (``asyncio.to_thread``): a child's ``agenerate`` is bound to the CHILD's loop
-        and cannot be awaited from composed's loop, but the façade drives the child's
-        own loop internally and is safe to call from a thread.
         """
         input_part, ar_shell, diffusion_shell = self._unpack_request(sample)
 
@@ -166,8 +238,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         N = len(ar_shell.sample_ids) // P
         require(
             N >= 1 and len(diffusion_shell.sample_ids) % len(ar_shell.sample_ids) == 0,
-            f"ComposedRolloutEngine: diffusion shell {len(diffusion_shell.sample_ids)} "
-            f"not a multiple of P*N={P * N}",
+            f"ComposedRolloutEngine: diffusion shell {len(diffusion_shell.sample_ids)} not a multiple of P*N={P * N}",
         )
         M = len(diffusion_shell.sample_ids) // len(ar_shell.sample_ids)
         require(M >= 1, f"ComposedRolloutEngine.generate: diffusion branch M={M} must be >= 1")
@@ -185,7 +256,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             primitive=text_primitive,
             control=self._ar_control(input_part.control or {}),
         )
-        ar_out = await asyncio.to_thread(self._ar.generate, Sample(parts=[ar_input, ar_shell]))
+        ar_out = self._ar.generate(Sample(parts=[ar_input, ar_shell]))
         ar_part = ar_out.parts[-1]
         require(
             len(ar_part.sample_ids) == P * N,
@@ -223,7 +294,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             sampling_params=diffusion_shell.sampling_params,
             new_segment=diffusion_shell.segment,
         )
-        diff_out = await asyncio.to_thread(self._diffusion.generate, Sample(parts=[pe_input, diff_child_shell]))
+        diff_out = self._diffusion.generate(Sample(parts=[pe_input, diff_child_shell]))
         diff_child = diff_out.parts[-1]
         require(
             len(diff_child.sample_ids) == len(diffusion_shell.sample_ids),
@@ -241,13 +312,6 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         )
 
         return Sample(parts=[input_part, ar_part, diffusion_part])
-
-    async def _agenerate_batch(self, sample: Sample) -> Sample:
-        # Composed has SHARED child wake/sleep state, so the whole shard must run
-        # as ONE wake/sleep transition. The base split->gather would run P
-        # concurrent agenerate coroutines that interleave the shared sleep()/wake_up()
-        # calls and corrupt in-flight child gens. Process the whole batch as one unit.
-        return await self.agenerate(sample)
 
     # ------------------------------------------------------------------
     # Control plane — forwarded to both children (best-effort).
@@ -289,7 +353,9 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         diffusion_shell = next(
             (p for p in sample.parts[1:] if isinstance(p.sampling_params, DiffusionSamplingParams)), None
         )
-        require(ar_shell is not None, "ComposedRolloutEngine.generate: requires an AR gen-shell Part (ARSamplingParams)")
+        require(
+            ar_shell is not None, "ComposedRolloutEngine.generate: requires an AR gen-shell Part (ARSamplingParams)"
+        )
         require(
             diffusion_shell is not None,
             "ComposedRolloutEngine.generate: requires a diffusion gen-shell Part (DiffusionSamplingParams)",
@@ -347,7 +413,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
                 result[child_name] = subset
         return result
 
-    def _children_for_track_prefix(self, track_prefix: str) -> List[BaseRolloutEngine]:
+    def _children_for_track_prefix(self, track_prefix: str) -> List[BaseSingleTurnRolloutEngine]:
         """Resolve the tensor-payload track routing hint to child engines."""
         if not track_prefix:
             return list(self._child_by_name.values())

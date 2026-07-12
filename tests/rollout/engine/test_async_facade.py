@@ -1,8 +1,7 @@
-"""Contract/parity tests for the async rollout-engine façade (LIN-499).
+"""Contract/parity tests for independent sync/async rollout paths.
 
-The sync ``generate`` façade inherited from ``BaseRolloutEngine`` must stay
-byte-identical to running each prompt-group's ``agenerate`` and concatenating:
-split -> ``gather(agenerate)`` -> concat. These exercise that round-trip, the
+Concrete ``generate`` and ``agenerate`` implementations must preserve the same
+whole-Sample semantics without either path calling the other. These exercise parity, the
 per-prompt wire order the backend sees, the shared-semaphore concurrency bound,
 and ``Sample`` split/concat identity — all CPU-only against a fake backend.
 """
@@ -19,24 +18,22 @@ from tests.rollout.engine._fakes import (  # noqa: E402
 from unirl.types.sample import Sample  # noqa: E402
 
 
-def test_facade_matches_per_group_reference_in_group_by_parent_order():
-    """generate(batch) fills every P*n gen row, in group-by-parent order, exactly
-    matching a reference built by running each group's agenerate and concatenating."""
+def test_native_sync_and_async_paths_match_in_group_by_parent_order():
+    """Both native paths fill every P*n row in group-by-parent order."""
     P, n = 3, 2
     engine = FakeEngine(concurrency=8)
     batch = build_request_batch(P=P, n=n)
 
-    out = engine.generate(batch)
+    out = engine.generate(sample=batch)
 
     # Frontier gen Part filled for all P*n rows.
     gen = out.parts[-1]
     assert gen.primitive is not None
     assert len(gen.primitive.texts) == P * n
 
-    # Reference: run each prompt-group's agenerate (sequentially) and concat.
+    # Independent async reference over the same whole Sample.
     ref_engine = FakeEngine(concurrency=8)
-    groups = [ref_engine._run_coro(ref_engine.agenerate(g)) for g in batch.split()]
-    reference = Sample.concat(groups)
+    reference = ref_engine.run_session(factory=lambda: ref_engine.agenerate(sample=batch))
     assert out == reference
 
     # Explicit group-by-parent expected order: prompt-major, sibling-contiguous.
@@ -46,6 +43,32 @@ def test_facade_matches_per_group_reference_in_group_by_parent_order():
 
     engine.shutdown()
     ref_engine.shutdown()
+
+
+def test_generate_does_not_call_engine_agenerate():
+    engine = FakeEngine(concurrency=8)
+    batch = build_request_batch(P=2, n=2)
+
+    async def forbidden(_sample):
+        raise AssertionError("sync generate must not call engine.agenerate")
+
+    engine.agenerate = forbidden  # type: ignore[method-assign]
+    out = engine.generate(batch)
+    assert out.parts[-1].primitive is not None
+    engine.shutdown()
+
+
+def test_agenerate_does_not_call_engine_generate():
+    engine = FakeEngine(concurrency=8)
+    batch = build_request_batch(P=2, n=2)
+
+    def forbidden(_sample):
+        raise AssertionError("agenerate must not call engine.generate")
+
+    engine.generate = forbidden  # type: ignore[method-assign]
+    out = engine.run_session(lambda: engine.agenerate(batch))
+    assert out.parts[-1].primitive is not None
+    engine.shutdown()
 
 
 def test_backend_sees_per_prompt_wire_in_batch_order():

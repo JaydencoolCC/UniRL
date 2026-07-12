@@ -49,7 +49,7 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
 from unirl.rollout.engine.agentic.config import AgenticRolloutEngineConfig
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine, BaseSingleTurnRolloutEngine
 from unirl.types.sample import Sample, _part_with_field
 from unirl.types.sampling import total_samples_per_prompt
 
@@ -91,7 +91,19 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         # actual tools). Mutates the inner CONFIG before it is built; an explicit
         # ``inner.chat_template_kwargs.tools`` in the recipe still wins.
         self._maybe_inject_tool_schemas(config.inner, self._env)
-        self._inner: BaseRolloutEngine = config.inner.make_engine(strategy=strategy, **deps)
+        inner = config.inner.make_engine(strategy=strategy, **deps)
+        if not isinstance(inner, BaseSingleTurnRolloutEngine):
+            shutdown = getattr(inner, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception as exc:
+                    logger.warning("AgenticRolloutEngine invalid inner cleanup raised: %s", exc)
+            raise ValueError(
+                "AgenticRolloutEngine inner must implement the single-turn async engine contract; "
+                f"got {type(inner).__name__}"
+            )
+        self._inner: BaseSingleTurnRolloutEngine = inner
 
         self._sp = config.episode_sampling  # per-turn sampling params; carries n via samples_per_prompt
         self._n = total_samples_per_prompt(self._sp)  # GRPO group size
@@ -111,11 +123,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         # its whole life, incl. tool-wait between turns — so siblings keep the GPU busy.
         self._cap = asyncio.Semaphore(int(config.per_worker_concurrency))
 
-        # Adopt the inner engine's loop + drive it through the inner's lock-guarded
-        # _run_coro, so the drain loop and the inner's weight-sync verbs serialize on
-        # ONE lock — the quiesce boundary (design §6/§8).
-        self._init_async_loop(self._inner._loop)
-
         # Coordinator state (populated on rank 0 only, by set_workers).
         self._workers: List[Any] = []
         self._role: str = ""
@@ -131,10 +138,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         self._checkpointed: List[Sample] = []
         self._buf_lock = threading.Lock()
         self._stopping = False
-
-    def _run_coro(self, coro: Any) -> Any:
-        # Drive on the inner engine's loop under the inner's lock (shared quiesce).
-        return self._inner._run_coro(coro)
 
     @staticmethod
     def _maybe_inject_tool_schemas(inner_cfg: Any, env: Any) -> None:
@@ -223,7 +226,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         return self._fan("drain_completed")
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
-    def abort(self) -> List[Sample]:
+    def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Rank-0: **turn-boundary** stop; return the carried (unfinished) set.
 
         Signals every worker to stop pulling and checkpoint its in-flight
@@ -238,6 +241,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         caller should ``poll()`` once more after ``abort()`` to collect them before the
         next ``submit`` (which resets the per-drive buffers).
         """
+        del ids  # Agentic task ids do not map to backend request ids; abort the round.
         if not self._workers:
             return []
         ray.get([w.call.remote(self._role, "set_stopping", (), {}) for w in self._workers])
@@ -251,7 +255,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         return carried
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
-    def generate(self, request: Sample) -> List[Sample]:
+    def generate(self, sample: Sample) -> List[Sample]:
         """Thin **barrier** convenience: run the whole batch to completion.
 
         ``submit`` + drain-to-completion + collect — byte-identical trajectory set
@@ -261,11 +265,27 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         """
         require(bool(self._workers), "AgenticRolloutEngine.generate: call set_workers() first (rank 0)")
         self._reset_all()
-        self._enqueue_tasks(self._split_request(request))
+        self._enqueue_tasks(self._split_request(sample))
         self._fire_drain()
         ray.get(self._drain_refs)  # drives finish naturally (queue drained, no abort)
         self._drain_refs = []
         return self._fan("drain_completed")
+
+    async def agenerate(self, sample: Sample) -> List[Sample]:
+        """Asynchronous barrier generation over the same coordinator protocol.
+
+        This is a local composition API, not a distributed Handle method. It keeps
+        the caller's event loop responsive while Ray joins run in worker threads;
+        it does not call the synchronous :meth:`generate` implementation.
+        """
+        require(bool(self._workers), "AgenticRolloutEngine.agenerate: call set_workers() first (rank 0)")
+        await asyncio.to_thread(self._reset_all)
+        self._enqueue_tasks(self._split_request(sample))
+        self._fire_drain()
+        if self._drain_refs:
+            await asyncio.to_thread(ray.get, self._drain_refs)
+            self._drain_refs = []
+        return await asyncio.to_thread(self._fan, "drain_completed")
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def drained(self) -> bool:
@@ -297,14 +317,14 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         """Drive this worker's drain loop for the whole drive (background).
 
         Reached by raw ``Worker.call`` (rank 0 fires one per worker, non-blocking).
-        Sync at the RPC boundary; internally one ``run_until_complete`` (via the
-        inner's ``_run_coro``) is the single driver of the inner engine's loop — so
+        Sync at the RPC boundary; internally the inner engine's owned session is
+        the single driver of its async runtime — so
         concurrent trajectories are coroutines on one loop (continuous batching) and
         hold the inner backend's loop-lock for the drive. Results are written to the
         worker's ``_completed`` / ``_checkpointed`` buffers (read by
         ``drain_completed`` / ``collect_carried``), so this returns nothing.
         """
-        self._run_coro(self._drain(coordinator, role_name))
+        self._inner.run_session(lambda: self._drain(coordinator, role_name))
 
     async def _drain(self, coordinator: Any, role_name: str) -> None:
         inflight: set = set()

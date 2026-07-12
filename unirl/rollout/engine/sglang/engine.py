@@ -21,15 +21,15 @@ subprocesses need is quarantined in the backends' ``boot``.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypeVar
 
 import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
+from unirl.rollout.engine.runtime import CoroutineFactory
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
@@ -38,9 +38,10 @@ from unirl.rollout.engine.sglang.weight_sync import WeightSync
 from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
+_SessionResult = TypeVar("_SessionResult")
 
 
-class SGLangRolloutEngine(BaseRolloutEngine):
+class SGLangRolloutEngine(BaseSingleTurnRolloutEngine):
     """LLM/VLM rollout engine backed by a SGLang SRT server (v2 layout)."""
 
     _component_name = "sglang"
@@ -141,61 +142,60 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             uses_lora=bool(engine_kwargs.get("enable_lora", False)),
         )
 
-        # Async per-group path: adopt the backend's event loop (its awaitables are
-        # bound to it) and start the policy-version counter.
+        # The backend owns its async session/loop. The engine only owns policy
+        # provenance and delegates session driving through ``run_session``.
         self._weight_version = 0
-        self._init_async_loop(self._backend.loop)
 
     # ------------------------------------------------------------------ #
-    # Generation — async per-group core (``generate`` façade inherited from base)
+    # Generation — native sync whole-Sample path + matching async path
     # ------------------------------------------------------------------ #
 
-    # ``generate`` (the sync DP_SCATTER batch façade) is inherited from
-    # BaseRolloutEngine: it splits the batch into groups and gathers ``agenerate``
-    # over them on the backend loop. Override the loop driver so generation and
-    # the weight-sync verbs share the BACKEND's lock (one driver of engine.loop).
-    def _run_coro(self, coro: Any) -> Any:
-        return self._backend._run(coro)
+    def run_session(self, factory: CoroutineFactory[_SessionResult]) -> _SessionResult:
+        """Drive an async session on the backend-owned loop."""
+        return self._backend.run_session(factory)
 
-    async def agenerate(self, sample: Sample) -> Sample:
-        """Run ONE prompt-group on the engine loop and return it filled.
-
-        The per-group async core. Awaits the backend's per-request ``generate_one``
-        directly (never ``backend.generate``, which would nest a second
-        ``run_until_complete`` on the loop already being driven). All groups of a
-        batch share one bounding semaphore, so concurrency matches the old
-        whole-batch fan-out exactly.
-        """
+    def _prepare_generation(self, sample: Sample) -> Any:
         require(
             int(sample.parts[-1].batch_size) > 0,
-            "SGLangRolloutEngine.agenerate requires a non-empty group (gen batch_size > 0)",
+            "SGLangRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
         sampling = resolve_sampling(self.cfg, sample)
         prepared = self.adapter.build_inputs(sample, sampling=sampling)
-        # Activate the synced LoRA adapter for these requests — the visible line
-        # connecting WeightSync's state to the wire (adapter/seam stay unaware).
         active_adapter = self._weight_sync.active_adapter
         if active_adapter:
             for payload in prepared.wire:
                 payload["lora_path"] = active_adapter
-        nested = await asyncio.gather(*(self._backend.generate_one(p) for p in prepared.wire))
-        raw = [item for sublist in nested for item in sublist]
-        out = self.adapter.build_response(sample, prepared, raw)
-        return self._stamp_weight_version(out)
+        return prepared
+
+    def _finish_generation(self, sample: Sample, prepared: Any, raw: List[Any]) -> Sample:
+        return self._stamp_weight_version(self.adapter.build_response(sample, prepared, raw))
+
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def generate(self, sample: Sample) -> Sample:
+        """Generate one whole Sample synchronously through the backend seam."""
+        prepared = self._prepare_generation(sample)
+        raw = self._backend.generate(prepared.wire)
+        return self._finish_generation(sample, prepared, raw)
+
+    async def agenerate(self, sample: Sample) -> Sample:
+        """Generate one whole Sample inside an active backend session."""
+        prepared = self._prepare_generation(sample)
+        raw = await self._backend.agenerate(prepared.wire)
+        return self._finish_generation(sample, prepared, raw)
 
     # ── control plane — sync; reached via the raw Worker.call RPC ──────────
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Abort in-flight generation (best-effort). Partials surface via the
         pending ``generate``/``agenerate`` returns, so this returns ``[]``."""
         del ids
-        self._run_coro_threadsafe(self._backend.aabort(abort_all=True))
+        self._backend.abort(abort_all=True)
         return []
 
     def pause(self) -> None:
-        self._run_coro_threadsafe(self._backend.apause())
+        self._backend.pause()
 
     def resume(self) -> None:
-        self._run_coro_threadsafe(self._backend.aresume())
+        self._backend.resume()
 
     # ------------------------------------------------------------------ #
     # Lifecycle — the offload flags live here; decorators re-applied

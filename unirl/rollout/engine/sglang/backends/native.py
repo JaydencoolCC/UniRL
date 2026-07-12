@@ -12,12 +12,10 @@ whitelist, and per-request JSON serialization.
 Loop discipline (the load-bearing invariant): ``Engine.__init__`` creates and
 owns ``engine.loop``, and the TokenizerManager's handler task binds to it at
 the first await — so EVERY coroutine here must run on that loop (via
-:meth:`NativeBackend._run`), never on a fresh one (a fresh loop would work once
-and deadlock on the second call). Engine's own sync wrappers already run on
-``self.loop``. Corollary: concurrent ``run_until_complete`` on one loop raises,
-so every loop-DRIVING verb takes ``self._lock`` (``_run`` + the Engine sync
-verbs), which makes a threaded Worker (``worker_max_concurrency>1``) safe.
-``async_generate`` / ``abort`` coroutines run *on* the driven loop and do not lock.
+:meth:`NativeBackend.run_session`), never on a fresh one (a fresh loop would
+work once and deadlock on the second call). The backend-owned session runner
+serializes loop-driving calls, while active-session controls are scheduled onto
+the driven loop from a concurrent Worker thread.
 
 Verb routing: public ``Engine`` methods where the seam signatures match
 (memory, NCCL group, distributed update); the two verbs whose seam payloads
@@ -39,13 +37,15 @@ import dataclasses
 import logging
 import multiprocessing
 import os
-import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, TypeVar
 
+from unirl.rollout.engine.runtime import CoroutineFactory
+from unirl.rollout.engine.sglang.backends.base import SessionRunner
 from unirl.rollout.engine.sglang.backends.http import parse_generate_response
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 # ---------------------------------------------------------------------------
@@ -128,14 +128,13 @@ class NativeBackend:
         self._concurrency = int(concurrency)
         self._rt = runtime
         self._logged_first_response = False
-        # Serializes every call that DRIVES engine.loop (run_until_complete + the
-        # Engine sync verbs) so a threaded Worker (worker_max_concurrency>1) cannot
-        # drive the one loop from two threads at once. ``async_generate`` / abort
-        # coroutines run *on* the driven loop and do NOT take it.
-        self._lock = threading.Lock()
+        # The backend owns the one session runner for engine.loop. It serializes
+        # loop-driving calls and admits control coroutines only while a session is
+        # active, so the rollout engine never handles a raw event loop.
+        self._session = SessionRunner(engine.loop, label="sglang NativeBackend")
         # One semaphore bounding concurrent in-flight requests across ALL groups of
         # a generate (3.12 binds it to engine.loop on first use). Hoisted out of
-        # ``_generate_async`` so the per-group fan-out shares a single bound.
+        # ``agenerate`` so every whole-Sample call shares a single bound.
         self._sem = asyncio.Semaphore(int(concurrency))
 
     # ------------------------------------------------------------------ #
@@ -212,18 +211,13 @@ class NativeBackend:
         return cls(engine, concurrency=concurrency, runtime=rt)
 
     # ------------------------------------------------------------------ #
-    # The single loop seam — every coroutine runs on engine.loop
+    # The single session seam — every coroutine runs on engine.loop
     # ------------------------------------------------------------------ #
 
-    @property
-    def loop(self) -> Any:
-        """The engine's asyncio loop (the rollout engine adopts it as ``self._loop``)."""
-        return self._engine.loop
-
-    def _run(self, coro: Any) -> Any:
-        # Serialize loop-driving: two concurrent run_until_complete on one loop raises.
-        with self._lock:
-            return self._engine.loop.run_until_complete(coro)
+    def run_session(self, operation: CoroutineFactory[T]) -> T:
+        """Drive one factory-created operation on the SGLang Engine's loop."""
+        self._require_alive("run async session")
+        return self._session.run(operation)
 
     # ------------------------------------------------------------------ #
     # Generation — per-payload fan-out on engine.loop (no retry; see module
@@ -234,7 +228,7 @@ class NativeBackend:
         """Fan the per-prompt payloads out on engine.loop; flatten prompt-major."""
         self._require_alive("generate")
         t0 = time.perf_counter()
-        results = self._run(self._generate_async(requests))
+        results = self.run_session(lambda: self.agenerate(requests))
         elapsed = time.perf_counter() - t0
         logger.info(
             "sglang NativeBackend.generate: %d requests -> %d results in %.2fs",
@@ -265,15 +259,25 @@ class NativeBackend:
             )
         return parsed
 
-    async def _generate_async(self, requests: List[Dict[str, Any]]) -> List[Any]:
+    async def agenerate(self, requests: List[Dict[str, Any]]) -> List[Any]:
+        """Fan ready payloads out asynchronously; flatten prompt-major."""
+        self._require_alive("generate")
+        self._session.assert_active_loop()
         nested = await asyncio.gather(*(self.generate_one(p) for p in requests))
         return [item for sublist in nested for item in sublist]
 
     # ------------------------------------------------------------------ #
-    # Abort / pause — control-plane coroutines. The rollout engine schedules
-    # these onto the driven engine.loop via ``run_coroutine_threadsafe``, so
-    # they ride the loop a generate is driving and take NO lock.
+    # Abort / pause — best-effort controls admitted by the active session.
     # ------------------------------------------------------------------ #
+
+    def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
+        self._session.run_control(lambda: self.aabort(abort_all=abort_all, rid=rid))
+
+    def pause(self) -> None:
+        self._session.run_control(self.apause)
+
+    def resume(self) -> None:
+        self._session.run_control(self.aresume)
 
     async def aabort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
         """Abort in-flight generation (best-effort across sglang versions)."""
@@ -347,22 +351,32 @@ class NativeBackend:
         the KV pool.
         """
         self._require_alive("flush cache")
-        last: Any = None
-        for _ in range(60):
-            last = self._engine.flush_cache()
-            if getattr(last, "success", True):
-                return
-            time.sleep(1.0)
-        raise TimeoutError(f"sglang NativeBackend: flush_cache did not succeed after 60 attempts (last result: {last})")
+
+        def _flush() -> None:
+            last: Any = None
+            for _ in range(60):
+                last = self._engine.flush_cache()
+                if getattr(last, "success", True):
+                    return
+                time.sleep(1.0)
+            raise TimeoutError(
+                f"sglang NativeBackend: flush_cache did not succeed after 60 attempts (last result: {last})"
+            )
+
+        self._session.run_sync(_flush)
 
     def release_memory(self, *, tags: Optional[Sequence[str]] = None) -> None:
         self._require_alive("release memory")
-        result = self._engine.release_memory_occupation(tags=list(tags) if tags is not None else None)
+        result = self._session.run_sync(
+            lambda: self._engine.release_memory_occupation(tags=list(tags) if tags is not None else None)
+        )
         self._check_result(result, "release_memory")
 
     def resume_memory(self, *, tags: Optional[Sequence[str]] = None) -> None:
         self._require_alive("resume memory")
-        result = self._engine.resume_memory_occupation(tags=list(tags) if tags is not None else None)
+        result = self._session.run_sync(
+            lambda: self._engine.resume_memory_occupation(tags=list(tags) if tags is not None else None)
+        )
         self._check_result(result, "resume_memory")
 
     def ping(self) -> bool:
@@ -390,11 +404,16 @@ class NativeBackend:
         Engine registers its own atexit shutdown and the rollout engine's
         ``__del__`` re-enters ours — the None-swap makes our side idempotent.
         """
-        if self._engine is None:
+        engine = self._engine
+        if engine is None:
             return
-        engine, self._engine = self._engine, None
-        logger.info("Shutting down in-process SGLang Engine")
-        engine.shutdown()
+
+        def _shutdown() -> None:
+            self._engine = None
+            logger.info("Shutting down in-process SGLang Engine")
+            engine.shutdown()
+
+        self._session.close(finalizer=_shutdown)
 
     # ------------------------------------------------------------------ #
     # Weight-sync verbs — public Engine methods where signatures match;
@@ -421,7 +440,7 @@ class NativeBackend:
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        result = self._run(self._engine.tokenizer_manager.update_weights_from_tensor(obj, None))
+        result = self.run_session(lambda: self._engine.tokenizer_manager.update_weights_from_tensor(obj, None))
         self._check_result(result, "update_from_tensor")
 
     def init_weights_group(
@@ -435,13 +454,15 @@ class NativeBackend:
         backend: str,
     ) -> None:
         self._require_alive("init_weights_group")
-        result = self._engine.init_weights_update_group(
-            master_address=master_address,
-            master_port=int(master_port),
-            rank_offset=int(rank_offset),
-            world_size=int(world_size),
-            group_name=str(group_name),
-            backend=str(backend),
+        result = self._session.run_sync(
+            lambda: self._engine.init_weights_update_group(
+                master_address=master_address,
+                master_port=int(master_port),
+                rank_offset=int(rank_offset),
+                world_size=int(world_size),
+                group_name=str(group_name),
+                backend=str(backend),
+            )
         )
         self._check_result(result, "init_weights_group")
         logger.info(
@@ -469,18 +490,20 @@ class NativeBackend:
             flush_cache,
         )
         self._require_alive("update_from_distributed")
-        result = self._engine.update_weights_from_distributed(
-            names=list(names),
-            dtypes=list(dtypes),
-            shapes=[list(s) for s in shapes],
-            group_name=str(group_name),
-            flush_cache=flush_cache,
+        result = self._session.run_sync(
+            lambda: self._engine.update_weights_from_distributed(
+                names=list(names),
+                dtypes=list(dtypes),
+                shapes=[list(s) for s in shapes],
+                group_name=str(group_name),
+                flush_cache=flush_cache,
+            )
         )
         self._check_result(result, "update_from_distributed")
 
     def destroy_weights_group(self, *, group_name: str) -> None:
         self._require_alive("destroy_weights_group")
-        result = self._engine.destroy_weights_update_group(group_name=str(group_name))
+        result = self._session.run_sync(lambda: self._engine.destroy_weights_update_group(group_name=str(group_name)))
         self._check_result(result, "destroy_weights_group")
 
     def set_lora(
@@ -504,7 +527,7 @@ class NativeBackend:
             config_dict=dict(config_dict or {}),
             serialized_tensors=serialized,
         )
-        result = self._run(self._engine.tokenizer_manager.load_lora_adapter_from_tensors(obj, None))
+        result = self.run_session(lambda: self._engine.tokenizer_manager.load_lora_adapter_from_tensors(obj, None))
         self._check_result(result, "set_lora")
 
 

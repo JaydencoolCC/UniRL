@@ -19,13 +19,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+import threading
+from typing import Any, Dict, List, Optional, TypeVar
 
 import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
+from unirl.rollout.engine.runtime import CoroutineFactory, LocalAsyncRuntime
 from unirl.rollout.engine.sglang_diffusion.adapters import get_adapter
 from unirl.rollout.engine.sglang_diffusion.backends import SGLangBackend
 from unirl.rollout.engine.sglang_diffusion.config import (
@@ -39,6 +41,7 @@ from unirl.types.sample import Part, Sample
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
+_SessionResult = TypeVar("_SessionResult")
 
 #: Memory tags released on sleep / restored on wake.
 _OFFLOAD_TAGS = ("transformer", "vae", "text_encoder")
@@ -46,7 +49,7 @@ _OFFLOAD_TAGS = ("transformer", "vae", "text_encoder")
 _CPU_BACKUP_TAGS = ("vae", "text_encoder")
 
 
-class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
+class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
     """Rollout engine backed by ``sglang.multimodal_gen.DiffGenerator`` (v2 layout)."""
 
     _component_name = "sglang_diffusion"
@@ -118,46 +121,39 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         # σ schedule policy comes from the adapter (absorbs the generic-vs-factory branch).
         self.schedule_policy = self.adapter.schedule_policy()
 
-        # Async per-group path: the DiffGenerator backend is driven synchronously
-        # (no event loop, scheduler client not request-concurrent-safe) → a fresh
-        # on-demand loop plus a one-slot semaphore. The per-group ``agenerate``
-        # cores run sequentially in a worker thread, matching the v1 whole-batch
-        # forward. (3.12 binds the semaphore to the engine loop on first acquire.)
+        # The DiffGenerator backend is synchronous and its scheduler client is not
+        # request-concurrent-safe. One lock covers both public generation paths.
         self._weight_version = 0
-        self._init_async_loop()
-        self._sem = asyncio.Semaphore(1)
+        self._generate_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
+        self._shutdown_complete = False
+        self._runtime = LocalAsyncRuntime()
 
     # ------------------------------------------------------------------ #
-    # Generation — async per-group core (``generate`` façade inherited from base)
+    # Generation — native sync entrypoint + local async capability
     # ------------------------------------------------------------------ #
 
-    # ``generate`` (the sync DP_SCATTER batch façade) is inherited from
-    # BaseRolloutEngine; ``_agenerate_batch`` below overrides the base split→gather
-    # to keep the v1 whole-batch forward (see its note). The DiffGenerator backend
-    # is driven synchronously, so the per-group core runs in a worker thread under
-    # a one-slot semaphore — the scheduler client is not request-concurrent-safe.
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def generate(self, sample: Sample) -> Sample:
+        """Generate one whole DP shard synchronously."""
+        return self._generate_locked(sample)
+
     async def agenerate(self, sample: Sample) -> Sample:
-        """Run ONE prompt-group and return it with its gen Part filled.
+        """Generate one whole ``Sample`` without blocking the session loop."""
+        return await asyncio.to_thread(self._generate_locked, sample)
 
-        The per-group async core. Runs the synchronous ``_generate_core`` in a
-        worker thread (the DiffGenerator backend has no event loop) under the
-        one-slot semaphore, so a batch's groups generate sequentially —
-        byte-identical to the v1 whole-batch forward.
-        """
-        async with self._sem:
-            out = await asyncio.to_thread(self._generate_core, sample)
-        return self._stamp_weight_version(out)
+    def _generate_locked(self, sample: Sample) -> Sample:
+        with self._generate_lock:
+            if self._shutdown_requested:
+                raise RuntimeError("SGLangDiffusionRolloutEngine.generate called after shutdown")
+            return self._stamp_weight_version(self._generate_core(sample))
 
-    async def _agenerate_batch(self, sample: Sample) -> Sample:
-        # Sync/batch backend, not a streaming target: run the whole shard through
-        # one ``_generate_core`` (the v1 whole-batch path — GPU-efficient) rather
-        # than the base split→gather, which would do many small per-group forwards
-        # serialized under sem=1. ``agenerate`` stays the per-group unit the
-        # deferred streaming driver consumes.
-        return await self.agenerate(sample)
+    def run_session(self, factory: CoroutineFactory[_SessionResult]) -> _SessionResult:
+        return self._runtime.run(factory)
 
     def _generate_core(self, sample: Sample) -> Sample:
-        """Synchronous per-group generation (the former ``generate`` body)."""
+        """Synchronous generation for one whole ``Sample``."""
         gen = sample.parts[-1]
         require(
             int(gen.batch_size) > 0,
@@ -282,7 +278,20 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         return self._backend.ping()
 
     def shutdown(self) -> None:
-        self._backend.shutdown()
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            with self._generate_lock:
+                self._shutdown_requested = True
+            try:
+                self._runtime.close()
+            except BaseException:
+                with self._generate_lock:
+                    self._shutdown_requested = False
+                raise
+            with self._generate_lock:
+                self._backend.shutdown()
+            self._shutdown_complete = True
 
     # ------------------------------------------------------------------ #
     # Weight sync — frozen base.py surface; thin forwards to the component.

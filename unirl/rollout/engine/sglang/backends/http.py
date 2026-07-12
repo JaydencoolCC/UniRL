@@ -31,12 +31,14 @@ import logging
 import multiprocessing
 import os
 import signal
-import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar
+
+from unirl.rollout.engine.runtime import CoroutineFactory
+from unirl.rollout.engine.sglang.backends.base import SessionRunner
 
 try:
     import httpx
@@ -44,6 +46,7 @@ except ImportError:  # pragma: no cover - exercised only when httpx is missing
     httpx = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 # ---------------------------------------------------------------------------
@@ -219,18 +222,16 @@ class HTTPBackend:
         self._base_url = base_url
         self._concurrency = int(concurrency)
         self._rt = runtime
-        # Serializes loop-driving (run_until_complete) so a threaded Worker cannot
-        # drive _async_loop from two threads at once. abort/pause coroutines ride
-        # the driven loop via the engine's run_coroutine_threadsafe and don't lock.
-        self._lock = threading.Lock()
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._session: Optional[SessionRunner] = None
         self._client: Any = None
         # One shared semaphore bounding concurrent in-flight requests across all
-        # groups of a generate (hoisted out of ``_generate_async``).
+        # payloads of a whole-Sample generate (hoisted out of ``agenerate``).
         self._sem = asyncio.Semaphore(int(concurrency))
         if httpx is not None:
             self._async_loop = asyncio.new_event_loop()
-            self._client = self._run_async(self._make_client())
+            self._session = SessionRunner(self._async_loop, label="sglang HTTPBackend")
+            self._client = self.run_session(self._make_client)
         self._logged_first_response = False
 
     # ------------------------------------------------------------------ #
@@ -332,27 +333,18 @@ class HTTPBackend:
             trust_env=False,
         )
 
-    @property
-    def loop(self) -> Any:
-        """The HTTP client's asyncio loop (the rollout engine adopts it as ``self._loop``)."""
-        return self._async_loop
-
-    def _run_async(self, awaitable: Any) -> Any:
-        if self._async_loop is None or self._async_loop.is_closed():
-            close = getattr(awaitable, "close", None)
-            if close is not None:
-                close()
+    def run_session(self, operation: CoroutineFactory[T]) -> T:
+        """Drive one factory-created operation on the HTTP client's loop."""
+        if self._session is None:
             raise RuntimeError("sglang HTTPBackend async event loop is not available.")
-        # Serialize loop-driving: two concurrent run_until_complete on one loop raises.
-        with self._lock:
-            return self._async_loop.run_until_complete(awaitable)
+        return self._session.run(operation)
 
     def generate(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
         """POST the per-prompt payloads concurrently; flatten prompt-major."""
         if self._client is None:
             raise RuntimeError("httpx is required for sglang generate. Install httpx: pip install httpx")
         t0 = time.perf_counter()
-        results = self._run_async(self._generate_async(requests))
+        results = self.run_session(lambda: self.agenerate(requests))
         elapsed = time.perf_counter() - t0
         logger.info(
             "sglang HTTPBackend.generate: %d requests -> %d results in %.2fs",
@@ -379,14 +371,31 @@ class HTTPBackend:
             )
         return parsed
 
-    async def _generate_async(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
+    async def agenerate(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
+        """Fan ready payloads out asynchronously; flatten prompt-major."""
+        if self._client is None:
+            raise RuntimeError("httpx is required for sglang generate. Install httpx: pip install httpx")
+        if self._session is None:
+            raise RuntimeError("sglang HTTPBackend async event loop is not available.")
+        self._session.assert_active_loop()
         nested = await asyncio.gather(*(self.generate_one(p) for p in requests))
         return [item for sublist in nested for item in sublist]
 
     # ------------------------------------------------------------------ #
-    # Abort / pause — control-plane coroutines (best-effort). The rollout
-    # engine schedules these onto the driven loop via run_coroutine_threadsafe.
+    # Abort / pause — best-effort controls admitted by the active session.
     # ------------------------------------------------------------------ #
+
+    def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
+        if self._session is not None:
+            self._session.run_control(lambda: self.aabort(abort_all=abort_all, rid=rid))
+
+    def pause(self) -> None:
+        if self._session is not None:
+            self._session.run_control(self.apause)
+
+    def resume(self) -> None:
+        if self._session is not None:
+            self._session.run_control(self.aresume)
 
     async def aabort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
         payload: Dict[str, Any] = {"rid": rid} if rid is not None else {"abort_all": bool(abort_all)}
@@ -547,19 +556,33 @@ class HTTPBackend:
 
     def shutdown(self) -> None:
         """Kill the SRT server and close the HTTP client."""
-        if self._client is not None:
+        session = self._session
+        loop = self._async_loop
+        client = self._client
+        if session is not None:
+            finalized = False
+
+            def _close_loop() -> None:
+                nonlocal finalized
+                if loop is not None and not loop.is_closed():
+                    loop.close()
+                finalized = True
+
             try:
-                self._run_async(self._client.aclose())
+                session.close(
+                    async_cleanup=client.aclose if client is not None else None,
+                    finalizer=_close_loop,
+                )
             except Exception:
-                pass
-            self._client = None
-        if self._async_loop is not None:
-            try:
-                if not self._async_loop.is_closed():
-                    self._async_loop.close()
-            except Exception:
-                pass
-            self._async_loop = None
+                # Cleanup failure still runs the finalizer. A pre-lock rejection
+                # (for example shutdown from the owned loop) must remain visible.
+                if not finalized:
+                    raise
+        elif loop is not None and not loop.is_closed():
+            loop.close()
+        self._client = None
+        self._async_loop = None
+        self._session = None
         if self._server_process is not None:
             logger.info("Shutting down SGLang SRT server (pid=%s)", self._server_process.pid)
             kill_process_tree(self._server_process.pid)

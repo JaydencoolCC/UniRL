@@ -1,17 +1,17 @@
-"""Rollout engines that speak the ``Sample`` → ``Sample`` type.
+"""Rollout engines over the canonical ``Sample`` request type.
 
-The ABC at :mod:`unirl.rollout.engine.base` is the canonical one.
-The SGLang, sglang_diffusion, vllm-omni, and composed engines all implement it.
+The broad ABC includes coordinator engines; single-turn engines refine it with
+the ``Sample`` → ``Sample`` contract.
 """
 
 from typing import List, Optional
 
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine, BaseSingleTurnRolloutEngine
 from unirl.types.sample import Sample
 
 
 def chunked_engine_generate(
-    engine: BaseRolloutEngine,
+    engine: BaseSingleTurnRolloutEngine,
     sample: Sample,
     *,
     chunk_size: Optional[int],
@@ -53,4 +53,4 @@ def chunked_engine_generate(
     return Sample.concat(outputs)
 
 
-__all__ = ["BaseRolloutEngine", "chunked_engine_generate"]
+__all__ = ["BaseRolloutEngine", "BaseSingleTurnRolloutEngine", "chunked_engine_generate"]

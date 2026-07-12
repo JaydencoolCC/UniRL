@@ -1,15 +1,14 @@
-"""CPU-only fakes for exercising the async rollout-engine contract (LIN-499).
+"""CPU-only fakes for exercising native sync/async rollout contracts.
 
 No GPU, no sglang/vllm. ``FakeBackend`` mimics the native sglang ``Backend``
 shape (its own asyncio loop driven under a lock; one bounding ``Semaphore``
 hoisted across all groups; ``generate_one(payload) -> list`` plus the
 ``aabort``/``apause``/``aresume`` control coroutines), and
-``FakeEngine(BaseRolloutEngine)`` implements ``agenerate`` exactly like the real
+``FakeEngine(BaseSingleTurnRolloutEngine)`` implements both generation paths like the real
 ``SGLangRolloutEngine`` (build per-prompt wire -> ``gather(generate_one)`` ->
 flatten -> fill the frontier gen ``Part`` -> ``_stamp_weight_version``). That
-lets the tests exercise the *real* ``base.py`` surface — the inherited
-``generate`` façade's split -> ``gather(agenerate)`` -> concat round-trip, the
-shared-semaphore concurrency bound, and the ``abort``/``pause``/``resume`` +
+lets the tests exercise independent engine-owned sync and async paths, the shared
+semaphore concurrency bound, and the ``abort``/``pause``/``resume`` +
 weight-version control plane — without any real generation.
 
 To keep ``Sample``/``Part`` equality (dataclass ``__eq__``) usable in assertions,
@@ -25,11 +24,12 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
+from unirl.rollout.engine.sglang.backends.base import SessionRunner
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams
-
 
 # --------------------------------------------------------------------------- #
 # Deterministic "generation"
@@ -73,8 +73,7 @@ class FakeBackend:
 
     def __init__(self, *, concurrency: int, yields: int = 4) -> None:
         self._loop = asyncio.new_event_loop()
-        # Serializes loop driving (run_until_complete), like NativeBackend._lock.
-        self._lock = threading.Lock()
+        self._session = SessionRunner(self._loop, label="FakeBackend")
         # One bound across ALL groups of a generate (binds to self._loop on first
         # use), like NativeBackend._sem — the load-bearing "shared, not per-group".
         self._sem = asyncio.Semaphore(int(concurrency))
@@ -105,10 +104,9 @@ class FakeBackend:
     def loop(self) -> asyncio.AbstractEventLoop:
         return self._loop
 
-    def _run(self, coro: Any) -> Any:
-        # Two concurrent run_until_complete on one loop would raise; serialize.
-        with self._lock:
-            return self._loop.run_until_complete(coro)
+    def run_session(self, factory: Any) -> Any:
+        """Drive a caller-provided async session on the backend-owned loop."""
+        return self._session.run(factory)
 
     def _proceed_event(self) -> asyncio.Event:
         if self._proceed is None:
@@ -139,6 +137,13 @@ class FakeBackend:
                 self._inflight -= 1
         return [_raw_for(payload["text"], k) for k in range(n)]
 
+    async def agenerate(self, requests: List[Dict[str, Any]]) -> List[FakeRaw]:
+        nested = await asyncio.gather(*(self.generate_one(p) for p in requests))
+        return [item for sublist in nested for item in sublist]
+
+    def generate(self, requests: List[Dict[str, Any]]) -> List[FakeRaw]:
+        return self.run_session(lambda: self.agenerate(requests))
+
     # ---- control plane: coroutines the engine schedules onto the driven loop ----
     async def aabort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
         self.aborted = True
@@ -151,39 +156,56 @@ class FakeBackend:
     async def aresume(self) -> None:
         self.paused = False
 
+    def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
+        self._session.run_control(lambda: self.aabort(abort_all=abort_all, rid=rid))
+
+    def pause(self) -> None:
+        self._session.run_control(self.apause)
+
+    def resume(self) -> None:
+        self._session.run_control(self.aresume)
+
+    def shutdown(self) -> None:
+        self._session.close(finalizer=self._loop.close)
+
+    def __del__(self) -> None:
+        # Tests intentionally construct short-lived engines directly rather than
+        # through the worker lifecycle. Mirror the production backend teardown so
+        # forgotten explicit shutdowns do not leak selector sockets/event loops.
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
 
 # --------------------------------------------------------------------------- #
-# Fake engine — agenerate like the real SGLang engine; everything else inherited
+# Fake engine — independent sync and async paths like the real SGLang engine
 # --------------------------------------------------------------------------- #
 
 
-class FakeEngine(BaseRolloutEngine):
-    """Minimal ``BaseRolloutEngine`` over a ``FakeBackend``.
-
-    Adopts the backend loop (``_init_async_loop``), shares the backend's
-    loop-driving lock (override ``_run_coro`` like the real engine), implements
-    the async per-group ``agenerate``, and routes the control verbs through
-    ``_run_coro_threadsafe`` — the exact wiring in
-    ``sglang/engine.py``, minus real generation.
-    """
+class FakeEngine(BaseSingleTurnRolloutEngine):
+    """Minimal single-turn engine over a backend-owned async session."""
 
     def __init__(self, *, concurrency: int = 8, yields: int = 4) -> None:
         self._backend = FakeBackend(concurrency=concurrency, yields=yields)
         self._weight_version = 0
-        self._init_async_loop(self._backend.loop)
 
-    # Generation and the weight-sync verbs share the BACKEND's lock (one driver
-    # of the loop), exactly as SGLangRolloutEngine overrides it.
-    def _run_coro(self, coro: Any) -> Any:
-        return self._backend._run(coro)
+    def run_session(self, factory: Any) -> Any:
+        return self._backend.run_session(factory)
+
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def generate(self, sample: Sample) -> Sample:
+        """Native synchronous whole-Sample path through ``backend.generate``."""
+        wire, _ = self._build_inputs(sample)
+        raw = self._backend.generate(wire)
+        return self._stamp_weight_version(self._build_response(sample, raw))
 
     async def agenerate(self, sample: Sample) -> Sample:
         """Run ONE prompt-group: per-prompt wire -> gather(generate_one) ->
         flatten -> fill the frontier gen Part -> stamp. Mirrors the real engine,
         awaiting ``generate_one`` directly so all groups share the one semaphore."""
         wire, _ = self._build_inputs(sample)
-        nested = await asyncio.gather(*(self._backend.generate_one(p) for p in wire))
-        raw = [item for sublist in nested for item in sublist]
+        raw = await self._backend.agenerate(wire)
         out = self._build_response(sample, raw)
         return self._stamp_weight_version(out)
 
@@ -207,19 +229,17 @@ class FakeEngine(BaseRolloutEngine):
     # ---- control plane: sync verbs scheduled onto the driven loop ----
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         del ids
-        self._run_coro_threadsafe(self._backend.aabort(abort_all=True))
+        self._backend.abort(abort_all=True)
         return []
 
     def pause(self) -> None:
-        self._run_coro_threadsafe(self._backend.apause())
+        self._backend.pause()
 
     def resume(self) -> None:
-        self._run_coro_threadsafe(self._backend.aresume())
+        self._backend.resume()
 
     def shutdown(self) -> None:
-        loop = self._backend.loop
-        if not loop.is_closed():
-            loop.close()
+        self._backend.shutdown()
 
 
 # --------------------------------------------------------------------------- #
