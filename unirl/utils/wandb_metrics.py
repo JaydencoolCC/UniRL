@@ -115,7 +115,7 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
         metrics["num_samples"] = float(int(getattr(sample, "batch_size", 0)))
         return metrics
 
-    gen_parts = [p for p in parts if getattr(p, "sampling_params", None) is not None]
+    gen_parts = [p for p in parts if getattr(p, "is_gen", False)]
     # num_samples = the generated-sample count (frontier gen Part), restoring the
     # pre-migration resp.batch_size. sample.batch_size is the root prompt count P,
     # which under-reports by the fan-out factor (N for AR/diffusion, N*M for the
@@ -133,9 +133,9 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
             metrics.update(_tensor_stats(f"{prefix}reward", rewards_f))
             zero_cnt, group_cnt = _zero_std_group_counts_from_ids(
                 rewards_f,
-                # Bucket by the grouping the advantages were actually computed under
-                # (may be coarser than the immediate-parent group_ids, e.g. PE root scope).
-                getattr(part, "advantage_group_ids", None) or getattr(part, "group_ids", None),
+                # Buckets are sibling groups (immediate parent), regardless of the
+                # lineage layer the advantages were normalized at.
+                getattr(part, "group_ids", None),
             )
             if group_cnt > 0:
                 metrics[f"{prefix}zero_std_group_ratio"] = float(zero_cnt) / float(group_cnt)

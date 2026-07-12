@@ -327,16 +327,14 @@ class PETrainer(BaseTrainer):
         # 4. Per-Part GRPO advantages. "ar" groups by prompt (its N rewrites).
         #    "diffusion" groups by rewrite (M images) by default, or — when
         #    ``diffusion_group_scope="prompt"`` — by the ROOT prompt (all N*M
-        #    images of a prompt, via ``Sample.root_group_ids``) so cross-rewrite
-        #    quality becomes signal. Only the trained Parts need advantages; a
-        #    frozen LLM skips the AR one.
+        #    images of a prompt, ``group_layer=0``) so cross-rewrite quality
+        #    becomes signal. Only the trained Parts need advantages; a frozen
+        #    LLM skips the AR one.
         new_parts = list(sample.parts)
         for name in self._train_tracks:
             idx = parts_by_name[name]
-            if name == "diffusion" and self._diffusion_group_scope == "prompt":
-                new_parts[idx] = new_parts[idx].compute_advantages(normalize=True, group_ids=sample.root_group_ids(idx))
-            else:
-                new_parts[idx] = new_parts[idx].compute_advantages(normalize=True)
+            layer = 0 if (name == "diffusion" and self._diffusion_group_scope == "prompt") else None
+            new_parts[idx] = new_parts[idx].compute_advantages(normalize=True, group_layer=layer)
         sample = sample.with_parts(new_parts)
 
         # Captions for the image previews fall back to the frontier-aligned prompt

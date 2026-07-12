@@ -200,10 +200,10 @@ def check_cot_text_chain() -> None:
 
 
 def check_root_group_ids() -> None:
-    """``Sample.root_group_ids(i)`` climbs each sample of ``parts[i]`` to its root
-    prompt — coarser than ``Part.group_ids`` (immediate parent). The PE/unified
-    ``compute_track_advantages(group_key="root")`` replacement; the labels stay
-    group-by-parent contiguous for ``Part.compute_advantages(group_ids=...)``."""
+    """``Sample.root_group_ids(i)`` is the ``ancestor_id(sid, 0)`` projection (the
+    id's first segment) — coarser than ``Part.group_ids`` (immediate parent). The
+    labels stay group-by-parent contiguous, matching what
+    ``Part.compute_advantages(group_layer=0)`` groups by."""
     # P=2 prompts, N=2 AR children each, M=1 image each → [input, ar(4), image(4)].
     inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))
     ar = inp.fork(2, sampling_params=ARSamplingParams())
@@ -229,6 +229,8 @@ def check_gen_part_accessors() -> None:
 
     gps = sample.gen_parts()
     _check(len(gps) == 2 and gps[0] is ar and gps[1] is img, "gen_parts skips the input Part")
+    _check(ar.is_gen and img.is_gen and not inp.is_gen, "is_gen classifies gen shells vs the input head")
+    _expect_raises(lambda: inp.fork(1), TypeError, "fork without sampling_params must fail loud")
     _check(sample.gen_part(ARSamplingParams) is ar, "gen_part locates the AR stage by type")
     _check(sample.gen_part(DiffusionSamplingParams) is img, "gen_part locates the diffusion stage by type")
     _check(sample.gen_part_index(ARSamplingParams) == 1, "gen_part_index: AR at position 1")
@@ -293,22 +295,42 @@ def check_unified_dit_noise_ids_unique() -> None:
     _check(len(old) != len(set(old)), "sanity: the old replica-local d{k} scheme DOES collide")
 
 
-def check_advantage_group_ids_recorded() -> None:
-    """``Part.compute_advantages`` records the grouping it used (``advantage_group_ids``)
-    so zero-std metrics bucket by the actual GRPO baseline — including a coarser
-    root-prompt override (PE ``diffusion_group_scope='prompt'``)."""
+def check_group_layer_advantages() -> None:
+    """``Part.compute_advantages``: ``scope`` picks the normalization mode
+    (``"global"`` = batch z-score with unbiased std — the historical convention);
+    under ``scope="group"``, ``group_layer`` selects the lineage layer whose
+    ancestor id labels the GRPO groups: ``None`` (default) = immediate parent,
+    ``0`` = root prompt (PE ``diffusion_group_scope='prompt'``)."""
     inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
     ar = inp.fork(2, sampling_params=ARSamplingParams())
     img = ar.fork(2, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
-    sample = Sample(parts=[inp, ar, img])
-    image = _part_with_field(sample.parts[2], "rewards", torch.arange(8, dtype=torch.float32))  # 8 = P*N*M
+    image = _part_with_field(img, "rewards", torch.arange(8, dtype=torch.float32))  # 8 = P*N*M
+
+    def _norm(r: torch.Tensor) -> torch.Tensor:  # per-group GRPO z-score, population std
+        return (r - r.mean()) / (r.var(unbiased=False) + 1e-8).sqrt()
+
+    rewards = image.rewards
+    a_root = image.compute_advantages(normalize=True, group_layer=0)
+    expected_root = torch.cat([_norm(rewards[:4]), _norm(rewards[4:])])  # {p0: rows 0-3, p1: rows 4-7}
+    _check(torch.allclose(a_root.advantages, expected_root), "group_layer=0 normalizes per ROOT prompt")
 
     a_def = image.compute_advantages(normalize=True)
-    _check(a_def.advantage_group_ids == list(image.group_ids), "records the immediate-parent grouping by default")
-    root = sample.root_group_ids(2)
-    a_root = image.compute_advantages(normalize=True, group_ids=root)
-    _check(a_root.advantage_group_ids == root, "records the root-scope override grouping")
-    _check(a_root.advantage_group_ids != list(image.group_ids), "root grouping is coarser than immediate group_ids")
+    expected_parent = torch.cat([_norm(rewards[i : i + 2]) for i in range(0, 8, 2)])  # one group per rewrite
+    _check(torch.allclose(a_def.advantages, expected_parent), "default group_layer normalizes per immediate parent")
+    _check(not torch.allclose(a_def.advantages, a_root.advantages), "root layer is coarser than the parent default")
+
+    a_global = image.compute_advantages(normalize=True, scope="global")
+    expected_global = (rewards - rewards.mean()) / (rewards.std() + 1e-8)  # unbiased std — historical parity
+    _check(torch.allclose(a_global.advantages, expected_global), "scope='global' batch z-scores with unbiased std")
+
+    _expect_raises(
+        lambda: image.compute_advantages(group_layer=5), ValueError, "out-of-range group_layer must raise"
+    )
+    _expect_raises(
+        lambda: image.compute_advantages(group_layer=-1),
+        ValueError,
+        "negative group_layer must raise (global is scope='global')",
+    )
 
 
 def check_rollout_metric_naming() -> None:
@@ -419,7 +441,7 @@ _CHECKS: Tuple[Callable[[], None], ...] = (
     check_gen_part_accessors,
     check_sample_dp_chunk,
     check_unified_dit_noise_ids_unique,
-    check_advantage_group_ids_recorded,
+    check_group_layer_advantages,
     check_rollout_metric_naming,
     check_disable_driver_xt_flag,
     check_noise_recipe_from_sample,

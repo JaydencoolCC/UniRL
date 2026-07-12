@@ -44,8 +44,19 @@ def child_id(pid: str, j: int) -> str:
     return f"{pid}/{j}"
 
 
+def ancestor_id(sid: str, depth: int) -> str:
+    """Id of the ancestor at lineage depth ``depth`` — the id's first
+    ``depth + 1`` segments (``0`` = root; a sample's own depth returns the id
+    itself). Fail-loud when ``depth`` is negative or exceeds the sample's depth."""
+    segs = sid.split("/")
+    if depth < 0 or depth >= len(segs):
+        raise ValueError(f"ancestor_id: depth {depth} out of range for id {sid!r} (depth {len(segs) - 1})")
+    return "/".join(segs[: depth + 1])
+
+
 __all__ = [
     "parent_id",
     "branch_of",
     "child_id",
+    "ancestor_id",
 ]
