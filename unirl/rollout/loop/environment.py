@@ -22,25 +22,19 @@ class Environment(Protocol):
         """Consume the latest action; return ``(observation, done, info)``.
 
         ``observation is None`` appends nothing this turn; ``done`` ends the episode.
+        Must be re-entrant/thread-safe: one env instance serves many concurrent
+        trajectories on a worker (the agentic drain calls it from one thread per
+        trajectory), so per-trajectory state is derived from the sample, not
+        held on the instance — or is lock-guarded.
         """
         ...
 
-    async def astep(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
-        """Async :meth:`step` — the non-blocking tool boundary (LIN-522).
-
-        Runs genuinely blocking tool I/O off the event loop (e.g. via
-        ``loop.run_in_executor``) so a slow tool yields the worker's shared loop to
-        sibling trajectories instead of stalling them. Must be re-entrant: one env
-        instance serves many concurrent trajectories on a worker.
-        """
-        ...
-
-    async def aclose(self, sample: Sample) -> None:
+    def close(self, sample: Sample) -> None:
         """Optional guaranteed teardown (LIN-533), called from the engine's ``finally`` on every
-        path — success, crash, and abort. The engine invokes it via ``getattr(env, "aclose", None)``,
+        path — success, crash, and abort. The engine invokes it via ``getattr(env, "close", None)``,
         so an env holding no per-trajectory resource need not implement it (default: no-op). Stateful
         envs use it to release handles exactly once — tool sessions
-        (:meth:`~unirl.rollout.loop.tool_environment.ToolEnvironment.aclose`) or ALFWorld episodes/
+        (:meth:`~unirl.rollout.loop.tool_environment.ToolEnvironment.close`) or ALFWorld episodes/
         pooled templates. Must be idempotent and **must not raise**.
         """
         ...

@@ -3,13 +3,11 @@
 The ALFWorld backend is lazy (``_ensure_backend``) and the per-episode env factory
 (``_open_episode``) is isolated, so we inject a mock TextWorld env and exercise the
 real protocol: reset builds the ReAct prompt + mints an episode id in the control bag,
-astep parses the action + steps the sim + emits reward-on-done, and concurrent
+step parses the action + steps the sim + emits reward-on-done, and concurrent
 trajectories (even siblings with the SAME sample id) get isolated episodes.
 """
 
 from __future__ import annotations
-
-import asyncio
 
 import pytest
 
@@ -124,18 +122,18 @@ def test_same_sample_id_siblings_isolated(monkeypatch):
     assert not done_b and obs_b is not None
 
 
-def test_aclose_reclaims_episode_and_template(monkeypatch):
+def test_close_reclaims_episode_and_template(monkeypatch):
     """Leak regression (LIN-533): a trajectory that dies IN THE ENGINE never reaches ``step``'s
     done-path, so its episode stays in ``_episodes`` and its pooled template stays checked out.
-    The engine's ``finally`` hook (``aclose``) reclaims both — idempotently."""
+    The engine's ``finally`` hook (``close``) reclaims both — idempotently."""
     env = _env(monkeypatch)
     template = object()  # a sentinel pooled template to prove it returns to _free
     monkeypatch.setattr(env, "_open_episode", lambda gi: (_FakeTW("win"), template))
     s = env.reset(_request("r0:g0", 0))
     assert len(env._episodes) == 1 and env._free == []  # leased, not yet released
 
-    asyncio.run(env.aclose(s))
+    env.close(s)
     assert env._episodes == {} and env._free == [template]  # episode popped, template pooled
 
-    asyncio.run(env.aclose(s))  # idempotent: no double-release, no error
+    env.close(s)  # idempotent: no double-release, no error
     assert env._episodes == {} and env._free == [template]

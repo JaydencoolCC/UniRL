@@ -15,7 +15,6 @@ schemas for the prompt come from :meth:`ToolEnvironment.tool_schemas`.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -202,15 +201,6 @@ class ToolEnvironment:
         observation = Texts(texts=[r if r is not None else "" for r in results])
         return observation, False, info
 
-    async def astep(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
-        """Async :meth:`step` (LIN-522): run the synchronous tool dispatch in the
-        event loop's default executor so a genuinely blocking tool yields the
-        worker's shared loop to sibling trajectories. Safe to call concurrently —
-        :meth:`step` is stateless (turn derived from the sample), and tools must be
-        thread-safe (the calculator is a pure function)."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.step, sample)
-
     def _run(self, call: Dict[str, Any], sessions: Dict[str, str]) -> str:
         """Dispatch one parsed call to its tool; surface any failure to the model as text.
 
@@ -232,21 +222,20 @@ class ToolEnvironment:
         except Exception as exc:  # noqa: BLE001 — tool errors are fed back to the model, not raised
             return f"Error: {exc}"
 
-    async def aclose(self, sample: Sample) -> None:
+    def close(self, sample: Sample) -> None:
         """Guaranteed teardown (LIN-533): end every open tool session for this trajectory.
 
         The engine calls this from ``_run_one``'s ``finally`` on every path — success, crash, and
-        abort. Runs the (possibly blocking) ``session_end`` calls in the loop's executor, same as
-        :meth:`astep`, and swallows per-session errors so teardown can never destabilize the drain
-        loop (``_run_one`` must not raise). A no-op for stateless tools / sessionless trajectories.
+        abort — on the trajectory's own drain thread. Swallows per-session errors so teardown can
+        never destabilize the drain (``_run_one`` must not raise). A no-op for stateless tools /
+        sessionless trajectories.
         """
         if not self._stateful_tools:
             return
         sessions = (sample.parts[0].control or {}).get("tool_sessions", {}) if sample.parts else {}
         if not sessions:
             return
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._end_sessions, sessions)
+        self._end_sessions(sessions)
 
     def _end_sessions(self, sessions: Dict[str, str]) -> None:
         """Run ``session_end`` for each open session; swallow + log failures (idempotent)."""

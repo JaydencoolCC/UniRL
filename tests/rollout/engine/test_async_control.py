@@ -1,16 +1,16 @@
-"""Control-plane + provenance tests for engine-owned async sessions.
+"""Control-plane + provenance tests for the sync engine under threads.
 
 The control verbs (``abort``/``pause``/``resume``) are sync methods reached via
-the raw ``Worker.call`` RPC on a *different* thread than the in-flight
-``generate``; the backend-owned session schedules control work onto its active loop. Weight-version
-provenance is stamped onto the frontier gen ``Part`` by ``_stamp_weight_version``
-(bumped per weight sync). Streaming is the consumer composing ``agenerate``
-coroutines as-completed (the deferred driver), overlapping a finished group's
-scoring with the others' generation. These exercise all three, CPU-only against a
-fake backend.
+the raw ``Worker.call`` RPC on a *different* thread than an in-flight
+``generate`` (the ``worker_max_concurrency>1`` overlap) — they must interleave
+with it, and ``abort`` must release parked requests so partials return.
+Weight-version provenance is stamped onto the frontier gen ``Part`` by
+``_stamp_weight_version`` (bumped per weight sync). Continuous batching is the
+load-bearing property the sync rewrite must not lose: two concurrent callers'
+requests stay in flight together, and a fast caller returns while a slow one
+is still generating. All CPU-only against a fake backend.
 """
 
-import asyncio
 import threading
 
 import pytest
@@ -27,38 +27,11 @@ from unirl.types.sampling import ARSamplingParams  # noqa: E402
 # --------------------------------------------------------------------------- #
 
 
-def test_abort_sets_flag_and_inflight_groups_still_complete():
-    """A driver coroutine sharing the loop with two in-flight agenerates triggers
-    aabort; the abort flag is set and both groups still return filled (partials)."""
-    engine = FakeEngine(concurrency=8)
-    engine._backend.block_until_released = True  # park generate_one until released
-    g0, g1 = build_request_batch(P=2, n=2).split()
-
-    async def scenario():
-        async def driver():
-            # Let g0/g1 reach their in-flight wait, then abort to release them.
-            for _ in range(8):
-                await asyncio.sleep(0)
-            await engine._backend.aabort(abort_all=True)
-
-        return await asyncio.gather(engine.agenerate(g0), engine.agenerate(g1), driver())
-
-    r0, r1, _ = engine.run_session(scenario)
-
-    assert engine._backend.aborted is True
-    # Both groups completed despite the abort (best-effort cancel returns partials).
-    assert r0.parts[-1].primitive is not None and len(r0.parts[-1].primitive.texts) == 2
-    assert r1.parts[-1].primitive is not None and len(r1.parts[-1].primitive.texts) == 2
-
-    engine.shutdown()
-
-
-def test_control_verbs_scheduled_threadsafe_while_generate_drives_loop():
-    """The worker_max_concurrency>1 overlap: a control RPC interleaves with an
-    in-flight generate. While generate drives the loop on one (worker) thread,
-    pause/resume/abort called from a second thread schedule their backend coroutine
-    onto that running loop without taking the session-driving lock — flags flip
-    and the parked generate is released."""
+def test_controls_interleave_with_inflight_generate_and_abort_releases():
+    """The worker_max_concurrency>1 overlap: while one (worker) thread is parked
+    inside ``generate``, pause/resume/abort from a second thread reach the
+    backend — flags flip, and ``abort`` releases the parked request so the
+    generate completes (the best-effort-cancel-returns-partials path)."""
     engine = FakeEngine(concurrency=8)
     engine._backend.block_until_released = True
     batch = build_request_batch(P=1, n=2)
@@ -66,21 +39,20 @@ def test_control_verbs_scheduled_threadsafe_while_generate_drives_loop():
     result: dict = {}
 
     def drive():
-        result["out"] = engine.generate(batch)  # drives the loop; parks in generate_one
+        result["out"] = engine.generate(batch)  # parks in the backend hold-gate
 
     worker = threading.Thread(target=drive)
     worker.start()
     try:
-        # Wait until the loop is actually driving a generate_one body.
+        # Wait until a request body is actually in flight.
         assert engine._backend.entered.wait(timeout=5.0)
 
-        # pause()/resume() ride run_coroutine_threadsafe onto the running loop.
         engine.pause()
         assert engine._backend.paused is True
         engine.resume()
         assert engine._backend.paused is False
 
-        # abort() schedules aabort, which releases the parked generate_one.
+        # abort() flips the flag AND releases the parked request.
         engine.abort()
         assert engine._backend.aborted is True
     finally:
@@ -94,57 +66,61 @@ def test_control_verbs_scheduled_threadsafe_while_generate_drives_loop():
     engine.shutdown()
 
 
-def test_control_verbs_noop_when_loop_idle():
-    """Control coroutine factories are never constructed while the session is idle."""
+def test_controls_reach_backend_when_idle():
+    """Sync controls always reach the backend — with nothing in flight they are
+    harmless (the server-side no-op), never an error. (Contract change from the
+    session-scoped loop, where idle controls were dropped engine-side.)"""
     engine = FakeEngine(concurrency=8)
 
     engine.pause()
+    assert engine._backend.paused is True
     engine.resume()
-    assert engine.abort() == []
-    # No coroutine ran, so the backend flags are untouched.
     assert engine._backend.paused is False
-    assert engine._backend.aborted is False
+    assert engine.abort() == []
+    assert engine._backend.aborted is True
 
     engine.shutdown()
 
 
 # --------------------------------------------------------------------------- #
-# streaming — the deferred driver consumes agenerate as-completed (overlap)
+# continuous batching — concurrent callers overlap; fast finishes first
 # --------------------------------------------------------------------------- #
 
 
-def test_streaming_consumes_agenerate_as_completed_with_score_overlap():
-    """The streaming contract (base.py): a consumer composes per-group agenerate
-    coroutines and processes each as it completes (asyncio.as_completed), so a
-    finished group is scored while the others are still generating."""
+def test_concurrent_callers_overlap_and_finish_by_speed():
+    """The continuous-batching regression the thread rewrite must not lose: two
+    ``generate`` callers on two threads are in flight TOGETHER (peak == 2), and
+    the fast one returns while the slow one is still generating (completion
+    order ≠ submission order)."""
     engine = FakeEngine(concurrency=8)
-    batch = build_request_batch(P=3, n=2)
-    prompts = list(batch.parts[0].primitive.texts)  # prompt-0, prompt-1, prompt-2
-    groups = batch.split()
+    batch = build_request_batch(P=2, n=1)
+    slow_group, fast_group = batch.split()
+    prompts = list(batch.parts[0].primitive.texts)
+    engine._backend.delay_for = {prompts[0]: 0.25, prompts[1]: 0.0}  # slow first prompt
 
-    # Stagger completion: group 0 is submitted first but finishes LAST, so
-    # as_completed must yield by completion time (streaming), not submission order.
-    engine._backend.delay_for = {prompts[0]: 16, prompts[1]: 8, prompts[2]: 0}
+    finished: list = []
+    lock = threading.Lock()
 
-    scored = []  # the prompt of each group, in the order it was scored
-    inflight_at_first_score = []
+    def run(group, tag):
+        engine.generate(group)
+        with lock:
+            finished.append(tag)
 
-    async def consume():
-        tasks = [asyncio.ensure_future(engine.agenerate(g)) for g in groups]
-        for fut in asyncio.as_completed(tasks):
-            result = await fut
-            if not scored:  # first group finished — the rest are still generating
-                inflight_at_first_score.append(engine._backend._inflight)
-            await asyncio.sleep(0)  # a trivial async "score" step over the finished group
-            scored.append(result.parts[0].primitive.texts[0])
+    slow = threading.Thread(target=run, args=(slow_group, "slow"))
+    fast = threading.Thread(target=run, args=(fast_group, "fast"))
+    slow.start()
+    # Ensure the slow request is in flight before submitting the fast one, so
+    # "fast finished first" can only come from genuine overlap.
+    assert engine._backend.entered.wait(timeout=5.0)
+    fast.start()
+    fast.join(timeout=5.0)
+    with lock:
+        first_done = list(finished)
+    slow.join(timeout=5.0)
 
-    engine.run_session(consume)
-
-    # Consumed in completion order (fast group first), NOT submission order.
-    assert scored == [prompts[2], prompts[1], prompts[0]]
-    assert set(scored) == set(prompts)  # every group streamed through exactly once
-    assert inflight_at_first_score[0] >= 1  # scored while other groups were generating
-    assert engine._backend.peak == 3  # all three generations overlapped in flight
+    assert first_done == ["fast"]  # fast returned while slow was still in flight
+    assert finished == ["fast", "slow"]
+    assert engine._backend.peak == 2  # both were in flight together
 
     engine.shutdown()
 

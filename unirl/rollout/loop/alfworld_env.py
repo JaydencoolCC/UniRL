@@ -7,7 +7,7 @@ observation, ending with a binary task-success reward. Unlike the stateless
 :class:`~unirl.rollout.loop.tool_environment.ToolEnvironment`, each trajectory is its
 own **episode with evolving state** and the **reward comes from the simulator**.
 
-Fits the engine's ``reset(sample)->Sample`` / ``astep(sample)->(obs, done, info)``
+Fits the engine's ``reset(sample)->Sample`` / ``step(sample)->(obs, done, info)``
 protocol (:class:`~unirl.rollout.engine.agentic.engine.AgenticRolloutEngine`), which
 builds one env per worker and requires re-entrancy across concurrent trajectories.
 Re-entrancy here means **per-episode state keyed by a unique id** minted in
@@ -25,7 +25,6 @@ checked out to one episode at a time (the engine caps concurrency), then release
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
@@ -154,8 +153,8 @@ class AlfworldEnv:
         self._step_penalty = float(step_penalty)
         self._max_obs_chars = int(max_obs_chars)
         # Per-trajectory episodes keyed by the id minted in reset() (carried in the
-        # Sample's root control bag). Guarded: reset runs on the loop thread, astep in
-        # an executor thread.
+        # Sample's root control bag). Guarded: concurrent trajectory threads reset/
+        # step their own episodes against this shared store.
         self._episodes: Dict[str, _Episode] = {}
         self._lock = threading.Lock()
         self._counter = 0
@@ -170,9 +169,9 @@ class AlfworldEnv:
     # ALFWorld backend — lazy + isolated so tests can inject a mock episode.
     # ------------------------------------------------------------------
     def _ensure_backend(self) -> None:
-        # Double-checked lock: with async reset, concurrent executor threads all reach
-        # here on the first rollout; only ONE may run the setup (it mutates sys.argv
-        # around load_config(), which is not thread-safe).
+        # Double-checked lock: concurrent trajectory threads all reach here on the
+        # first rollout; only ONE may run the setup (it mutates sys.argv around
+        # load_config(), which is not thread-safe).
         if self._ready:
             return
         with self._lock:
@@ -263,12 +262,6 @@ class AlfworldEnv:
         )
         return Sample.request(new_root)
 
-    async def astep(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
-        """Async :meth:`step`: run the blocking simulator in the loop's executor so a
-        slow env yields the worker's shared loop to sibling trajectories."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.step, sample)
-
     def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
         """Apply the frontier action to this trajectory's episode; return
         ``(observation, done, info)`` with the (cumulative) env return in
@@ -308,20 +301,19 @@ class AlfworldEnv:
         observation = Texts(texts=[self._format(obs, infos, first=False)])
         return observation, False, {"reward": ep.reward}
 
-    async def aclose(self, sample: Sample) -> None:
+    def close(self, sample: Sample) -> None:
         """Guaranteed teardown (LIN-533): reclaim this trajectory's episode + pooled template.
 
         ``step`` already pops + releases on clean ``done`` (and pops-without-reusing on a game
         error), so this only does work for a trajectory that died **in the engine** between turns —
         closing the leak that would otherwise grow ``self._episodes`` and starve the ``_free``
-        template pool. Idempotent (a no-op once the episode is gone, so no double-release); runs the
-        release in the executor, off the shared loop, same as :meth:`astep`.
+        template pool. Idempotent (a no-op once the episode is gone, so no double-release); runs
+        on the trajectory's own drain thread.
         """
         eid = self._episode_id(sample)
         if eid is None:
             return
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._teardown_episode, eid)
+        self._teardown_episode(eid)
 
     def _teardown_episode(self, eid: str) -> None:
         with self._lock:

@@ -1,10 +1,13 @@
-"""Contract/parity tests for independent sync/async rollout paths.
+"""Contract tests for the sync generation path under concurrent callers.
 
-Concrete ``generate`` and ``agenerate`` implementations must preserve the same
-whole-Sample semantics without either path calling the other. These exercise parity, the
-per-prompt wire order the backend sees, the shared-semaphore concurrency bound,
-and ``Sample`` split/concat identity — all CPU-only against a fake backend.
+``generate`` is the ONE generation interface (LIN-522 → sync-only contract): it
+must fill the whole Sample in group-by-parent order, hand the backend the
+per-prompt wire in batch order, and hold one SHARED concurrency bound across
+groups AND across concurrent caller threads (the agentic drain calls it from
+one thread per trajectory). All CPU-only against a fake backend.
 """
+
+import threading
 
 import pytest
 
@@ -18,8 +21,8 @@ from tests.rollout.engine._fakes import (  # noqa: E402
 from unirl.types.sample import Sample  # noqa: E402
 
 
-def test_native_sync_and_async_paths_match_in_group_by_parent_order():
-    """Both native paths fill every P*n row in group-by-parent order."""
+def test_generate_fills_group_by_parent_order():
+    """The sync path fills every P*n row in group-by-parent order."""
     P, n = 3, 2
     engine = FakeEngine(concurrency=8)
     batch = build_request_batch(P=P, n=n)
@@ -31,48 +34,16 @@ def test_native_sync_and_async_paths_match_in_group_by_parent_order():
     assert gen.primitive is not None
     assert len(gen.primitive.texts) == P * n
 
-    # Independent async reference over the same whole Sample.
-    ref_engine = FakeEngine(concurrency=8)
-    reference = ref_engine.run_session(factory=lambda: ref_engine.agenerate(sample=batch))
-    assert out == reference
-
     # Explicit group-by-parent expected order: prompt-major, sibling-contiguous.
     prompts = list(batch.parts[0].primitive.texts)
     expected = [raw_text_for(p, k) for p in prompts for k in range(n)]
     assert gen.primitive.texts == expected
 
     engine.shutdown()
-    ref_engine.shutdown()
-
-
-def test_generate_does_not_call_engine_agenerate():
-    engine = FakeEngine(concurrency=8)
-    batch = build_request_batch(P=2, n=2)
-
-    async def forbidden(_sample):
-        raise AssertionError("sync generate must not call engine.agenerate")
-
-    engine.agenerate = forbidden  # type: ignore[method-assign]
-    out = engine.generate(batch)
-    assert out.parts[-1].primitive is not None
-    engine.shutdown()
-
-
-def test_agenerate_does_not_call_engine_generate():
-    engine = FakeEngine(concurrency=8)
-    batch = build_request_batch(P=2, n=2)
-
-    def forbidden(_sample):
-        raise AssertionError("agenerate must not call engine.generate")
-
-    engine.generate = forbidden  # type: ignore[method-assign]
-    out = engine.run_session(lambda: engine.agenerate(batch))
-    assert out.parts[-1].primitive is not None
-    engine.shutdown()
 
 
 def test_backend_sees_per_prompt_wire_in_batch_order():
-    """The backend receives one generate_one per prompt, in the whole batch's
+    """The backend receives one payload per prompt, in the whole batch's
     per-prompt wire order."""
     P, n = 3, 2
     engine = FakeEngine(concurrency=8)
@@ -101,6 +72,37 @@ def test_shared_semaphore_bounds_concurrency_across_groups():
     assert peak <= C  # the shared bound holds across all P groups
     assert peak > 1  # but generation genuinely overlapped (not serialized)
 
+    engine.shutdown()
+
+
+def test_shared_semaphore_bounds_concurrent_caller_threads():
+    """The agentic-drain shape: N threads each call ``generate`` for their own
+    single-prompt group. The backend's ONE semaphore bounds the union — and the
+    admitted callers are in flight TOGETHER (deterministic via the hold-gate)."""
+    C, N = 2, 5
+    engine = FakeEngine(concurrency=C)
+    engine._backend.block_until_released = True
+    groups = build_request_batch(P=N, n=1).split()
+
+    results: list = [None] * N
+    threads = [
+        threading.Thread(target=lambda i=i: results.__setitem__(i, engine.generate(groups[i]))) for i in range(N)
+    ]
+    for t in threads:
+        t.start()
+    deadline = threading.Event()
+    for _ in range(1000):
+        if engine._backend.inflight == C:
+            break
+        deadline.wait(0.005)
+    assert engine._backend.inflight == C  # exactly the bound, all parked together
+
+    engine._backend.release.set()  # stays set: the queued callers flow through
+    for t in threads:
+        t.join(timeout=5)
+
+    assert engine._backend.peak == C
+    assert all(r is not None and r.parts[-1].primitive is not None for r in results)
     engine.shutdown()
 
 

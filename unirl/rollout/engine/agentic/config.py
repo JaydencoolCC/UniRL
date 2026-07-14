@@ -3,9 +3,9 @@
 Registered as a peer rollout engine (alongside ``sglang`` / ``composed`` /
 ``vllm_omni`` / ``trainside``) whose ``_target_`` points at
 :class:`AgenticRolloutEngine`. The agentic engine wraps **one inner rollout
-engine** (the single-turn generator it awaits each turn) and **one environment**
+engine** (the single-turn generator it calls each turn) and **one environment**
 (the tool/world side), and drives multi-turn rollout across a DP-replicated slab
-with a rank-0 coordinator (see ``docs/async-rollout-service-design.md``).
+with a rank-0 coordinator.
 
 Like :class:`ComposedRolloutEngineConfig`, the ``inner`` and ``env`` fields are
 kept ``Any``: each carries its own ``_target_`` and is built by the worker walker
@@ -39,9 +39,10 @@ class AgenticRolloutEngineConfig(BaseEngineConfig):
     #: Per-turn sampling params (``BaseSamplingParams``); its ``samples_per_prompt``
     #: is the GRPO group size ``n`` (read via ``total_samples_per_prompt``).
     episode_sampling: Any = None
-    #: Max concurrent trajectories per worker — the pull gate / load-balance
-    #: granularity. Set a small multiple of the inner backend ``concurrency`` so
-    #: trajectories in tool-wait don't starve the GPU (see design §5).
+    #: Max concurrent trajectories per worker — the drain thread-pool size (one
+    #: trajectory per thread; a thread holds its trajectory across tool-wait).
+    #: Set a small multiple of the inner backend ``concurrency`` so trajectories
+    #: in tool-wait don't starve the GPU.
     per_worker_concurrency: int = 8
     #: Partial rollout (LIN-531): expose the coordinator as a ``submit``/``poll``/
     #: ``abort`` interface so the *trainer* can over-sample, commit the first

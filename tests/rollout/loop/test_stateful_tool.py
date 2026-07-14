@@ -6,8 +6,8 @@ id minted at ``reset`` and carried in the root Sample's *control* bag. These tes
 counter tool:
 
 - ``reset`` stamps ``control["tool_sessions"]`` and fires ``session_start`` once;
-- ``astep`` dispatches ``execute_session`` with state that persists across turns;
-- ``aclose`` ends the session exactly once — on success AND on a forced-exception (``finally``)
+- ``step`` dispatches ``execute_session`` with state that persists across turns;
+- ``close`` ends the session exactly once — on success AND on a forced-exception (``finally``)
   path — and never raises, even when the tool's ``session_end`` throws.
 
 The stateless :class:`~unirl.rollout.loop.tools.calculator.CalculatorTool` path stays byte-identical.
@@ -15,7 +15,6 @@ The stateless :class:`~unirl.rollout.loop.tools.calculator.CalculatorTool` path 
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Dict, List
 
 import pytest
@@ -37,7 +36,7 @@ class _CounterTool(StatefulTool):
     """Trivial stateful tool: each ``execute_session`` increments a per-session counter and returns
     the new value, so a returned value ``> 1`` proves state persisted across turns. Records the
     lifecycle (``started``/``ended``) for assertions; ``session_end`` is idempotent (a live session
-    ends at most once). ``end_raises`` makes ``session_end`` throw, to test that ``aclose`` swallows.
+    ends at most once). ``end_raises`` makes ``session_end`` throw, to test that ``close`` swallows.
     """
 
     name = "counter"
@@ -86,19 +85,19 @@ def test_reset_mints_and_starts_session():
     assert counter.started == [sessions["counter"]]  # session_start fired once with that id
 
 
-def test_cross_turn_state_via_astep():
-    """The same session id (carried on parts[0].control across fork/observe) reaches every astep,
+def test_cross_turn_state_via_step():
+    """The same session id (carried on parts[0].control across fork/observe) reaches every step,
     so the tool's per-session state accumulates — the capability stateless tools cannot express."""
     counter = _CounterTool()
     env = ToolEnvironment([counter])
     base = env.reset(_request("r0"))
 
     s1 = _turn(base)
-    obs1, done1, _ = asyncio.run(env.astep(s1))
+    obs1, done1, _ = env.step(s1)
     assert done1 is False and isinstance(obs1, Texts) and obs1.texts == ["1"]
 
     s2 = _turn(s1.observe(obs1))
-    obs2, done2, _ = asyncio.run(env.astep(s2))
+    obs2, done2, _ = env.step(s2)
     assert done2 is False and obs2.texts == ["2"]  # state persisted across turns
 
 
@@ -108,55 +107,55 @@ def test_teardown_fires_once_on_success():
     base = env.reset(_request("r0"))
     sid = base.parts[0].control["tool_sessions"]["counter"]
 
-    asyncio.run(env.aclose(base))
+    env.close(base)
     assert counter.ended == [sid]  # session_end fired exactly once
 
 
 def test_teardown_fires_on_forced_exception():
-    """The engine calls aclose from a ``finally`` — teardown must fire even when the turn loop
+    """The engine calls close from a ``finally`` — teardown must fire even when the turn loop
     raises. Mirrors AgenticRolloutEngine._run_one's finally-hook."""
     counter = _CounterTool()
     env = ToolEnvironment([counter])
     base = env.reset(_request("r0"))
     sid = base.parts[0].control["tool_sessions"]["counter"]
 
-    async def _crash_then_close():
+    def _crash_then_close():
         try:
             raise RuntimeError("trajectory blew up mid-loop")
         finally:
-            await env.aclose(base)
+            env.close(base)
 
     with pytest.raises(RuntimeError, match="blew up"):
-        asyncio.run(_crash_then_close())
+        _crash_then_close()
     assert counter.ended == [sid]  # session_end still fired despite the exception
 
 
-def test_aclose_is_idempotent():
+def test_close_is_idempotent():
     counter = _CounterTool()
     env = ToolEnvironment([counter])
     base = env.reset(_request("r0"))
     sid = base.parts[0].control["tool_sessions"]["counter"]
 
-    asyncio.run(env.aclose(base))
-    asyncio.run(env.aclose(base))  # second call is a no-op (session already ended)
+    env.close(base)
+    env.close(base)  # second call is a no-op (session already ended)
     assert counter.ended == [sid]
 
 
-def test_aclose_swallows_session_end_errors():
-    """A raising session_end must never propagate out of aclose — the engine's drain relies on
+def test_close_swallows_session_end_errors():
+    """A raising session_end must never propagate out of close — the engine's drain relies on
     _run_one never raising."""
     env = ToolEnvironment([_CounterTool(end_raises=True)])
     base = env.reset(_request("r0"))
-    asyncio.run(env.aclose(base))  # must not raise
+    env.close(base)  # must not raise
 
 
 def test_stateless_tool_is_untouched():
     """Zero regression: with no StatefulTool, reset returns the request object unchanged (no
-    control stamping) and aclose is a no-op."""
+    control stamping) and close is a no-op."""
     env = ToolEnvironment([CalculatorTool()])
     req = _request("r0")
     assert env.reset(req) is req  # same object back — no session plumbing
-    asyncio.run(env.aclose(req))  # no-op, must not raise
+    env.close(req)  # no-op, must not raise
 
 
 def test_mixed_stateful_and_stateless():

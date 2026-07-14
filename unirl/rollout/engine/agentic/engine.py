@@ -1,10 +1,11 @@
 """AgenticRolloutEngine — multi-turn (agentic) rollout over a rank-0 coordinator (LIN-522, LIN-531).
 
-See ``docs/async-rollout-service-design.md`` and ``docs/partial-rollout-design.md``. The engine is a
-``BaseRolloutEngine`` on a DP-replicated slab. Each worker builds its **own local** inner single-turn
-engine + environment (the ``ComposedRolloutEngine`` build-inner pattern) and runs **one persistent drain
-loop** that pulls single-trajectory tasks from a central queue and runs each as a multi-turn agent loop
-on the inner engine's event loop.
+The engine is a ``BaseRolloutEngine`` on a DP-replicated slab. Each worker builds its **own local**
+inner single-turn engine + environment (the ``ComposedRolloutEngine`` build-inner pattern) and runs
+a **pool of drain threads** (``per_worker_concurrency`` of them) that pull single-trajectory tasks
+from a central queue and run each as a plain synchronous multi-turn agent loop on its own thread:
+per-turn ``inner.generate`` (the inner engine is safe for concurrent callers — its backend keeps
+the in-flight requests batching together) and ``env.step`` (the env is re-entrant across threads).
 
 **Partial rollout interface (LIN-531).** The engine is the *mechanism*; the trainer owns the *policy*
 (how many to over-sample, staleness, when to sync). The coordinator exposes a
@@ -25,22 +26,25 @@ Two roles, one class:
   ``BROADCAST + RANK_ZERO``): rank 0 fans the batch into ``n × P`` single-trajectory tasks, fires one
   ``run_drain`` per worker (raw ``Worker.call``), serves ``next_task`` pulls, and aggregates the
   per-worker completed/carried buffers.
-- **Worker = every instance** (``run_drain`` / ``_drain`` / ``_run_one`` / ``_pull`` + the un-decorated
-  control methods ``drain_completed``/``collect_carried``/``set_stopping``/``reset_round``): the
-  persistent drain loop is the always-on driver of the inner engine's loop; the control methods ride the
-  threaded Worker (``worker_max_concurrency>1``) alongside the running drain.
+- **Worker = every instance** (``run_drain`` / ``_drain_worker`` / ``_run_one`` / ``_pull`` + the
+  un-decorated control methods ``drain_completed``/``collect_carried``/``set_stopping``/
+  ``reset_round``): ``run_drain`` blocks in its Worker-actor slot for the whole drive while the
+  drain threads work; the control methods ride the threaded Worker
+  (``worker_max_concurrency>1``) alongside it.
 
-Weight sync is unchanged (design §8): the trainer quiesces the rollout (``abort`` — turn-boundary
-checkpoint, or the ``generate`` barrier) and syncs *between* drives; ``run_drain`` holds the inner
-backend's loop-lock for the drive. Delegated verbs below forward to the inner engine.
+Weight sync: the trainer quiesces the rollout (``abort`` — turn-boundary checkpoint, or the
+``generate`` barrier) and syncs *between* drives. The quiesce is structural: ``abort``/``generate``
+join the drain threads (``ray.get(drain_refs)``), and every generate call runs on one of those
+threads — after the join, nothing is in flight and the inner engine is decode-idle. Delegated
+verbs below forward to the inner engine.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import ray
@@ -100,7 +104,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
                 except Exception as exc:
                     logger.warning("AgenticRolloutEngine invalid inner cleanup raised: %s", exc)
             raise ValueError(
-                "AgenticRolloutEngine inner must implement the single-turn async engine contract; "
+                "AgenticRolloutEngine inner must implement the single-turn engine contract; "
                 f"got {type(inner).__name__}"
             )
         self._inner: BaseSingleTurnRolloutEngine = inner
@@ -118,10 +122,11 @@ class AgenticRolloutEngine(BaseRolloutEngine):
             f"env.max_turns ({_env_mt}) must equal config.max_turns ({self._max_turns}); "
             "they are set independently in the recipe and must agree.",
         )
-        # Per-worker trajectory cap = the pull gate (distinct from the inner backend's
-        # per-request semaphore; see design §5). A trajectory holds a cap slot across
-        # its whole life, incl. tool-wait between turns — so siblings keep the GPU busy.
-        self._cap = asyncio.Semaphore(int(config.per_worker_concurrency))
+        # Per-worker trajectory cap = the drain pool size (distinct from the inner
+        # backend's per-request semaphore — two independent bounds). A trajectory
+        # holds its thread across its whole life, incl. tool-wait between turns —
+        # so siblings keep the GPU busy while one waits on a slow tool.
+        self._concurrency = int(config.per_worker_concurrency)
 
         # Coordinator state (populated on rank 0 only, by set_workers).
         self._workers: List[Any] = []
@@ -271,22 +276,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         self._drain_refs = []
         return self._fan("drain_completed")
 
-    async def agenerate(self, sample: Sample) -> List[Sample]:
-        """Asynchronous barrier generation over the same coordinator protocol.
-
-        This is a local composition API, not a distributed Handle method. It keeps
-        the caller's event loop responsive while Ray joins run in worker threads;
-        it does not call the synchronous :meth:`generate` implementation.
-        """
-        require(bool(self._workers), "AgenticRolloutEngine.agenerate: call set_workers() first (rank 0)")
-        await asyncio.to_thread(self._reset_all)
-        self._enqueue_tasks(self._split_request(sample))
-        self._fire_drain()
-        if self._drain_refs:
-            await asyncio.to_thread(ray.get, self._drain_refs)
-            self._drain_refs = []
-        return await asyncio.to_thread(self._fan, "drain_completed")
-
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def drained(self) -> bool:
         """Rank-0: True once the in-flight drive is finished (queue empty + every
@@ -310,50 +299,49 @@ class AgenticRolloutEngine(BaseRolloutEngine):
             return self._queue.popleft() if self._queue else None
 
     # ------------------------------------------------------------------
-    # Per-worker execution — the persistent drain loop (the loop driver)
+    # Per-worker execution — the drain thread pool
     # ------------------------------------------------------------------
 
     def run_drain(self, coordinator: Any, role_name: str) -> None:
-        """Drive this worker's drain loop for the whole drive (background).
+        """Drive this worker's drain for the whole drive (background).
 
         Reached by raw ``Worker.call`` (rank 0 fires one per worker, non-blocking).
-        Sync at the RPC boundary; internally the inner engine's owned session is
-        the single driver of its async runtime — so
-        concurrent trajectories are coroutines on one loop (continuous batching) and
-        hold the inner backend's loop-lock for the drive. Results are written to the
-        worker's ``_completed`` / ``_checkpointed`` buffers (read by
-        ``drain_completed`` / ``collect_carried``), so this returns nothing.
+        Runs ``per_worker_concurrency`` drain threads — one whole trajectory per
+        thread at a time, so the pool size IS the trajectory cap. Results are
+        written to the worker's ``_completed`` / ``_checkpointed`` buffers (read
+        by ``drain_completed`` / ``collect_carried``), so this returns nothing.
+
+        Joins every thread and re-raises the first failure — ``shutdown(wait=True)``
+        alone would swallow a dead thread's error and silently strand queued tasks
+        where today's contract is a loud drain failure.
         """
-        self._inner.run_session(lambda: self._drain(coordinator, role_name))
+        with ThreadPoolExecutor(
+            max_workers=self._concurrency, thread_name_prefix="agentic-drain"
+        ) as pool:
+            futures = [pool.submit(self._drain_worker, coordinator, role_name) for _ in range(self._concurrency)]
+        for future in futures:
+            future.result()
 
-    async def _drain(self, coordinator: Any, role_name: str) -> None:
-        inflight: set = set()
+    def _drain_worker(self, coordinator: Any, role_name: str) -> None:
+        """One drain thread: pull → run a whole trajectory → buffer, until the
+        queue drains or ``set_stopping``. An unexpected failure (the pull RPC —
+        ``_run_one`` itself never raises) sets ``_stopping`` so sibling threads
+        checkpoint at their next turn boundary instead of grinding through the
+        queue behind a doomed drive, then re-raises into ``run_drain``'s join."""
+        try:
+            while not self._stopping:
+                task = self._pull(coordinator, role_name)
+                if task is None:  # sentinel: queue drained
+                    break
+                sample, done = self._run_one(task)  # never raises (failure-isolated)
+                with self._buf_lock:
+                    (self._completed if done else self._checkpointed).append(sample)
+        except BaseException:
+            self._stopping = True
+            raise
 
-        def _done(fut: "asyncio.Future") -> None:
-            self._cap.release()
-            inflight.discard(fut)
-            sample, done = fut.result()  # _run_one never raises (failure-isolated)
-            with self._buf_lock:
-                (self._completed if done else self._checkpointed).append(sample)
-
-        while not self._stopping:
-            await self._cap.acquire()  # block until a trajectory slot frees
-            if self._stopping:  # re-check after acquire (abort raced the wait)
-                self._cap.release()
-                break
-            task = await self._pull(coordinator, role_name)
-            if task is None:  # sentinel: queue drained
-                self._cap.release()
-                break
-            fut = asyncio.ensure_future(self._run_one(task))
-            inflight.add(fut)
-            fut.add_done_callback(_done)
-
-        if inflight:
-            await asyncio.gather(*list(inflight))  # let the last in-flight trajectories finish/checkpoint
-
-    async def _run_one(self, task: Sample) -> Tuple[Sample, bool]:
-        """One trajectory's agent loop. Returns ``(sample, done)``.
+    def _run_one(self, task: Sample) -> Tuple[Sample, bool]:
+        """One trajectory's agent loop, on this drain thread. Returns ``(sample, done)``.
 
         ``done=True`` — terminal (the env said done, or ``max_turns`` reached).
         ``done=False`` — **checkpointed** at a turn boundary because ``self._stopping``
@@ -373,8 +361,12 @@ class AgenticRolloutEngine(BaseRolloutEngine):
             for _ in range(self._max_turns - turns_done):
                 if self._stopping:  # partial rollout: checkpoint at the turn boundary, carry & resume
                     return sample, False
-                sample = await self._inner.agenerate(sample.fork(1, sampling_params=self._sp))  # +[gen(1)]
-                observation, done, info = await self._env.astep(sample)  # async tool boundary (§7)
+                # Concurrent-caller safe: fork() builds a fresh gen Part per call and
+                # the shared self._sp is only READ (resolve_sampling is pure) — an
+                # inner engine that mutated part.sampling_params in generate would
+                # turn this into a cross-thread race.
+                sample = self._inner.generate(sample.fork(1, sampling_params=self._sp))  # +[gen(1)]
+                observation, done, info = self._env.step(sample)  # blocking tool boundary, own thread
                 # Env-sourced reward (LIN-519): interactive envs (ALFWorld, …) return a
                 # per-trajectory return in ``info["reward"]`` (last value = the episode
                 # return); tool-only envs (calculator/search) omit it — a no-op here.
@@ -389,16 +381,16 @@ class AgenticRolloutEngine(BaseRolloutEngine):
             logger.warning("AgenticRolloutEngine: trajectory failed, returning partial: %s", exc, exc_info=True)
             return self._attach_env_reward(sample, env_reward), True
         finally:
-            # Guaranteed teardown (LIN-533): end any open tool sessions / episodes for this
-            # trajectory — on success, crash, AND cancellation/abort. Duck-typed like
-            # ``tool_schemas`` so envs without ``aclose`` are unaffected, and wrapped so a teardown
-            # error can never re-raise into the drain's ``fut.result()`` (``_run_one`` must not raise).
-            aclose = getattr(self._env, "aclose", None)
-            if aclose is not None:
+            # Guaranteed teardown (LIN-533): end any open tool sessions / episodes for
+            # this trajectory — on success, crash, AND abort. Duck-typed like
+            # ``tool_schemas`` so envs without ``close`` are unaffected, and wrapped so
+            # a teardown error can never re-raise (``_run_one`` must not raise).
+            close = getattr(self._env, "close", None)
+            if close is not None:
                 try:
-                    await aclose(sample)
+                    close(sample)
                 except Exception:  # noqa: BLE001 — teardown must not sink the drain
-                    logger.warning("AgenticRolloutEngine: env.aclose failed during teardown", exc_info=True)
+                    logger.warning("AgenticRolloutEngine: env.close failed during teardown", exc_info=True)
 
     @staticmethod
     def _attach_env_reward(sample: Sample, reward: Optional[float]) -> Sample:
@@ -417,19 +409,18 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         )
         return sample.with_parts([rewarded if p is last else p for p in sample.parts])
 
-    async def _pull(self, coordinator: Any, role_name: str) -> Optional[Sample]:
-        """Pull the next task from the coordinator. Bridges the Ray RPC onto the
-        backend loop via ``run_in_executor`` (a Ray ObjectRef isn't awaitable on
-        that loop) — the same trick :meth:`Environment.astep` uses for slow tools."""
-        loop = asyncio.get_running_loop()
+    def _pull(self, coordinator: Any, role_name: str) -> Optional[Sample]:
+        """Pull the next task from the coordinator — a blocking Ray RPC on this
+        drain thread. Kept as a method so no-Ray CPU tests can monkeypatch the
+        seam with an in-process queue."""
         ref = coordinator.call.remote(role_name, "next_task", (self.rank or 0,), {})
-        return await loop.run_in_executor(None, ray.get, ref)
+        return ray.get(ref)
 
     # ------------------------------------------------------------------
     # Per-worker partial-rollout control methods (un-decorated, raw Worker.call).
     # They ride the threaded Worker (worker_max_concurrency>1) alongside the
-    # running drain: the drain's done-callback appends to the buffers on the loop
-    # thread; these read/clear them on a control thread — hence _buf_lock.
+    # running drain: the drain threads append to the buffers; these read/clear
+    # them on a control thread — hence _buf_lock.
     # ------------------------------------------------------------------
 
     def drain_completed(self) -> List[Sample]:

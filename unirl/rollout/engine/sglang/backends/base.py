@@ -1,15 +1,15 @@
 """The backend seam contract — the ``Backend`` protocol + the wire types.
 
 Every ``sglang`` collaborator reaches the SGLang SRT runtime through this
-protocol; the real implementation lives beside it (``http.py`` — SRT server
-subprocess + HTTP). This module holds no runtime code at all, so it is trivially
-CPU-importable.
+protocol; the real implementations live beside it (``http.py`` — SRT server
+subprocess + sync HTTP; ``native.py`` — in-process Engine). This module holds
+no runtime code at all, so it is trivially CPU-importable.
 
 **No RL types cross this seam.** ``generate`` takes ready-to-POST ``/generate``
 payload dicts (one per prompt) and returns ``list[RawResult]`` (a structural view
 of one parsed ``/generate`` candidate); the adapters do the
 ``Sample``↔wire translation. The impl absorbs its transport
-asymmetries (async fan-out, retries, SGLang's dict-vs-list response shape for
+asymmetries (thread fan-out, retries, SGLang's dict-vs-list response shape for
 ``n``) behind these signatures.
 
 Deliberate divergences from the ``sglang_diffusion`` seam:
@@ -24,189 +24,15 @@ Deliberate divergences from the ``sglang_diffusion`` seam:
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import threading
-from concurrent.futures import Future
 from typing import (
     Any,
-    Callable,
-    Coroutine,
     Dict,
     List,
     Optional,
     Protocol,
     Sequence,
-    TypeVar,
     runtime_checkable,
 )
-
-logger = logging.getLogger(__name__)
-T = TypeVar("T")
-
-#: Transitional alias for :class:`SessionRunner` (kept only for the test fakes;
-#: removed with it).
-CoroutineFactory = Callable[[], Coroutine[Any, Any, T]]
-
-
-class SessionRunner:
-    """Drive one backend loop session and admit controls only while it is active.
-
-    The coroutine *factory* is load-bearing: an idle/closed backend rejects work
-    before a coroutine object exists, so best-effort controls cannot leak an
-    unawaited coroutine. Controls accepted at the end of a session are tracked and
-    drained before ``run`` lets the loop stop, closing the
-    ``is_running()``/``run_coroutine_threadsafe`` race at that boundary.
-    """
-
-    def __init__(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        *,
-        label: str,
-        control_timeout_s: float = 10.0,
-    ) -> None:
-        self._loop = loop
-        self._label = label
-        self._control_timeout_s = float(control_timeout_s)
-        self._drive_lock = threading.Lock()
-        self._state_lock = threading.Lock()
-        self._closed = False
-        self._accept_controls = False
-        self._controls: set[Future[Any]] = set()
-
-    def _reject_async_caller(self, operation: str) -> None:
-        """Fail before lock acquisition when called from any running loop."""
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        raise RuntimeError(f"{self._label} {operation} cannot be called from a running event loop")
-
-    def run(self, operation: CoroutineFactory[T]) -> T:
-        """Run one factory-created awaitable on the owned loop, serialized."""
-        self._reject_async_caller("run_session")
-        with self._drive_lock:
-            if self._closed or self._loop.is_closed():
-                raise RuntimeError(f"{self._label} async event loop is not available.")
-            if self._loop.is_running():
-                raise RuntimeError(f"{self._label} async event loop is already running")
-            with self._state_lock:
-                self._accept_controls = True
-            session = self._run_operation(operation)
-            try:
-                return self._loop.run_until_complete(session)
-            except BaseException:
-                # ``run_until_complete`` can reject before taking ownership.
-                # Closing the wrapper is harmless once it has already completed.
-                session.close()
-                raise
-            finally:
-                with self._state_lock:
-                    self._accept_controls = False
-                    self._controls.clear()
-
-    def run_sync(self, operation: Callable[[], T]) -> T:
-        """Serialize a synchronous loop-driving backend verb with sessions."""
-        self._reject_async_caller("run_sync")
-        with self._drive_lock:
-            if self._closed or self._loop.is_closed():
-                raise RuntimeError(f"{self._label} async event loop is not available.")
-            return operation()
-
-    def assert_active_loop(self) -> None:
-        """Fail fast unless called on this runner's currently active loop."""
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError as exc:
-            raise RuntimeError(f"{self._label} async operation requires run_session") from exc
-        with self._state_lock:
-            active = not self._closed and self._accept_controls
-        if running_loop is not self._loop or not active:
-            raise RuntimeError(f"{self._label} async operation requires its active run_session loop")
-
-    def close(
-        self,
-        *,
-        async_cleanup: Optional[CoroutineFactory[Any]] = None,
-        finalizer: Optional[Callable[[], None]] = None,
-    ) -> None:
-        """Close once under the session lock, optionally cleaning up on the loop."""
-        self._reject_async_caller("close")
-        with self._drive_lock:
-            with self._state_lock:
-                if self._closed:
-                    return
-                self._closed = True
-                self._accept_controls = False
-            try:
-                if async_cleanup is not None and not self._loop.is_closed():
-                    cleanup = async_cleanup()
-                    try:
-                        self._loop.run_until_complete(cleanup)
-                    except BaseException:
-                        cleanup.close()
-                        raise
-            finally:
-                if finalizer is not None:
-                    finalizer()
-
-    async def _run_operation(self, operation: CoroutineFactory[T]) -> T:
-        try:
-            return await operation()
-        finally:
-            # Stop admission before taking the snapshot. A control that won the
-            # state lock is already registered and must finish before this session
-            # lets run_until_complete stop the loop.
-            with self._state_lock:
-                self._accept_controls = False
-                pending = tuple(future for future in self._controls if not future.done())
-            if pending:
-                await asyncio.gather(
-                    *(asyncio.wrap_future(future, loop=self._loop) for future in pending),
-                    return_exceptions=True,
-                )
-
-    def run_control(self, operation: CoroutineFactory[Any]) -> Any:
-        """Run a control on the active session, or no-op without creating it."""
-        try:
-            on_session_loop = asyncio.get_running_loop() is self._loop
-        except RuntimeError:
-            on_session_loop = False
-        if on_session_loop:
-            # This synchronous method cannot wait on its own loop. Controls enter
-            # through a concurrent Worker thread; a same-loop call is best-effort.
-            return None
-
-        with self._state_lock:
-            if self._closed or not self._accept_controls or not self._loop.is_running():
-                return None
-            coroutine = self._run_control(operation)
-            try:
-                future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
-            except Exception:
-                close = getattr(coroutine, "close", None)
-                if close is not None:
-                    close()
-                return None
-            self._controls.add(future)
-
-        try:
-            return future.result()
-        finally:
-            with self._state_lock:
-                self._controls.discard(future)
-
-    async def _run_control(self, operation: CoroutineFactory[Any]) -> Any:
-        try:
-            return await asyncio.wait_for(operation(), timeout=self._control_timeout_s)
-        except TimeoutError:
-            logger.warning(
-                "%s control timed out after %.1fs (best-effort)",
-                self._label,
-                self._control_timeout_s,
-            )
-            return None
 
 
 class RawResult(Protocol):
@@ -291,4 +117,4 @@ class Backend(Protocol):
     # update_from_ipc is intentionally absent — SGLang has no IPC receiver.
 
 
-__all__ = ["Backend", "RawResult", "SessionRunner"]
+__all__ = ["Backend", "RawResult"]
