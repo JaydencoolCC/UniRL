@@ -31,6 +31,7 @@ from concurrent.futures import Future
 from typing import (
     Any,
     Callable,
+    Coroutine,
     Dict,
     List,
     Optional,
@@ -40,10 +41,12 @@ from typing import (
     runtime_checkable,
 )
 
-from unirl.rollout.engine.runtime import CoroutineFactory
-
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+
+#: Transitional alias for :class:`SessionRunner` (kept only for the test fakes;
+#: removed with it).
+CoroutineFactory = Callable[[], Coroutine[Any, Any, T]]
 
 
 class SessionRunner:

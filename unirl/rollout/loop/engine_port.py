@@ -15,16 +15,10 @@ class RolloutEnginePort(Protocol):
     """What the loop calls to generate one model turn."""
 
     def generate(self, sample: Sample) -> Sample:
-        """Fill the request Sample's frontier gen Part and return it."""
-        ...
+        """Fill the request Sample's frontier gen Part and return it.
 
-    async def agenerate(self, sample: Sample) -> Sample:
-        """Async per-turn core: fill the frontier gen Part and return it.
-
-        Loop-bound engines must be awaited inside their engine-owned
-        ``run_session(lambda: ...)`` context; the agentic coordinator uses that
-        session for its whole drain. One turn is always one ``Sample`` (never a
-        trajectory list) — that list belongs to the coordinator contract.
+        One turn is always one ``Sample`` (never a trajectory list) — that
+        list belongs to the coordinator contract.
         """
         ...
 

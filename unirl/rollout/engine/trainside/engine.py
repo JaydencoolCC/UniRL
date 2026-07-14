@@ -9,9 +9,8 @@ worker subprocess and no weight sync are needed.
 
 from __future__ import annotations
 
-import asyncio
 import threading
-from typing import List, Optional, Sequence, TypeVar, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 
@@ -20,12 +19,10 @@ from unirl.models.types.ar import ARStage
 from unirl.models.types.diffusion import DiffusionStage
 from unirl.models.types.pipeline import Pipeline
 from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
-from unirl.rollout.engine.runtime import CoroutineFactory, LocalAsyncRuntime
 from unirl.sde.runtime import FlowMatchSchedulePolicy
 from unirl.types.sample import Part, Sample
 
 Stage = Union[DiffusionStage, ARStage]
-_SessionResult = TypeVar("_SessionResult")
 
 
 class TrainsideRolloutEngine(BaseSingleTurnRolloutEngine):
@@ -93,18 +90,17 @@ class TrainsideRolloutEngine(BaseSingleTurnRolloutEngine):
             # AR stage — no diffusion schedule needed
             self.schedule_policy = None
 
-        # The pipeline is synchronous and shares one GPU context. One lock covers
-        # both the native sync entrypoint and the async to_thread adapter, so local
-        # async sessions cannot overlap a trainer-side generate call.
+        # The pipeline is synchronous and shares one GPU context; the lock
+        # serializes concurrent generate callers (this engine's concurrency
+        # story under the sync contract).
         self._weight_version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
         self._shutdown_complete = False
-        self._runtime = LocalAsyncRuntime()
 
     # ------------------------------------------------------------------ #
-    # Generation — native sync entrypoint + local async capability
+    # Generation — sync entrypoint, serialized internally
     # ------------------------------------------------------------------ #
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -112,18 +108,11 @@ class TrainsideRolloutEngine(BaseSingleTurnRolloutEngine):
         """Generate one whole DP shard synchronously."""
         return self._generate_locked(sample)
 
-    async def agenerate(self, sample: Sample) -> Sample:
-        """Generate one whole ``Sample`` without blocking the session loop."""
-        return await asyncio.to_thread(self._generate_locked, sample)
-
     def _generate_locked(self, sample: Sample) -> Sample:
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("TrainsideRolloutEngine.generate called after shutdown")
             return self._stamp_weight_version(self._generate_core(sample))
-
-    def run_session(self, factory: CoroutineFactory[_SessionResult]) -> _SessionResult:
-        return self._runtime.run(factory)
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous pipeline forward for one whole ``Sample``."""
@@ -180,12 +169,6 @@ class TrainsideRolloutEngine(BaseSingleTurnRolloutEngine):
                 return
             with self._generate_lock:
                 self._shutdown_requested = True
-            try:
-                self._runtime.close()
-            except BaseException:
-                with self._generate_lock:
-                    self._shutdown_requested = False
-                raise
             self._shutdown_complete = True
 
     # sleep / wake_up inherit BaseRolloutEngine's @distributed no-op default.

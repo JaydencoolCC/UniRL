@@ -23,24 +23,20 @@ worker partitions.
 
 from __future__ import annotations
 
-import asyncio
 import threading
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
-from unirl.rollout.engine.runtime import CoroutineFactory, LocalAsyncRuntime
 from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
 from unirl.rollout.engine.vllm_omni.weight_sync import WeightSync
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
-
-_SessionResult = TypeVar("_SessionResult")
 
 
 class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
@@ -102,21 +98,20 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
         # consumes it in ``generate`` (gated on the adapter's needs_sigmas).
         self.schedule_policy = self.adapter.schedule_policy()
 
-        # The Omni orchestrator is synchronous and not request-concurrent-safe.
-        # One lock covers the native sync entrypoint and async to_thread adapter.
+        # The Omni orchestrator is synchronous and not request-concurrent-safe;
+        # the lock serializes concurrent generate callers.
         self._weight_version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
         self._shutdown_complete = False
-        self._runtime = LocalAsyncRuntime()
 
     def _tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
         """Late-bound bridge handed to the adapter as ``tokenize_fn``."""
         return self._backend.tokenize_prompt(text, task=task, sys_type=sys_type)
 
     # ------------------------------------------------------------------ #
-    # Generation — native sync entrypoint + local async capability
+    # Generation — sync entrypoint, serialized internally
     # ------------------------------------------------------------------ #
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -124,18 +119,11 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
         """Generate one whole DP shard synchronously."""
         return self._generate_locked(sample)
 
-    async def agenerate(self, sample: Sample) -> Sample:
-        """Generate one whole ``Sample`` without blocking the session loop."""
-        return await asyncio.to_thread(self._generate_locked, sample)
-
     def _generate_locked(self, sample: Sample) -> Sample:
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("VLLMOmniRolloutEngine.generate called after shutdown")
             return self._stamp_weight_version(self._generate_core(sample))
-
-    def run_session(self, factory: CoroutineFactory[_SessionResult]) -> _SessionResult:
-        return self._runtime.run(factory)
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous whole-Sample generation: validate, σ-pin, run, decode."""
@@ -234,12 +222,6 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
                 return
             with self._generate_lock:
                 self._shutdown_requested = True
-            try:
-                self._runtime.close()
-            except BaseException:
-                with self._generate_lock:
-                    self._shutdown_requested = False
-                raise
             with self._generate_lock:
                 self._backend.shutdown()
             self._shutdown_complete = True

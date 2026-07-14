@@ -17,17 +17,15 @@ engine is usable. ``generate`` / ``sleep`` / ``wake_up`` re-apply ``@distributed
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
-from unirl.rollout.engine.runtime import CoroutineFactory, LocalAsyncRuntime
 from unirl.rollout.engine.sglang_diffusion.adapters import get_adapter
 from unirl.rollout.engine.sglang_diffusion.backends import SGLangBackend
 from unirl.rollout.engine.sglang_diffusion.config import (
@@ -41,7 +39,6 @@ from unirl.types.sample import Part, Sample
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
-_SessionResult = TypeVar("_SessionResult")
 
 #: Memory tags released on sleep / restored on wake.
 _OFFLOAD_TAGS = ("transformer", "vae", "text_encoder")
@@ -122,16 +119,15 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
         self.schedule_policy = self.adapter.schedule_policy()
 
         # The DiffGenerator backend is synchronous and its scheduler client is not
-        # request-concurrent-safe. One lock covers both public generation paths.
+        # request-concurrent-safe; the lock serializes concurrent generate callers.
         self._weight_version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
         self._shutdown_complete = False
-        self._runtime = LocalAsyncRuntime()
 
     # ------------------------------------------------------------------ #
-    # Generation — native sync entrypoint + local async capability
+    # Generation — sync entrypoint, serialized internally
     # ------------------------------------------------------------------ #
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -139,18 +135,11 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
         """Generate one whole DP shard synchronously."""
         return self._generate_locked(sample)
 
-    async def agenerate(self, sample: Sample) -> Sample:
-        """Generate one whole ``Sample`` without blocking the session loop."""
-        return await asyncio.to_thread(self._generate_locked, sample)
-
     def _generate_locked(self, sample: Sample) -> Sample:
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("SGLangDiffusionRolloutEngine.generate called after shutdown")
             return self._stamp_weight_version(self._generate_core(sample))
-
-    def run_session(self, factory: CoroutineFactory[_SessionResult]) -> _SessionResult:
-        return self._runtime.run(factory)
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous generation for one whole ``Sample``."""
@@ -283,12 +272,6 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
                 return
             with self._generate_lock:
                 self._shutdown_requested = True
-            try:
-                self._runtime.close()
-            except BaseException:
-                with self._generate_lock:
-                    self._shutdown_requested = False
-                raise
             with self._generate_lock:
                 self._backend.shutdown()
             self._shutdown_complete = True

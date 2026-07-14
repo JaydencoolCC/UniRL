@@ -22,10 +22,9 @@ forwards each subset to the matching child with the prefix stripped.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -34,13 +33,11 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.pe.instruction import postprocess_pe_texts
 from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
-from unirl.rollout.engine.runtime import CoroutineFactory, LocalAsyncRuntime
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
 logger = logging.getLogger(__name__)
-_SessionResult = TypeVar("_SessionResult")
 
 
 def _cleanup_constructed_child(name: str, child: Any) -> None:
@@ -125,16 +122,13 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
         self._shutdown_complete = False
-        runtime = LocalAsyncRuntime()
         try:
             if config.sleep_diffusion_on_start:
                 self._diffusion.sleep()
         except BaseException:
-            runtime.close()
             _cleanup_constructed_child("diffusion", diffusion)
             _cleanup_constructed_child("ar", ar)
             raise
-        self._runtime = runtime
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -147,12 +141,6 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
                 return
             with self._generate_lock:
                 self._shutdown_requested = True
-            try:
-                self._runtime.close()
-            except BaseException:
-                with self._generate_lock:
-                    self._shutdown_requested = False
-                raise
             with self._generate_lock:
                 for name, child in self._child_by_name.items():
                     try:
@@ -200,18 +188,11 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         """Run the whole PE serial flow for one DP shard synchronously."""
         return self._generate_locked(sample)
 
-    async def agenerate(self, sample: Sample) -> Sample:
-        """Run the whole PE serial flow without blocking the session loop."""
-        return await asyncio.to_thread(self._generate_locked, sample)
-
     def _generate_locked(self, sample: Sample) -> Sample:
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("ComposedRolloutEngine.generate called after shutdown")
             return self._generate_core(sample)
-
-    def run_session(self, factory: CoroutineFactory[_SessionResult]) -> _SessionResult:
-        return self._runtime.run(factory)
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Run the PE serial flow for a whole ``Sample`` → filled 3-part output.
