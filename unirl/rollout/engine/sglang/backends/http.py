@@ -328,6 +328,8 @@ class HTTPBackend:
         log; longer wires fan out on a throwaway pool (``executor.map`` keeps
         prompt order).
         """
+        if not requests:
+            return []
         if len(requests) == 1:
             return self.generate_one(requests[0])
         t0 = time.perf_counter()

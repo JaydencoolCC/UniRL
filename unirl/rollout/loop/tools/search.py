@@ -9,7 +9,7 @@ as text. Two providers, selected by ``$SEARCH_PROVIDER`` (or the constructor):
 
 Both read the API key from ``$SERPER_KEY_ID``. ``execute`` is synchronous and
 thread-safe (it holds no state) so it runs cleanly under
-:meth:`ToolEnvironment.astep`'s executor across concurrent trajectories.
+concurrent trajectory threads (:meth:`ToolEnvironment.step`).
 """
 
 from __future__ import annotations

@@ -110,6 +110,8 @@ class FakeBackend:
     def generate(self, requests: List[Dict[str, Any]]) -> List[FakeRaw]:
         with self._lock:
             self.calls.extend(requests)  # deterministic wire order
+        if not requests:
+            return []
         if len(requests) == 1:
             return self._generate_one(requests[0])
         with ThreadPoolExecutor(max_workers=min(self.concurrency, len(requests))) as pool:

@@ -533,7 +533,7 @@ class NativeBackend:
         Engine registers its own atexit shutdown and the rollout engine's
         ``__del__`` re-enters ours — the None-swap makes our side idempotent.
         ``close`` waits for in-flight generation to settle before parking, so
-        teardown stays graceful (SessionRunner parity).
+        teardown stays graceful.
         """
         engine = self._engine
         if engine is None:

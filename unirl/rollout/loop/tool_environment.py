@@ -141,7 +141,7 @@ class ToolEnvironment:
         Stateful tools (LIN-533): mint a per-trajectory ``session_id`` (``uuid4``) for each
         :class:`~unirl.rollout.loop.tools.tool.StatefulTool`, call ``session_start`` (cheap — the
         handle opens lazily in :meth:`step`), and stamp the ids into the root Part's *control* bag
-        under ``"tool_sessions"`` so :meth:`step`/:meth:`aclose` recover them position-independently
+        under ``"tool_sessions"`` so :meth:`step`/:meth:`close` recover them position-independently
         across the fork/observe chain. ``uuid4`` avoids collisions between the ``n`` GRPO siblings
         that share a root ``sample_id``.
         """

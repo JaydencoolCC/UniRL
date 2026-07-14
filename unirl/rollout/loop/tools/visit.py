@@ -5,7 +5,7 @@ agent: fetch a URL's content with the Jina reader (needs ``$JINA_API_KEYS``) and
 summarize the parts relevant to a stated goal with an OpenAI-compatible LLM
 (hosted out-of-band; ``$SUMMARY_URL`` / ``$SUMMARY_MODEL`` or the constructor
 args — the same endpoint the judge uses). ``execute`` is synchronous and
-thread-safe so it runs under :meth:`ToolEnvironment.astep`'s executor across
+thread-safe so it runs on concurrent trajectory threads (:meth:`ToolEnvironment.step`) across
 concurrent trajectories. If no summarizer is configured it returns the truncated
 raw page content, so the tool is usable without a summarizer for smoke tests.
 

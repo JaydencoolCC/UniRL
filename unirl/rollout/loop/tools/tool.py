@@ -52,9 +52,9 @@ class StatefulTool(Tool):
       ``execute_session``, which runs off-loop in an executor.
     - ``execute_session(session_id, arguments)`` — per turn. Operates on the (lazily opened)
       per-session handle; runs in the executor via
-      :meth:`~unirl.rollout.loop.tool_environment.ToolEnvironment.astep`.
+      :meth:`~unirl.rollout.loop.tool_environment.ToolEnvironment.step`.
     - ``session_end(session_id)`` — once, guaranteed: the engine's ``finally`` hook calls it even on
-      a crashed/aborted trajectory (via ``ToolEnvironment.aclose``). Must be **idempotent**, a no-op
+      a crashed/aborted trajectory (via ``ToolEnvironment.close``). Must be **idempotent**, a no-op
       on an unknown/never-opened id, and **must not raise**.
 
     Implementations own a handle store keyed by ``session_id`` and guarded by a lock (``reset`` runs

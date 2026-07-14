@@ -35,13 +35,16 @@ wrong objective.
 
 ## How it works
 
-- **Two native generation interfaces.** `BaseRolloutEngine` (`engine/base.py`) is
-  a `Remote` whose concrete engines implement both synchronous `generate(sample)`
-  and local asynchronous `agenerate(sample)`. Neither method is a base-provided
-  wrapper around the other: each engine keeps its native batching/runtime path.
-  Single-turn engines return one `Sample` and dispatch synchronous `generate` with
-  `DP_SCATTER`; the agentic coordinator returns a trajectory list with rank-zero
-  broadcast dispatch. Event-loop ownership stays inside concrete engines/backends.
+- **One synchronous generation interface.** `BaseRolloutEngine` (`engine/base.py`)
+  is a `Remote` whose concrete engines implement synchronous `generate(sample)`;
+  each keeps its native batching/runtime path. Single-turn engines return one
+  `Sample` and dispatch `generate` with `DP_SCATTER`; the agentic coordinator
+  returns a trajectory list with rank-zero broadcast dispatch. Concurrency is
+  threads, not asyncio: the agentic engine drives one trajectory per drain
+  thread, so an engine meant to serve as its inner must make `generate` safe for
+  concurrent callers (the SGLang backends keep concurrent in-flight requests
+  batching together on the runtime; an event loop survives only inside the
+  native backend, where the in-process SRT runtime requires one).
 - **The typed boundary** (`../types/`). A `Sample` is an ordered chain of `Part`s.
   Each Part carries lineage ids, a raw `primitive`, an encoded `segment`, replay
   conditions, sampling params (including the σ schedule), and optional decoded
@@ -63,10 +66,12 @@ wrong objective.
 
 **Extending it:** a new single-turn engine adds `engine/<name>/config.py` (a
 `BaseEngineConfig` whose `make_engine(**deps)` lazily imports and builds it) and
-`engine/<name>/engine.py` (subclass `BaseSingleTurnRolloutEngine`, implement native
-sync/async generation over the same whole-`Sample` contract, and dispatch only the
-sync `generate` with `DP_SCATTER`). A dedicated engine also implements its
-weight-receive method and a matching `sync:` handler in `../distributed/weight_sync`.
+`engine/<name>/engine.py` (subclass `BaseSingleTurnRolloutEngine`, implement
+synchronous generation over the whole-`Sample` contract — thread-safe for
+concurrent callers if it should serve as an agentic inner, else serialized
+internally — and dispatch `generate` with `DP_SCATTER`). A dedicated engine also
+implements its weight-receive method and a matching `sync:` handler in
+`../distributed/weight_sync`.
 
 ## Gotchas
 
