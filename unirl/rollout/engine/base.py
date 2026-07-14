@@ -10,22 +10,19 @@ subprocesses spawned, dist groups brought up. This matches the actor flow where
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, TypeVar, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.rollout.engine.runtime import CoroutineFactory
 from unirl.types.sample import Sample
 
 #: The rollout batch contract (LIN-522). Single-turn engines return one ``Sample``;
 #: the agentic engine returns a list of variable-depth trajectory ``Sample``s (one
-#: per rollout). The broad generation methods use this union; the single-turn
-#: subclass refines both returns to ``Sample``.
+#: per rollout). The broad generation method uses this union; the single-turn
+#: subclass refines its return to ``Sample``.
 RolloutOutput = Union[Sample, List[Sample]]
-
-_SessionResult = TypeVar("_SessionResult")
 
 
 class BaseEngineConfig(ABC):
@@ -111,10 +108,6 @@ class BaseRolloutEngine(Remote, ABC):
         ``DP_SCATTER`` and return one ``Sample``; the agentic coordinator uses
         ``BROADCAST + RANK_ZERO`` and returns a trajectory list.
         """
-
-    @abstractmethod
-    async def agenerate(self, sample: Sample) -> RolloutOutput:
-        """Asynchronously run the engine's native generation unit."""
 
     # ------------------------------------------------------------------
     # Control plane — sync methods reached via the raw ``Worker.call`` RPC (the
@@ -228,10 +221,13 @@ class BaseRolloutEngine(Remote, ABC):
 class BaseSingleTurnRolloutEngine(BaseRolloutEngine, ABC):
     """Nominal contract for engines that fill and return one ``Sample``.
 
-    The class intentionally does not prescribe batching or provide a synchronous
-    ``generate`` wrapper. Each engine owns those semantics and applies its own
-    ``@distributed`` decorator. Sync-backed engines own a local runtime;
-    backend-driven engines delegate to their backend runtime.
+    The class intentionally does not prescribe batching or provide a batching
+    wrapper. Each engine owns those semantics and applies its own
+    ``@distributed`` decorator. The contract is synchronous. An engine meant to
+    serve as an agentic inner must make ``generate`` safe for CONCURRENT
+    callers (the agentic drain calls it from one thread per trajectory and
+    relies on the backend batching the in-flight requests together); an engine
+    that cannot serve concurrently serializes internally instead.
     """
 
     #: Policy weight version the current weights correspond to (bumped on each
@@ -239,26 +235,8 @@ class BaseSingleTurnRolloutEngine(BaseRolloutEngine, ABC):
     _weight_version: int = 0
 
     @abstractmethod
-    def run_session(self, factory: CoroutineFactory[_SessionResult]) -> _SessionResult:
-        """Run one local coroutine session from a synchronous worker method.
-
-        This method is deliberately not distributed: an agentic engine calls it
-        on its local inner single-turn engine to keep a whole trajectory drain on
-        that engine's runtime.
-        """
-
-    @abstractmethod
     def generate(self, sample: Sample) -> Sample:
         """Synchronously fill and return one request ``Sample``."""
-
-    @abstractmethod
-    async def agenerate(self, sample: Sample) -> Sample:
-        """Asynchronously fill and return one request ``Sample``.
-
-        Loop-bound implementations are awaited inside :meth:`run_session`; an
-        implementation backed by synchronous work may also support any caller
-        event loop directly.
-        """
 
     def _stamp_weight_version(self, sample: Sample) -> Sample:
         """Stamp ``self._weight_version`` onto the frontier (last) gen Part."""

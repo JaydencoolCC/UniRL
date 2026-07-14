@@ -22,14 +22,13 @@ subprocesses need is quarantined in the backends' ``boot``.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
-from unirl.rollout.engine.runtime import CoroutineFactory
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
@@ -38,7 +37,6 @@ from unirl.rollout.engine.sglang.weight_sync import WeightSync
 from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
-_SessionResult = TypeVar("_SessionResult")
 
 
 class SGLangRolloutEngine(BaseSingleTurnRolloutEngine):
@@ -142,17 +140,13 @@ class SGLangRolloutEngine(BaseSingleTurnRolloutEngine):
             uses_lora=bool(engine_kwargs.get("enable_lora", False)),
         )
 
-        # The backend owns its async session/loop. The engine only owns policy
-        # provenance and delegates session driving through ``run_session``.
+        # The backend owns its runtime concurrency. The engine only owns policy
+        # provenance and delegates generation through the seam.
         self._weight_version = 0
 
     # ------------------------------------------------------------------ #
-    # Generation — native sync whole-Sample path + matching async path
+    # Generation — sync whole-Sample path, safe for concurrent callers
     # ------------------------------------------------------------------ #
-
-    def run_session(self, factory: CoroutineFactory[_SessionResult]) -> _SessionResult:
-        """Drive an async session on the backend-owned loop."""
-        return self._backend.run_session(factory)
 
     def _prepare_generation(self, sample: Sample) -> Any:
         require(
@@ -172,21 +166,20 @@ class SGLangRolloutEngine(BaseSingleTurnRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
-        """Generate one whole Sample synchronously through the backend seam."""
+        """Generate one whole Sample synchronously through the backend seam.
+
+        Safe for concurrent callers (the agentic drain calls it from one
+        thread per trajectory): prepare/finish are pure per-call, and the
+        backend keeps concurrent wires in flight together.
+        """
         prepared = self._prepare_generation(sample)
         raw = self._backend.generate(prepared.wire)
-        return self._finish_generation(sample, prepared, raw)
-
-    async def agenerate(self, sample: Sample) -> Sample:
-        """Generate one whole Sample inside an active backend session."""
-        prepared = self._prepare_generation(sample)
-        raw = await self._backend.agenerate(prepared.wire)
         return self._finish_generation(sample, prepared, raw)
 
     # ── control plane — sync; reached via the raw Worker.call RPC ──────────
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Abort in-flight generation (best-effort). Partials surface via the
-        pending ``generate``/``agenerate`` returns, so this returns ``[]``."""
+        pending ``generate`` returns, so this returns ``[]``."""
         del ids
         self._backend.abort(abort_all=True)
         return []
