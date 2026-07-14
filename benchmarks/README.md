@@ -50,7 +50,9 @@ Video (VBench) is generated and scored with the official toolkit — see
 - Images are `p{prompt:05d}_s{k}.png` with seed `--seed + 1000*prompt + k` — the naming
   is the only state shared between stages.
 - Generation uses each pipeline's own defaults (steps/guidance/resolution) unless
-  overridden — record any override next to reported numbers.
+  overridden — record any override next to reported numbers. Distilled/turbo
+  checkpoints (e.g. Z-Image-Turbo) ship base-schedule pipeline defaults: pass the
+  model card's `--steps`/`--guidance` or you benchmark the wrong sampler setting.
 - Data files are vendored when small and redistributable; otherwise the benchmark folder
   ships a fetch script. Never commit gated data (`text/gpqa`).
 - Code lives in `core/` + `run.py` only; benchmark folders hold README + data. Adding a
