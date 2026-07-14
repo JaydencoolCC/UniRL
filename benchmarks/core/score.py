@@ -71,6 +71,39 @@ class RewardServiceClient:
         return rows, n_errors
 
 
+# geneval2 metadata canary: a 64x64 white PNG plus one deliberately false VQA
+# question about it. A scorer that honors request-metadata vqa_lists (Soft-TIFA)
+# scores ~0; a pre-metadata scorer ignores it and answers its generic
+# "does the image match the prompt" template on the trivially true prompt (~1).
+_CANARY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAYElEQVR4nO3PQQ0AIBDAMMC/50MEj4ZkVbDtmVk/OzrgVQNaA1oDWgNa"
+    "A1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgPaBXKqA31N0fbGAAAAAElFTkSuQmCC"
+)
+_CANARY_REQUEST = {
+    "history": [{"text": "a plain white background", "image_b64": _CANARY_PNG_B64}],
+    "required_rewards": ["geneval2"],
+    "metadata": {"vqa_list": [["Is there a red double-decker bus in the image?", "Yes"]]},
+}
+
+
+def check_geneval2_metadata(client: RewardServiceClient) -> None:
+    """SystemExit unless the service's geneval2 scorer consumes per-request
+    ``metadata.vqa_list``. A scorer without metadata support still answers —
+    with its degenerate single-question template — so a whole run would come
+    back with plausible-looking numbers that are not GenEval2 Soft-TIFA."""
+    resp = client.session.post(f"{client.base_url}/score", json={"requests": [_CANARY_REQUEST]}, timeout=600)
+    resp.raise_for_status()
+    score = (resp.json()["results"][0].get("geneval2") or {}).get("vqascore")
+    if score is None or score > 0.5:
+        raise SystemExit(
+            f"the geneval2 scorer at {client.base_url} ignores request-metadata vqa_lists "
+            f"(a deliberately false canary question scored {score!r}, expected ~0), so it would "
+            "score this benchmark with its generic single-question template instead of GenEval2 "
+            "Soft-TIFA. Deploy a geneval2 scorer with request-metadata support (RewardService "
+            "geneval2 reading metadata['vqa_list'])."
+        )
+
+
 # GPQA's official baseline parses "The correct answer is (X)"; we also accept \boxed{X}.
 _BOXED_LETTER = re.compile(r"\\boxed\{\s*\(?([A-Da-d])\)?\s*\}")
 _ANSWER_IS = re.compile(r"(?i)answer\s*(?:is)?\s*:?\s*\(?([A-D])\)?")

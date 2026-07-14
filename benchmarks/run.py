@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 from benchmarks.core import checkpoints, report
 from benchmarks.core.generate import T2I_KWARGS, image_path, read_completions, run_t2i, run_text, server_model, t2i_jobs
 from benchmarks.core.registry import SPECS, BenchmarkSpec, load_items, load_metadata, load_prompts
-from benchmarks.core.score import GRADERS, RewardServiceClient
+from benchmarks.core.score import GRADERS, RewardServiceClient, check_geneval2_metadata
 
 
 def _parse_args() -> argparse.Namespace:
@@ -137,6 +137,8 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
             raise SystemExit(f"{spec.name}: {missing} images missing — finish --stage generate (all shards) first")
         client = RewardServiceClient(args.reward_url)
         client.check(spec.rewards)
+        if "geneval2" in spec.rewards:
+            check_geneval2_metadata(client)  # fail fast instead of silently scoring non-Soft-TIFA
         metadatas = None
         if spec.send_metadata:
             per_prompt = load_metadata(spec)[: args.num_prompts or None]
