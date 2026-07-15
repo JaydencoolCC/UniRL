@@ -24,6 +24,7 @@ batch_size: 64            # samples per optimizer step (global; must divide dp)
 num_steps: 200            # total optimizer steps (~epochs = num_steps*batch/len(data))
 eval_interval: 20
 eval_batch_size: 16
+eval_num_samples: -1        # -1 = full eval set
 save_interval: 0          # append +save_interval=N +save_dir=... to checkpoint
 save_mode: auto
 

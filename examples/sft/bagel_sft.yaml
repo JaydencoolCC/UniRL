@@ -25,6 +25,7 @@ batch_size: 16
 num_steps: 300
 eval_interval: 20
 eval_batch_size: 8
+eval_num_samples: -1        # -1 = full eval set
 save_interval: 0
 save_mode: auto
 transport_kind: colocate_store
