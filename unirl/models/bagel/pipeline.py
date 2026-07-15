@@ -366,6 +366,14 @@ class BagelPipeline(Pipeline):
         ``guidance_scale`` and ``negatives`` do not shape the conditions here:
         ``negatives`` is rejected (Bagel has no negative-embedding branch) and
         ``guidance_scale`` is accepted for protocol parity only.
+
+        Deliberately UNCACHED (``_build_contexts``, not the memoized
+        ``_build_contexts_cached``): under an FSDP-wrapped transformer the
+        prefill forward is collective, and a per-rank LRU hit would skip a
+        rank's all-gathers while its peers run them — a cross-rank NCCL
+        deadlock. The GRPO path stays cached because sibling expansion makes
+        hits rank-symmetric; supervised batches have no siblings, and each
+        prompt recurs only once per epoch anyway.
         """
         del guidance_scale
         if negatives is not None:
@@ -373,7 +381,7 @@ class BagelPipeline(Pipeline):
                 "BagelPipeline.build_conditions: Bagel CFG uses prefilled cfg contexts, not "
                 "negative prompt embeddings — pass negatives=None and set cfg_*_scale on the params."
             )
-        contexts = [self._build_contexts_cached(prompt) for prompt in texts.texts]
+        contexts = [self._build_contexts(prompt, image=None) for prompt in texts.texts]
         shape = (int(image_shape[0]), int(image_shape[1]))
         return BagelDiffusionConditions(
             gen_contexts=[c[0] for c in contexts],
