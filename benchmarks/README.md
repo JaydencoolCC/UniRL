@@ -60,3 +60,13 @@ Video (VBench) is generated and scored with the official toolkit — see
 
 Roadmap (not in this drop): VL understanding (Geo3K test / MathVista), unified-model
 und-side, UniGenBench++, image-editing benchmarks.
+
+Extending: the staging/shard/resume/report machinery is modality-agnostic — a new
+modality (audio, editing, interleaved) is one driver in `core/generate.py` plus
+scorers. When the first benchmark lands whose loading/eval cannot be expressed as
+data + a spec, specs grow optional `loader`/`runner`/`scorer` dotpath hooks so that
+code lives in the benchmark's own folder (the lm-eval-harness / VLMEvalKit escape
+hatch), while core and the results contract (`summary.json`, tags, `--report`) stay
+fixed and global. Environment-style benchmarks (agent suites) are wrapped, never
+absorbed: the official harness runs the benchmark; we only normalize its results
+into the report.
