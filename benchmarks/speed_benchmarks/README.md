@@ -2,7 +2,8 @@
 
 How to measure UniRL training throughput and compare it fairly against another RL
 framework. One subfolder per rival framework with pinned same-setting pairs
-(currently [`verl_omni/`](verl_omni/)).
+(currently [`verl_omni/`](verl_omni/) — a submodule-pinned upstream, a runnable aligned
+SD3.5+FlowGRPO pair, and first measured rows).
 
 ## Measuring UniRL
 
