@@ -356,8 +356,7 @@ class TrainStack(Remote):
             return [(end - start) / float(update_total) for start, end in micros], None
         if weighting != "token":
             raise ValueError(
-                f"{type(self).__name__}: unknown algorithm.loss_weighting={weighting!r}; "
-                "expected 'sample' or 'token'."
+                f"{type(self).__name__}: unknown algorithm.loss_weighting={weighting!r}; expected 'sample' or 'token'."
             )
         rank_info = getattr(self, "rank_info", None)
         if rank_info is not None and int(getattr(rank_info, "sp_size", 1)) > 1:
