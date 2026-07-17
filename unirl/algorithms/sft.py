@@ -34,8 +34,9 @@ gradient. Seq-mean agg modes weigh each sequence equally instead
 
 from __future__ import annotations
 
+import hashlib
 import math
-from typing import Any, Dict, Mapping, Optional, Tuple, Type
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Type
 
 import torch
 
@@ -144,13 +145,16 @@ class SFT(StageAlgorithm):
         *,
         conditions: Mapping[str, Condition],
         segment: "TextSegment",
+        sample_ids: Optional[Sequence[str]] = None,
     ) -> Tuple[float, float]:
         """Forward-only ``(ce_sum, valid_token_count)`` for validation.
 
         Raw sums (not means) so the caller can aggregate exactly across micros,
         DP ranks, and eval batches — one loss implementation, one reduction
-        convention, shared with training.
+        convention, shared with training. ``sample_ids`` is unused here (CE is
+        deterministic) — accepted for a uniform ``evaluate_loss`` signature.
         """
+        del sample_ids
         if segment is None or segment.tokens is None or int(segment.tokens.shape[0]) == 0:
             return 0.0, 0.0
         _, aux = self._masked_ce(conditions, segment)
@@ -318,19 +322,23 @@ class FlowMatchSFT(StageAlgorithm):
         *,
         conditions: Mapping[str, Condition],
         segment: LatentSegment,
+        sample_ids: Optional[Sequence[str]] = None,
     ) -> Tuple[float, float]:
         """Forward-only ``(mse_sum, sample_count)`` at a FIXED (σ, ε) draw.
 
-        A seeded generator de-randomizes the noising, so the same validation
-        set yields a comparable number every eval (random-σ losses only
-        oscillate). ``segment.loss_mask`` (``[B]``) excludes padded eval rows.
+        The (σ, ε) draw is pinned PER SAMPLE (seeded from ``eval_seed`` + the
+        sample's own id), not per batch: a single batch-level seed would tie a
+        sample's noising to its position in the batch, so the eval loss would
+        shift if the eval batch size, order, or DP sharding changed. Per-sample
+        seeding makes the number comparable across steps AND invariant to
+        batching (random-σ losses only oscillate). ``segment.loss_mask``
+        (``[B]``) excludes padded eval rows.
         """
         x0 = self._clean_latents(segment)
         if x0 is None:
             return 0.0, 0.0
-        generator = torch.Generator(device=x0.device)
-        generator.manual_seed(self.eval_seed)
-        _, aux = self._velocity_mse(conditions, x0, generator=generator)
+        sigma, noise = self._eval_draws(x0, sample_ids)
+        _, aux = self._velocity_mse(conditions, x0, generator=None, sigma=sigma, noise=noise)
         per_sample = aux["per_sample_mse"]
         mask = getattr(segment, "loss_mask", None)
         if mask is not None:
@@ -371,19 +379,48 @@ class FlowMatchSFT(StageAlgorithm):
         sigma = (s * u) / (1.0 + (s - 1.0) * u)
         return sigma.clamp(min=self.sigma_min, max=1.0 - self.sigma_min)
 
+    def _sample_eval_seed(self, key: str) -> int:
+        """Stable int64 seed from ``eval_seed`` + a per-sample key (id).
+
+        ``hashlib`` (not Python's salted ``hash``) so the seed is identical
+        across processes / ranks / runs — the whole point of a comparable eval.
+        """
+        digest = hashlib.sha256(f"{self.eval_seed}:{key}".encode()).digest()
+        return int.from_bytes(digest[:8], "little") & 0x7FFF_FFFF_FFFF_FFFF
+
+    def _eval_draws(self, x0: torch.Tensor, sample_ids: Optional[Sequence[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-sample deterministic ``(σ, ε)`` for eval — one seeded generator
+        per sample keyed on its id, so a sample's noising is independent of the
+        batch it lands in. Falls back to the row index when ids are absent."""
+        batch = int(x0.shape[0])
+        device = x0.device
+        sigmas: list[torch.Tensor] = []
+        noises: list[torch.Tensor] = []
+        for i in range(batch):
+            key = str(sample_ids[i]) if sample_ids is not None and i < len(sample_ids) else str(i)
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self._sample_eval_seed(key))
+            sigmas.append(self._draw_sigma(1, device, generator))
+            noises.append(torch.randn(x0[i].shape, device=device, dtype=torch.float32, generator=generator))
+        return torch.cat(sigmas, dim=0), torch.stack(noises, dim=0)
+
     def _velocity_mse(
         self,
         conditions: Mapping[str, Condition],
         x0: torch.Tensor,
         *,
         generator: Optional[torch.Generator],
+        sigma: Optional[torch.Tensor] = None,
+        noise: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         batch = int(x0.shape[0])
         device = x0.device
         typed_conds = typed_conditions(conditions, self.conditions_cls)
 
-        sigma = self._draw_sigma(batch, device, generator)
-        noise = torch.randn(x0.shape, device=device, dtype=torch.float32, generator=generator)
+        if sigma is None:
+            sigma = self._draw_sigma(batch, device, generator)
+        if noise is None:
+            noise = torch.randn(x0.shape, device=device, dtype=torch.float32, generator=generator)
         s = sigma.view(batch, *([1] * (x0.ndim - 1)))
         xt = (1.0 - s) * x0 + s * noise
         v_target = noise - x0

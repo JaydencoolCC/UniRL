@@ -453,7 +453,11 @@ class TrainStack(Remote):
                 for start in range(0, bs, mbs):
                     end = min(start + mbs, bs)
                     micro = resp_track.slice(start, end)
-                    s, w = eval_fn(conditions=micro.conditions, segment=micro.segment)
+                    s, w = eval_fn(
+                        conditions=micro.conditions,
+                        segment=micro.segment,
+                        sample_ids=list(micro.sample_ids) if micro.sample_ids else None,
+                    )
                     loss_sum += float(s)
                     weight_sum += float(w)
         finally:
