@@ -10,14 +10,12 @@ native-logprob path, transformer hot-swap, sleep/wake) is ported from the proven
 DiffusionRL FastVideo engine; only the typed boundary (RolloutReq/RolloutResp/
 LatentSegment, σ SSOT) is new.
 
-NOTE (draft / WIP — pending GPU smoke):
-  * The SDE-step alignment between FastVideo's per-step log-probs and UniRL's
-    ``sde_indices`` is selected in :meth:`_build_segment`; verify on first smoke
-    that ``sde_logp`` columns line up with ``params.sde_indices`` (eta gating in
-    FastVideo's denoise must match the SDE window).
+Validated scope:
+  * Replay and native modes use the same resolved SDE window; native mode also
+    returns FastVideo's transition log-probs for ``old_logp_source=rollout``.
   * x_T SSOT: FastVideo currently regenerates its own initial noise from
     ``sp.seed`` rather than consuming the driver's NoiseRecipe x_T; wiring the
-    shared x_T into FastVideo (for on-policy ratio parity) is a follow-up.
+    shared x_T into FastVideo byte-for-byte is a follow-up.
   * Local-mode colocate, single model_family (wan2.1) only for now.
 """
 
@@ -74,9 +72,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self.model_config = model_config
         self.strategy = strategy
         self.rank = rank
-        self._device = device if device is not None else torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._is_offloaded = False
         self._generator: Any = None
         self._fastvideo_args: Any = None
@@ -103,7 +99,9 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         )
         logger.info(
             "Initialized fastvideo engine (rank=%s, native_logprob=%s, master_port=%s)",
-            rank, config.native_logprob, ports.master_port,
+            rank,
+            config.native_logprob,
+            ports.master_port,
         )
 
     # ------------------------------------------------------------------ #
@@ -143,7 +141,36 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         }
         fv_kwargs.update(ekw)
         self._fastvideo_args = FastVideoArgs.from_kwargs(**fv_kwargs)
-        self._generator = VideoGenerator.from_fastvideo_args(self._fastvideo_args)
+        # WanT2V480PConfig (1.3B) defaults flow_shift=3.0. UniRL may train at
+        # model_config.shift=5.0 (baseline). FastVideo re-applies flow_shift inside
+        # set_timesteps even for custom sigmas, so pipeline_config.flow_shift MUST
+        # match model_config.shift or native old_logp and trainer replay diverge.
+        target_shift = float(self.model_config.shift)
+        pc = self._fastvideo_args.pipeline_config
+        if getattr(pc, "flow_shift", None) != target_shift:
+            logger.info(
+                "fastvideo engine: pipeline_config.flow_shift %s -> %s (model_config.shift)",
+                getattr(pc, "flow_shift", None),
+                target_shift,
+            )
+            pc.flow_shift = target_shift
+        max_port_attempts = 5
+        for attempt in range(1, max_port_attempts + 1):
+            try:
+                self._generator = VideoGenerator.from_fastvideo_args(self._fastvideo_args)
+                break
+            except Exception as exc:  # noqa: BLE001
+                port_in_use = "EADDRINUSE" in str(exc) or "address already in use" in str(exc).lower()
+                if not port_in_use or attempt == max_port_attempts:
+                    raise
+                self._ports = FastVideoPorts.reserve()
+                self._fastvideo_args.master_port = int(self._ports.master_port)
+                logger.warning(
+                    "fastvideo init: master port busy (attempt %d/%d); retrying with %s",
+                    attempt,
+                    max_port_attempts,
+                    self._ports.master_port,
+                )
 
     # ------------------------------------------------------------------ #
     # Generation
@@ -223,7 +250,11 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         return [_derive_group_seed(base_seed, str(k)) for k in keys]
 
     def _drive_fastvideo(
-        self, prompts: List[str], params: Any, sigmas: torch.Tensor, seeds: List[int],
+        self,
+        prompts: List[str],
+        params: Any,
+        sigmas: torch.Tensor,
+        seeds: List[int],
     ) -> Dict[str, Any]:
         """PR #1222 native-logprob path via executor.execute_forward + RLData.
 
@@ -259,10 +290,18 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         #     g = s / (shift - s·(shift-1))   ⇒   shift·g/(1+(shift-1)·g) == s
         # (valid because FastVideo's WAN flow_shift == model_config.shift). Drop
         # the terminal 0 — FastVideo appends its own endpoint.
-        _f = float(self.model_config.shift)
+        _f = float(getattr(self._fastvideo_args.pipeline_config, "flow_shift", self.model_config.shift))
         _s = sigmas.detach().cpu().double()
         _g = _s / (_f - _s * (_f - 1.0))
         sp.sigmas = [float(x) for x in _g.tolist()[:-1]]
+
+        # SDE window handed to FastVideo's denoiser so it injects exploration
+        # noise ONLY on the trainer's SDE steps and runs the rest as a
+        # deterministic Euler step (clean low-sigma tail). ``params.sde_indices``
+        # is stamped per rollout by the trainer (resolve_sde_indices); it matches
+        # the columns the trainer replays. Empty/None => every step is SDE.
+        _sde_idx = getattr(params, "sde_indices", None)
+        sde_step_indices = [int(x) for x in _sde_idx] if _sde_idx else None
 
         all_log_probs: List[torch.Tensor] = []
         all_traj: List[torch.Tensor] = []
@@ -295,6 +334,8 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     collect_log_probs=bool(self.cfg.native_logprob),
                     store_trajectory=True,
                     keep_trajectory_on_cpu=True,
+                    sde_step_indices=sde_step_indices,
+                    sde_type=str(getattr(self.strategy, "canonical_name", "flow")),
                 ),
             )
             out = self._generator.executor.execute_forward(batch, self._fastvideo_args)
@@ -422,13 +463,12 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         contract the reward path (video_pickscore) consumes.
         """
         frames = raw["decoded"]
-        require(torch.is_tensor(frames) and frames.dim() == 5,
-                f"fastvideo decoded must be [B, C, T, H, W]; got "
-                f"{tuple(frames.shape) if torch.is_tensor(frames) else type(frames).__name__}")
-        videos = [
-            Video(frames=frames[i].permute(1, 0, 2, 3).contiguous())
-            for i in range(int(frames.shape[0]))
-        ]
+        require(
+            torch.is_tensor(frames) and frames.dim() == 5,
+            f"fastvideo decoded must be [B, C, T, H, W]; got "
+            f"{tuple(frames.shape) if torch.is_tensor(frames) else type(frames).__name__}",
+        )
+        videos = [Video(frames=frames[i].permute(1, 0, 2, 3).contiguous()) for i in range(int(frames.shape[0]))]
         return Videos.from_list(videos)
 
     def _build_segment(self, req: RolloutReq, params: Any, raw: Dict[str, Any]):
@@ -486,7 +526,29 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             return
         from fastvideo import VideoGenerator
 
-        self._generator = VideoGenerator.from_fastvideo_args(self._fastvideo_args)
+        # MultiprocExecutor's TCPStore must bind a master port every time the
+        # generator is rebuilt. Reusing the constructor-time port after sleep
+        # can hit a lingering listener; its get_open_port() check also has a
+        # close-before-child-bind TOCTOU window when all DP actors wake
+        # concurrently. Refresh the hint for every attempt and self-heal the
+        # rare EADDRINUSE race instead of killing the Ray actor/run.
+        max_port_attempts = 5
+        for attempt in range(1, max_port_attempts + 1):
+            self._ports = FastVideoPorts.reserve()
+            self._fastvideo_args.master_port = int(self._ports.master_port)
+            try:
+                self._generator = VideoGenerator.from_fastvideo_args(self._fastvideo_args)
+                break
+            except Exception as exc:  # noqa: BLE001
+                port_in_use = "EADDRINUSE" in str(exc) or "address already in use" in str(exc).lower()
+                if not port_in_use or attempt == max_port_attempts:
+                    raise
+                logger.warning(
+                    "fastvideo wake_up: master_port=%s busy (attempt %d/%d); retrying",
+                    self._ports.master_port,
+                    attempt,
+                    max_port_attempts,
+                )
         self._is_offloaded = False
         # ``from_fastvideo_args`` reloads the PRETRAINED transformer from
         # ``model_path``; without this the engine would sample under pretrained

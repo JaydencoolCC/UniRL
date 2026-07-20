@@ -17,12 +17,13 @@
 #      weights and pushes the merged full model (FastVideo serves merged weights;
 #      it has no separate adapter path here).
 #
-# FastVideo dependency: fork https://github.com/Zcchill/FastVideo (hao-ai-lab
-# PR #1222 snapshot). Set $FASTVIDEO_PATH. Lazy-imported by the engine only.
+# FastVideo dependency: https://github.com/Zcchill/FastVideo at or after
+# 7fe1d7db9a0b8aebb46679e7924f597431f23665. Set $FASTVIDEO_PATH to that
+# checkout; FastVideo is lazy-imported by the rollout engine only.
 #
-# NOTE (draft / WIP): runnability smoke pending; native log-prob path
-# (old_logp_source: rollout + native_logprob: true) is available but the SDE
-# column alignment is still to be verified — this recipe defaults to replay.
+# This recipe defaults to replay log-probs. Native mode is enabled by setting
+# rollout.config.native_logprob=true and algorithm.old_logp_source=rollout;
+# both modes use the same SDE sampling window.
 
 num_devices: 8                # 1 node x 8 GPUs
 batch_size: 48                # prompts_per_rollout
@@ -36,11 +37,10 @@ model_config:
   _target_: unirl.models.wan21.config.WAN21PipelineConfig
   pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
   model_precision: bf16
-  shift: 3.0   # MUST match the model's native scheduler flow_shift (Wan2.1-1.3B=3.0);
-               # FastVideo generates at the model's flow_shift, so a mismatched shift
-               # here desyncs the σ schedule between rollout (FastVideo) and train
-               # (replay) -> importance ratio != 1. Verified: 5.0 gave native ratio
-               # 0.94; 3.0 gives ratio 1.0000.
+  # Match wan21_t2v_dancegrpo.yaml exactly. The FastVideo engine now sets its
+  # pipeline flow_shift from this value and pre-images custom sigmas before
+  # FastVideo reapplies the shift, so rollout and trainer both consume shift=5.
+  shift: 5.0
   max_sequence_length: 512
   # LoRA is configured via backend.lora_cfg only (faithful to the official
   # wan21_t2v_dancegrpo recipe — bundle.config sets no use_lora). The
@@ -56,11 +56,7 @@ bundle:
 
 pipeline:
   _target_: unirl.models.wan21.pipeline.WAN21Pipeline
-  shift: 3.0   # MUST match the model's native scheduler flow_shift (Wan2.1-1.3B=3.0);
-               # FastVideo generates at the model's flow_shift, so a mismatched shift
-               # here desyncs the σ schedule between rollout (FastVideo) and train
-               # (replay) -> importance ratio != 1. Verified: 5.0 gave native ratio
-               # 0.94; 3.0 gives ratio 1.0000.
+  shift: 5.0
   autocast_precision: bf16
   trajectory_precision: fp16
   logprob_precision: fp32
@@ -78,7 +74,7 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
-    activation_checkpointing: false  # deliberately off (speed); v1 used bf16_full_ac
+    activation_checkpointing: true   # required for the 1x8 720p configuration
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig

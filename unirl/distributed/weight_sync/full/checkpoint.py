@@ -103,7 +103,9 @@ class CheckpointWeightSync(FullWeightSync):
         t0 = time.time()
         while not os.path.exists(marker):
             if time.time() - t0 > self._wait_timeout_s:
-                raise TimeoutError(f"CheckpointWeightSync: ready marker not found after {self._wait_timeout_s}s: {marker}")
+                raise TimeoutError(
+                    f"CheckpointWeightSync: ready marker not found after {self._wait_timeout_s}s: {marker}"
+                )
             time.sleep(0.2)
 
 
