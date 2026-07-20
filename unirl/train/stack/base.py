@@ -312,7 +312,7 @@ class TrainStack(Remote):
             # Reduce over the backend's actual FSDP mesh, matching its gradient
             # averaging instead of returning rank 0's local proxy.
             (global_loss_sum,) = self._all_reduce_sums([total_loss])
-            total_loss = global_loss_sum / float(self._loss_weight_world())
+            total_loss = global_loss_sum / self._loss_weight_world()
         else:
             # Exact global token-mean of this update's loss: every rank enters
             # this collective (micro counts are rank-symmetric), so the logged
@@ -364,13 +364,13 @@ class TrainStack(Remote):
             # the whole-update mean only when each micro is weighted by its share of
             # samples. With equal count-based micros this reduces to 1/len(micros);
             # with token-budget packing micros vary in size.
-            return [(end - start) / float(update_total) for start, end in micros], None
+            return [(end - start) / update_total for start, end in micros], None
         if weighting != "token":
             raise ValueError(
                 f"{type(self).__name__}: unknown algorithm.loss_weighting={weighting!r}; expected 'sample' or 'token'."
             )
         rank_info = getattr(self, "rank_info", None)
-        if rank_info is not None and int(getattr(rank_info, "sp_size", 1)) > 1:
+        if rank_info is not None and rank_info.sp_size > 1:
             # Sequence parallelism shards tokens WITHIN a rank's samples; the
             # denominator group would have to include the SP dimension too
             # (the exact undercount verl hit at CP>1 in its #5983). Fail loudly
@@ -380,7 +380,7 @@ class TrainStack(Remote):
                 f"sequence parallelism (sp_size={rank_info.sp_size}); use sp_size=1."
             )
         weights = [self._micro_loss_weight(resp_track, start, end) for start, end in micros]
-        local_total = float(sum(weights))
+        local_total = sum(weights)
         (global_total,) = self._all_reduce_sums([local_total])
         if global_total <= 0.0:
             raise ValueError(
@@ -409,7 +409,7 @@ class TrainStack(Remote):
 
     def _loss_weight_world(self) -> int:
         """World size whose gradient averaging the token weighting must cancel."""
-        return int(self.fsdp_backend.gradient_average_world_size())
+        return self.fsdp_backend.gradient_average_world_size()
 
     def _all_reduce_sums(self, values: List[float]) -> List[float]:
         """SUM scalars over the backend's FSDP mesh (no-op single-rank).
@@ -446,8 +446,8 @@ class TrainStack(Remote):
         model.eval()
         try:
             with torch.no_grad():
-                bs = int(resp_track.batch_size)
-                mbs = int(self.micro_batch_size)
+                bs = resp_track.batch_size
+                mbs = self.micro_batch_size
                 loss_sum = 0.0
                 weight_sum = 0.0
                 for start in range(0, bs, mbs):

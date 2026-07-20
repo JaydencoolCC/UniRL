@@ -390,7 +390,7 @@ class BagelPipeline(Pipeline):
                 "negative prompt embeddings — pass negatives=None and set cfg_*_scale on the params."
             )
         contexts = [self._build_contexts(prompt, image=None) for prompt in texts.texts]
-        shape = (int(image_shape[0]), int(image_shape[1]))
+        shape = image_shape
         return BagelDiffusionConditions(
             gen_contexts=[c[0] for c in contexts],
             cfg_text_contexts=[c[1] for c in contexts],

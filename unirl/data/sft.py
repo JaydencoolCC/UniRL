@@ -176,8 +176,8 @@ class SupervisedDataSource:
                 "SupervisedDataSource: no eval_manifest_path — eval batches fall back to the "
                 "TRAIN set (eval loss then measures training data)."
             )
-        self.seed = int(seed)
-        self.shuffle = bool(shuffle)
+        self.seed = seed
+        self.shuffle = shuffle
         self._epoch = 0
         self._pos = 0
         self._order = self._make_order()
@@ -192,7 +192,7 @@ class SupervisedDataSource:
 
     def get_samples(self, batch_size: int) -> List[Dict[str, Any]]:
         batch: List[Dict[str, Any]] = []
-        while len(batch) < int(batch_size):
+        while len(batch) < batch_size:
             if self._pos >= len(self._order):
                 self._epoch += 1
                 self._pos = 0
@@ -211,16 +211,16 @@ class SupervisedDataSource:
     def state_dict(self) -> Dict[str, int]:
         return {"epoch": self._epoch, "position": self._pos, "seed": self.seed}
 
-    def load_state_dict(self, state: Dict[str, Any]) -> None:
-        if int(state.get("seed", self.seed)) != self.seed:
+    def load_state_dict(self, state: Dict[str, int]) -> None:
+        if state.get("seed", self.seed) != self.seed:
             logger.warning(
                 "SupervisedDataSource.load_state_dict: checkpoint seed %s != configured seed %s — "
                 "the resumed shuffle order will differ from the original run.",
                 state.get("seed"),
                 self.seed,
             )
-        self._epoch = int(state["epoch"])
-        self._pos = int(state["position"])
+        self._epoch = state["epoch"]
+        self._pos = state["position"]
         self._order = self._make_order()
         if self._pos > len(self._order):
             raise ValueError(
@@ -240,9 +240,9 @@ class SupervisedDataSource:
         """
         pool = self.eval_dataset if self.eval_dataset is not None else self.dataset
         n = len(pool)
-        limit = n if int(eval_num_samples) < 0 else min(int(eval_num_samples), n)
-        for start in range(0, limit, int(batch_size)):
-            yield [pool[i] for i in range(start, min(start + int(batch_size), limit))]
+        limit = n if eval_num_samples < 0 else min(eval_num_samples, n)
+        for start in range(0, limit, batch_size):
+            yield [pool[i] for i in range(start, min(start + batch_size, limit))]
 
 
 __all__ = [

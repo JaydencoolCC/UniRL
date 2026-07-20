@@ -192,7 +192,7 @@ def patchify_latent(
     """Spatial ``[N, z, h·p, w·p]`` → packed ``[N, h·w, p²·z]`` (inverse of
     :func:`unpatchify_latent`; batched form of the vendored
     ``forward_cache_update_vae`` patchify einsum)."""
-    p, z = int(patch_size), int(latent_channels)
+    p, z = patch_size, latent_channels
     n = spatial.shape[0]
     cropped = spatial[:, :, : h * p, : w * p]
     blocks = cropped.reshape(n, z, h, p, w, p)
@@ -223,8 +223,8 @@ class BagelVAEEncodeStage:
                 f"BagelVAEEncodeStage.encode: expected pixels [B, 3, H, W], got "
                 f"{tuple(pixels.shape) if isinstance(pixels, torch.Tensor) else type(pixels).__name__}"
             )
-        height, width = int(pixels.shape[2]), int(pixels.shape[3])
-        down = int(self.bundle.latent_downsample)
+        height, width = pixels.shape[2], pixels.shape[3]
+        down = self.bundle.latent_downsample
         if height % down or width % down:
             raise ValueError(
                 f"BagelVAEEncodeStage.encode: image {height}x{width} must be divisible by latent_downsample={down}."
@@ -245,8 +245,8 @@ class BagelVAEEncodeStage:
             spatial.float(),
             h=h,
             w=w,
-            patch_size=int(self.bundle.latent_patch_size),
-            latent_channels=int(self.bundle.latent_channels),
+            patch_size=self.bundle.latent_patch_size,
+            latent_channels=self.bundle.latent_channels,
         )
         return ImageLatentCondition(latents=packed)
 

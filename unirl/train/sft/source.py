@@ -120,10 +120,10 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         if tokenizer is None:
             raise ValueError("ARSupervisedTrackBuilder: pipeline.bundle has no tokenizer.")
         self._tokenizer = tokenizer
-        if int(max_response_length) < 1:
+        if max_response_length < 1:
             raise ValueError(f"ARSupervisedTrackBuilder: max_response_length must be >= 1; got {max_response_length!r}")
-        self.max_response_length = int(max_response_length)
-        self.append_eos = bool(append_eos)
+        self.max_response_length = max_response_length
+        self.append_eos = append_eos
         # VLM chat stages take (texts, images); text-only ones take (texts).
         self._embed_takes_images = "images" in inspect.signature(self._chat_stage.embed).parameters
         self._warned_truncation = False
@@ -144,9 +144,9 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             conditions=conditions.to_dict(),
             segment=segment,
         )
-        if int(track.batch_size) != len(records):
+        if track.batch_size != len(records):
             raise RuntimeError(
-                f"ARSupervisedTrackBuilder.build: built {int(track.batch_size)} rows from {len(records)} "
+                f"ARSupervisedTrackBuilder.build: built {track.batch_size} rows from {len(records)} "
                 "records — token accounting is broken."
             )
         return track
@@ -208,7 +208,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
                 ids = ids[:budget]
                 truncated += 1
             if self.append_eos:
-                ids = list(ids) + [int(eos_id)]
+                ids = list(ids) + [eos_id]
             tokens.append(torch.tensor(ids, dtype=torch.long, device=device))
             # _eval_pad rows ride the forward but carry zero loss weight — the
             # trainer pads eval batches to the DP width with duplicates.
@@ -258,10 +258,10 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
     ) -> None:
         super().__init__()
         self.pipeline = pipeline
-        self.height = int(height)
-        self.width = int(width)
-        self.guidance_scale = float(guidance_scale)
-        align = int(resolution_align)
+        self.height = height
+        self.width = width
+        self.guidance_scale = guidance_scale
+        align = resolution_align
         if self.height % align or self.width % align:
             raise ValueError(
                 f"DiffusionSupervisedTrackBuilder: height/width ({self.height}x{self.width}) must be "
@@ -295,9 +295,9 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             conditions = self.pipeline.build_conditions(texts, **self._conditions_kwargs)
             pixels = self._load_target_pixels(records)
             latents = self._encode.encode(Images(pixels=pixels)).latents
-        if int(latents.shape[0]) != len(records):
+        if latents.shape[0] != len(records):
             raise RuntimeError(
-                f"DiffusionSupervisedTrackBuilder.build: encoded {int(latents.shape[0])} latents "
+                f"DiffusionSupervisedTrackBuilder.build: encoded {latents.shape[0]} latents "
                 f"from {len(records)} records."
             )
         pad = torch.tensor([0.0 if p else 1.0 for p in _pad_flags(records)], dtype=torch.float32)

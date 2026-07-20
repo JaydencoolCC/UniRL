@@ -67,11 +67,10 @@ class SFTTrainer(BaseTrainer):
         eval_num_samples: int = -1,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
-        self.batch_size = int(batch_size)
-        self.eval_interval = int(eval_interval)
-        self.eval_batch_size = max(1, int(eval_batch_size))
-        _num = int(eval_num_samples)
-        self.eval_num_samples = -1 if _num < 0 else _num
+        self.batch_size = batch_size
+        self.eval_interval = eval_interval
+        self.eval_batch_size = max(1, eval_batch_size)
+        self.eval_num_samples = -1 if eval_num_samples < 0 else eval_num_samples
 
         # Driver-side data iterator (not a Remote) — records stay light dicts;
         # tokenization / media loading run worker-side in the track builder.
@@ -85,7 +84,7 @@ class SFTTrainer(BaseTrainer):
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
             self.track_builder = remote_hydra(track_builder_cfg, pipeline=self.pipeline)
 
-        self.dp_size = int(self.stack.dp_size)
+        self.dp_size = self.stack.dp_size
         if self.batch_size % self.dp_size:
             raise ValueError(f"SFTTrainer: batch_size={self.batch_size} must be divisible by dp={self.dp_size}")
         logger.info("SFTTrainer ready: dp=%d batch=%d", self.dp_size, self.batch_size)
@@ -97,14 +96,12 @@ class SFTTrainer(BaseTrainer):
     def train_step(self, records: List[Dict[str, Any]], *, training_progress: float = 0.0) -> TrainStepResult:
         """records → worker-side track build → stack train. No rollout legs."""
         track = self.track_builder.build(records)
-        if int(track.batch_size) != len(records):
+        if track.batch_size != len(records):
             # AReaL's single-controller once broadcast SFT batches instead of
             # scattering them — 8× duplicated tokens with a correct-LOOKING loss.
             # Token conservation is cheap to assert; assert it.
-            raise RuntimeError(
-                f"SFTTrainer: track builder built {int(track.batch_size)} rows from {len(records)} records."
-            )
-        return self.stack.train_track(track, training_progress=float(training_progress))
+            raise RuntimeError(f"SFTTrainer: track builder built {track.batch_size} rows from {len(records)} records.")
+        return self.stack.train_track(track, training_progress=training_progress)
 
     # ------------------------------------------------------------------
     # Validation loss (full set, exact)

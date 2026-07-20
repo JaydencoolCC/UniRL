@@ -646,7 +646,7 @@ class BaseFSDP2Backend(Remote):
         """Ranks in the FSDP mesh whose gradient averaging loss scaling cancels."""
         mesh = self._loss_reduction_mesh
         if mesh is not None:
-            return int(mesh.size())
+            return mesh.size()
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             raise RuntimeError(
                 f"{type(self).__name__}: distributed training has no FSDP DeviceMesh; "
@@ -672,7 +672,7 @@ class BaseFSDP2Backend(Remote):
         tensor = torch.tensor(values, dtype=torch.float64, device=self._device)
         for group in mesh.get_all_groups():
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
-        return [float(value) for value in tensor.tolist()]
+        return tensor.tolist()
 
     def trainable_module(self) -> nn.Module:
         return self.model

@@ -97,8 +97,8 @@ class SFT(StageAlgorithm):
         if loss_agg_mode not in _LOSS_AGG_MODES:
             raise ValueError(f"SFT: loss_agg_mode must be one of {_LOSS_AGG_MODES}; got {loss_agg_mode!r}.")
         self.stage = stage
-        self.loss_agg_mode = str(loss_agg_mode)
-        self.horizon = int(horizon)
+        self.loss_agg_mode = loss_agg_mode
+        self.horizon = horizon
         self.conditions_cls = conditions_cls
         # token-mean pairs with the stack's global-token weighting; the seq-mean
         # modes weigh sequences equally, i.e. sample-share weighting.
@@ -120,7 +120,7 @@ class SFT(StageAlgorithm):
         del advantages, training_progress  # supervised: no advantage signal, no schedules
         if segment is None or segment.tokens is None or segment.lengths is None:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
-        if int(segment.tokens.shape[0]) == 0:
+        if segment.tokens.shape[0] == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         loss, aux = self._masked_ce(conditions, segment)
@@ -128,14 +128,14 @@ class SFT(StageAlgorithm):
 
         metrics: Dict[str, Any] = {
             "sft_ce": aux["token_mean"],
-            "sft_ppl": float(math.exp(min(aux["token_mean"], 20.0))),
+            "sft_ppl": math.exp(min(aux["token_mean"], 20.0)),
             "sft_tokens": aux["tokens"],
             "response_len_mean": float(segment.lengths.float().mean().item()),
         }
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
             metrics=metrics,
-            num_steps_or_tokens=int(round(aux["tokens"])),
+            num_steps_or_tokens=round(aux["tokens"]),
             has_backward=True,
         )
 
@@ -156,7 +156,7 @@ class SFT(StageAlgorithm):
         unused here (CE is deterministic) — accepted for a uniform signature.
         """
         del sample_ids
-        if segment is None or segment.tokens is None or int(segment.tokens.shape[0]) == 0:
+        if segment is None or segment.tokens is None or segment.tokens.shape[0] == 0:
             return 0.0, 0.0
         _, aux = self._masked_ce(conditions, segment)
         return aux["objective_sum"], aux["objective_weight"]
@@ -200,7 +200,7 @@ class SFT(StageAlgorithm):
 
             valid_parts = [(p, weight) for p, weight in zip(parts, token_weights) if weight > 0.0]
             if self.loss_agg_mode == "seq-mean-token-sum-norm":
-                per_seq = [p.sum() / float(self.horizon) for p, _ in valid_parts]
+                per_seq = [p.sum() / self.horizon for p, _ in valid_parts]
             else:  # seq-mean-token-mean
                 per_seq = [p.sum() / weight for p, weight in valid_parts]
             objective_sum = torch.stack(per_seq).sum() if per_seq else ce_sum * 0.0
@@ -280,19 +280,19 @@ class FlowMatchSFT(StageAlgorithm):
             raise ValueError(
                 f"FlowMatchSFT: timestep_sampling must be 'uniform' or 'logit_normal'; got {timestep_sampling!r}."
             )
-        if not float(timestep_shift) > 0.0:
+        if not timestep_shift > 0.0:
             raise ValueError(f"FlowMatchSFT: timestep_shift must be > 0; got {timestep_shift!r}.")
-        if not 0.0 < float(sigma_min) < 0.5:
+        if not 0.0 < sigma_min < 0.5:
             raise ValueError(f"FlowMatchSFT: sigma_min must lie in (0, 0.5); got {sigma_min!r}.")
         self.stage = stage
         self.params = params
         self.conditions_cls = conditions_cls
-        self.timestep_sampling = str(timestep_sampling)
-        self.logit_mean = float(logit_mean)
-        self.logit_std = float(logit_std)
-        self.timestep_shift = float(timestep_shift)
-        self.sigma_min = float(sigma_min)
-        self.eval_seed = int(eval_seed)
+        self.timestep_sampling = timestep_sampling
+        self.logit_mean = logit_mean
+        self.logit_std = logit_std
+        self.timestep_shift = timestep_shift
+        self.sigma_min = sigma_min
+        self.eval_seed = eval_seed
 
     # ------------------------------------------------------------------
     # StageAlgorithm contract
@@ -323,7 +323,7 @@ class FlowMatchSFT(StageAlgorithm):
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
             metrics=metrics,
-            num_steps_or_tokens=int(x0.shape[0]),
+            num_steps_or_tokens=x0.shape[0],
             has_backward=True,
         )
 
@@ -354,10 +354,10 @@ class FlowMatchSFT(StageAlgorithm):
         mask = getattr(segment, "loss_mask", None)
         if mask is not None:
             mask = mask.to(dtype=per_sample.dtype, device=per_sample.device).flatten()
-            if int(mask.shape[0]) != int(per_sample.shape[0]):
+            if mask.shape[0] != per_sample.shape[0]:
                 raise ValueError(
-                    f"FlowMatchSFT.evaluate_loss: loss_mask length {int(mask.shape[0])} != "
-                    f"batch {int(per_sample.shape[0])} (expected one weight per sample)."
+                    f"FlowMatchSFT.evaluate_loss: loss_mask length {mask.shape[0]} != "
+                    f"batch {per_sample.shape[0]} (expected one weight per sample)."
                 )
             return float((per_sample * mask).sum().item()), float(mask.sum().item())
         return float(per_sample.sum().item()), float(per_sample.shape[0])
@@ -403,7 +403,7 @@ class FlowMatchSFT(StageAlgorithm):
         """Per-sample deterministic ``(σ, ε)`` for eval — one seeded generator
         per sample keyed on its id, so a sample's noising is independent of the
         batch it lands in. Falls back to the row index when ids are absent."""
-        batch = int(x0.shape[0])
+        batch = x0.shape[0]
         device = x0.device
         sigmas: list[torch.Tensor] = []
         noises: list[torch.Tensor] = []
@@ -424,7 +424,7 @@ class FlowMatchSFT(StageAlgorithm):
         sigma: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        batch = int(x0.shape[0])
+        batch = x0.shape[0]
         device = x0.device
         typed_conds = typed_conditions(conditions, self.conditions_cls)
 
