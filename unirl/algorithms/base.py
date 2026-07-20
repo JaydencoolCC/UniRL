@@ -375,24 +375,9 @@ class StageAlgorithm(Remote, ABC):
     # Independent of ``requires_ema_rollout`` (DiffusionNFT needs the backend for its
     # EMA shadow). Default False — most algorithms take only the ``pipeline`` sibling.
     requires_backend: bool = False
-    # Whether ``compute_loss_and_backward`` reads the per-sample ``advantages``
-    # tensor. RL algorithms do (default True) and ``TrainStack`` enforces a
-    # populated ``resp_track.advantages`` for them. Supervised algorithms (SFT /
-    # FlowMatchSFT) override to False: the stack then permits ``advantages=None``
-    # and forwards it verbatim (the algorithm must ignore it).
+    # Whether the loss requires per-sample advantages. SFT variants set False.
     requires_advantages: bool = True
-    # How micro-batch losses combine into one optimizer step across the
-    # grad-accumulation loop AND data-parallel ranks:
-    #   - "sample" (default): every micro is weighted by its share of the
-    #     update's SAMPLES (today's behaviour — correct for seq-mean losses and
-    #     for the GRPO convention where each rank's shard weighs equally).
-    #   - "token": every micro is weighted by its share of the update's GLOBAL
-    #     valid-token count (all-reduced across DP), making the gradient equal
-    #     to the full-batch token-mean regardless of micro-batch packing or DP
-    #     layout (verl #3994 / NeMo-RL global_valid_toks convention). Only
-    #     meaningful for token-level losses over packed ``TextSegment``s; the
-    #     stack reads the count from ``segment.loss_mask`` (fallback:
-    #     ``segment.lengths``).
+    # Weight accumulated losses by samples or the global valid-token count.
     loss_weighting: str = "sample"
     # Segment fields this algorithm freezes as the π_old anchor in
     # :meth:`prepare_segment` (GRPO: ``("sde_logp",)``; FlowDPPO:

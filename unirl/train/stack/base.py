@@ -241,7 +241,7 @@ class TrainStack(Remote):
 
         loss_scales, global_weight = self._resolve_loss_scales(resp_track, micros=micros)
         micro_results: List[AlgorithmStepResult] = []
-        total_loss = 0.0
+        total_loss = 0.0  # sample-weighted local mean; made FSDP-global below
         weighted_loss_sum = 0.0  # Σ (micro token count × micro token-mean) — token weighting only
         has_backward = False
 
@@ -261,8 +261,12 @@ class TrainStack(Remote):
                 loss_scale=loss_scales[i],
             )
             micro_results.append(result)
-            total_loss += result.loss
-            if global_weight is not None:
+            if global_weight is None:
+                # Match the sample-share factors used for backward. Summing raw
+                # micro means would make train/loss scale with the micro count
+                # (FlowMatchSFT with bs=1 micros was the visible case).
+                total_loss += result.loss * loss_scales[i]
+            else:
                 weighted_loss_sum += result.loss * self._micro_loss_weight(resp_track, start, end)
             has_backward = has_backward or result.has_backward
 
@@ -302,7 +306,14 @@ class TrainStack(Remote):
                 "cuda_reserved_gb": torch.cuda.memory_reserved() / 2**30,
             }
 
-        if global_weight is not None:
+        if global_weight is None:
+            # DP_SCATTER gives every data rank the same sample count, so the
+            # optimized sample objective is the mean of these rank-local means.
+            # Reduce over the backend's actual FSDP mesh, matching its gradient
+            # averaging instead of returning rank 0's local proxy.
+            (global_loss_sum,) = self._all_reduce_sums([total_loss])
+            total_loss = global_loss_sum / float(self._loss_weight_world())
+        else:
             # Exact global token-mean of this update's loss: every rank enters
             # this collective (micro counts are rank-symmetric), so the logged
             # number equals the optimized objective — not a rank-local proxy
@@ -398,27 +409,16 @@ class TrainStack(Remote):
 
     def _loss_weight_world(self) -> int:
         """World size whose gradient averaging the token weighting must cancel."""
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            return int(dist.get_world_size())
-        return 1
+        return int(self.fsdp_backend.gradient_average_world_size())
 
     def _all_reduce_sums(self, values: List[float]) -> List[float]:
-        """SUM-all-reduce scalars over the training process group (no-op single-rank).
+        """SUM scalars over the backend's FSDP mesh (no-op single-rank).
 
         Every rank must call this the same number of times per step — callers keep
         the collective count rank-symmetric (micro plans are; DP_SCATTER shards are
         equal-sized).
         """
-        import torch.distributed as dist
-
-        if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
-            return list(values)
-        device = next(self.fsdp_backend.trainable_module().parameters()).device
-        t = torch.tensor(values, dtype=torch.float64, device=device)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        return [float(v) for v in t.tolist()]
+        return self.fsdp_backend.all_reduce_loss_sums(values)
 
     # ---- forward-only evaluation --------------------------------------------
 

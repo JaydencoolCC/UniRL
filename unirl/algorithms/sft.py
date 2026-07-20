@@ -147,18 +147,19 @@ class SFT(StageAlgorithm):
         segment: "TextSegment",
         sample_ids: Optional[Sequence[str]] = None,
     ) -> Tuple[float, float]:
-        """Forward-only ``(ce_sum, valid_token_count)`` for validation.
+        """Forward-only ``(objective_sum, objective_weight)`` for validation.
 
-        Raw sums (not means) so the caller can aggregate exactly across micros,
-        DP ranks, and eval batches — one loss implementation, one reduction
-        convention, shared with training. ``sample_ids`` is unused here (CE is
-        deterministic) — accepted for a uniform ``evaluate_loss`` signature.
+        ``token-mean`` returns raw CE and valid-token count. Sequence-mean modes
+        return the sum of their per-sequence objectives and the number of valid
+        sequences. The caller can therefore aggregate the exact training
+        objective across micros, DP ranks, and eval batches. ``sample_ids`` is
+        unused here (CE is deterministic) — accepted for a uniform signature.
         """
         del sample_ids
         if segment is None or segment.tokens is None or int(segment.tokens.shape[0]) == 0:
             return 0.0, 0.0
         _, aux = self._masked_ce(conditions, segment)
-        return aux["ce_sum"], aux["tokens"]
+        return aux["objective_sum"], aux["objective_weight"]
 
     # ------------------------------------------------------------------
     # Internals
@@ -169,7 +170,7 @@ class SFT(StageAlgorithm):
         conditions: Mapping[str, Condition],
         segment: "TextSegment",
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """One teacher-forced forward → (aggregated loss, raw sums).
+        """One teacher-forced forward → (aggregated loss, reduction stats).
 
         ``temperature=1.0`` — plain CE, never a sampling-matched rescale.
         """
@@ -187,26 +188,36 @@ class SFT(StageAlgorithm):
         ce_sum = nll.sum()
 
         if self.loss_agg_mode == "token-mean":
-            loss = ce_sum / max(tokens, 1.0)
+            objective_sum = ce_sum
+            objective_weight = tokens
         else:
             parts = torch.split(nll, segment.lengths.tolist())
+            if mask is not None:
+                mask_parts = torch.split(mask, segment.lengths.tolist())
+                token_weights = [float(m.sum().item()) for m in mask_parts]
+            else:
+                token_weights = [float(p.numel()) for p in parts]
+
+            valid_parts = [(p, weight) for p, weight in zip(parts, token_weights) if weight > 0.0]
             if self.loss_agg_mode == "seq-mean-token-sum-norm":
-                loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
-            else:  # seq-mean-token-mean — guard 0-length responses (mean of empty = NaN)
-                if mask is not None:
-                    mask_parts = torch.split(mask, segment.lengths.tolist())
-                    per_seq = [
-                        p.sum() / m.sum().clamp(min=1.0) if p.numel() else p.new_zeros(())
-                        for p, m in zip(parts, mask_parts)
-                    ]
-                else:
-                    per_seq = [p.mean() if p.numel() else p.new_zeros(()) for p in parts]
-                loss = torch.stack(per_seq).mean()
+                per_seq = [p.sum() / float(self.horizon) for p, _ in valid_parts]
+            else:  # seq-mean-token-mean
+                per_seq = [p.sum() / weight for p, weight in valid_parts]
+            objective_sum = torch.stack(per_seq).sum() if per_seq else ce_sum * 0.0
+            objective_weight = float(len(per_seq))
+
+        loss = objective_sum / max(objective_weight, 1.0)
 
         token_mean = float((ce_sum / max(tokens, 1.0)).detach().item())
         if not math.isfinite(token_mean):
             raise RuntimeError(f"SFT: non-finite CE (token_mean={token_mean!r}, tokens={tokens}).")
-        return loss, {"ce_sum": float(ce_sum.detach().item()), "tokens": tokens, "token_mean": token_mean}
+        return loss, {
+            "ce_sum": float(ce_sum.detach().item()),
+            "tokens": tokens,
+            "token_mean": token_mean,
+            "objective_sum": float(objective_sum.detach().item()),
+            "objective_weight": objective_weight,
+        }
 
 
 class FlowMatchSFT(StageAlgorithm):
