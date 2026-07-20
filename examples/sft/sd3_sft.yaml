@@ -2,7 +2,7 @@
 # SFT — SD3.5-medium flow-matching finetune on (caption, image) pairs (LoRA).
 #
 # Diffusion SFT = FlowMatchSFT (σ-sampled velocity MSE) over x0-only tracks
-# built by DiffusionSupervisedSource: prompts through the pipeline's own
+# built by DiffusionSupervisedTrackBuilder: prompts through the pipeline's own
 # build_conditions, target images through the bundle's VAE encode stage
 # (strict inverse of decode). timestep_shift matches SD3's inference schedule
 # (shift=3.0) so training visits the noise band inference uses.
@@ -113,8 +113,8 @@ stack:
   micro_batch_size: 4
   max_grad_norm: 1.0
 
-source:
-  _target_: unirl.train.sft.source.DiffusionSupervisedSource
+track_builder:
+  _target_: unirl.train.sft.source.DiffusionSupervisedTrackBuilder
   height: 512
   width: 512
   guidance_scale: 1.0              # pure conditional branch — no CFG double-forward

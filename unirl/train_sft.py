@@ -26,7 +26,7 @@ def main(cfg: DictConfig) -> None:
         backend_cfg=cfg.backend,
         algorithm_cfg=cfg.algorithm,
         stack_cfg=cfg.stack,
-        source_cfg=cfg.source,
+        track_builder_cfg=cfg.track_builder,
         data_source_cfg=cfg.data_source,
         logging_cfg=cfg.get("logging"),
         eval_interval=int(cfg.get("eval_interval", 0)),

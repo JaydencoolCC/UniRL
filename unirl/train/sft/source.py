@@ -1,4 +1,4 @@
-"""SupervisedSource — worker-side track builders for the SFT domain.
+"""Worker-side supervised track builders for the SFT domain.
 
 In the RL loop the rollout engine is the data producer: it turns a request
 into a ``RolloutTrack`` (conditions + segment) that ``TrainStack.train_track``
@@ -48,7 +48,7 @@ def _load_pil_image(uri: str):
 
     if uri.startswith(("http://", "https://", "s3://", "gs://")):
         raise NotImplementedError(
-            f"SupervisedSource: remote media URIs are not supported yet ({uri!r}); "
+            f"SupervisedTrackBuilder: remote media URIs are not supported yet ({uri!r}); "
             "download to local/shared storage and reference the path."
         )
     return PILImage.open(uri).convert("RGB")
@@ -73,7 +73,14 @@ def _pad_flags(records: Sequence[Record]) -> List[bool]:
     return [bool(r.get("_eval_pad", False)) for r in records]
 
 
-class ARSupervisedSource(Remote):
+class SupervisedTrackBuilder(Remote):
+    """Worker-side interface for converting normalized records into tracks."""
+
+    def build(self, records: List[Record]) -> RolloutTrack:
+        raise NotImplementedError
+
+
+class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
     """Dataset records → AR ``RolloutTrack`` (LLM + VLM), via the bundle's stages.
 
     Prompt side: the pipeline's chat-template stage (``add_generation_prompt``
@@ -106,15 +113,15 @@ class ARSupervisedSource(Remote):
         self._chat_stage = getattr(pipeline, chat_stage_attr, None)
         if self._chat_stage is None or not callable(getattr(self._chat_stage, "embed", None)):
             raise ValueError(
-                f"ARSupervisedSource: pipeline.{chat_stage_attr} is missing or has no .embed(); "
+                f"ARSupervisedTrackBuilder: pipeline.{chat_stage_attr} is missing or has no .embed(); "
                 f"point chat_stage_attr at the pipeline's chat-template stage."
             )
         tokenizer = getattr(pipeline.bundle, "tokenizer", None)
         if tokenizer is None:
-            raise ValueError("ARSupervisedSource: pipeline.bundle has no tokenizer.")
+            raise ValueError("ARSupervisedTrackBuilder: pipeline.bundle has no tokenizer.")
         self._tokenizer = tokenizer
         if int(max_response_length) < 1:
-            raise ValueError(f"ARSupervisedSource: max_response_length must be >= 1; got {max_response_length!r}")
+            raise ValueError(f"ARSupervisedTrackBuilder: max_response_length must be >= 1; got {max_response_length!r}")
         self.max_response_length = int(max_response_length)
         self.append_eos = bool(append_eos)
         # VLM chat stages take (texts, images); text-only ones take (texts).
@@ -125,7 +132,7 @@ class ARSupervisedSource(Remote):
     def build(self, records: List[Record]) -> RolloutTrack:
         """Tokenize + embed one shard of supervised records into a root track."""
         if not records:
-            raise ValueError("ARSupervisedSource.build: empty record shard.")
+            raise ValueError("ARSupervisedTrackBuilder.build: empty record shard.")
         with torch.no_grad():
             conditions = self._embed_prompts(records)
             tokens, loss_masks = self._tokenize_responses(records)
@@ -139,7 +146,7 @@ class ARSupervisedSource(Remote):
         )
         if int(track.batch_size) != len(records):
             raise RuntimeError(
-                f"ARSupervisedSource.build: built {int(track.batch_size)} rows from {len(records)} "
+                f"ARSupervisedTrackBuilder.build: built {int(track.batch_size)} rows from {len(records)} "
                 "records — token accounting is broken."
             )
         return track
@@ -152,7 +159,7 @@ class ARSupervisedSource(Remote):
         for r in records:
             if "messages" in r:
                 raise NotImplementedError(
-                    "ARSupervisedSource: multi-turn 'messages' records are not supported yet — "
+                    "ARSupervisedTrackBuilder: multi-turn 'messages' records are not supported yet — "
                     "use single-turn {'prompt', 'response'} rows (multi-turn interleaved masking "
                     "is a follow-up with its own template-consistency tests)."
                 )
@@ -164,7 +171,7 @@ class ARSupervisedSource(Remote):
             uris = _media_uris(r, role="condition")
             if len(uris) > 1:
                 raise ValueError(
-                    f"ARSupervisedSource: at most one role='condition' image per record "
+                    f"ARSupervisedTrackBuilder: at most one role='condition' image per record "
                     f"(sample {r.get('sample_id')!r} has {len(uris)})."
                 )
             images.append(_load_pil_image(uris[0]) if uris else None)
@@ -178,7 +185,7 @@ class ARSupervisedSource(Remote):
         if isinstance(eos_id, (list, tuple)):
             eos_id = eos_id[0] if eos_id else None
         if self.append_eos and eos_id is None:
-            raise ValueError("ARSupervisedSource: append_eos=True but the tokenizer has no eos_token_id.")
+            raise ValueError("ARSupervisedTrackBuilder: append_eos=True but the tokenizer has no eos_token_id.")
 
         tokens: List[torch.Tensor] = []
         masks: List[torch.Tensor] = []
@@ -187,13 +194,13 @@ class ARSupervisedSource(Remote):
             response = r.get("response")
             if not isinstance(response, str) or not response:
                 raise ValueError(
-                    f"ARSupervisedSource: record {r.get('sample_id')!r} has no non-empty 'response' — "
+                    f"ARSupervisedTrackBuilder: record {r.get('sample_id')!r} has no non-empty 'response' — "
                     "AR SFT manifests must carry the target text."
                 )
             ids = self._tokenizer(response, add_special_tokens=False)["input_ids"]
             if not ids:
                 raise ValueError(
-                    f"ARSupervisedSource: response of record {r.get('sample_id')!r} tokenized to zero "
+                    f"ARSupervisedTrackBuilder: response of record {r.get('sample_id')!r} tokenized to zero "
                     "tokens — a sample with no supervision would poison the loss denominator."
                 )
             budget = self.max_response_length - (1 if self.append_eos else 0)
@@ -210,7 +217,7 @@ class ARSupervisedSource(Remote):
         if truncated and not self._warned_truncation:
             self._warned_truncation = True
             logger.warning(
-                "ARSupervisedSource: %d/%d responses truncated to max_response_length=%d (EOS kept). "
+                "ARSupervisedTrackBuilder: %d/%d responses truncated to max_response_length=%d (EOS kept). "
                 "This warning is emitted once.",
                 truncated,
                 len(records),
@@ -219,7 +226,7 @@ class ARSupervisedSource(Remote):
         return tokens, masks
 
 
-class DiffusionSupervisedSource(Remote):
+class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
     """Dataset records → diffusion ``RolloutTrack`` with an x0-only segment.
 
     Prompt side: the pipeline's own ``build_conditions`` (the exact conditions
@@ -257,20 +264,20 @@ class DiffusionSupervisedSource(Remote):
         align = int(resolution_align)
         if self.height % align or self.width % align:
             raise ValueError(
-                f"DiffusionSupervisedSource: height/width ({self.height}x{self.width}) must be "
+                f"DiffusionSupervisedTrackBuilder: height/width ({self.height}x{self.width}) must be "
                 f"divisible by {align} (VAE downsample × transformer patch size)."
             )
         self._encode = getattr(pipeline, encode_stage_attr, None)
         if self._encode is None or not callable(getattr(self._encode, "encode", None)):
             raise ValueError(
-                f"DiffusionSupervisedSource: pipeline.{encode_stage_attr} is missing or has no "
+                f"DiffusionSupervisedTrackBuilder: pipeline.{encode_stage_attr} is missing or has no "
                 f".encode() — this model family needs a VAE encode stage (see the add-model-bundle "
                 f"skill, checklist item 10; WAN21ImageLatentEncodeStage is the template)."
             )
         build_conditions = getattr(pipeline, "build_conditions", None)
         if not callable(build_conditions):
             raise ValueError(
-                "DiffusionSupervisedSource: pipeline has no build_conditions(texts, ...) — "
+                "DiffusionSupervisedTrackBuilder: pipeline has no build_conditions(texts, ...) — "
                 "add one (every diffusion pipeline exposes it) so SFT encodes prompts exactly "
                 "like rollout does."
             )
@@ -282,7 +289,7 @@ class DiffusionSupervisedSource(Remote):
     def build(self, records: List[Record]) -> RolloutTrack:
         """Encode one shard of (prompt, target image) records into a root track."""
         if not records:
-            raise ValueError("DiffusionSupervisedSource.build: empty record shard.")
+            raise ValueError("DiffusionSupervisedTrackBuilder.build: empty record shard.")
         with torch.no_grad():
             texts = Texts(texts=[str(r["prompt"]) for r in records])
             conditions = self.pipeline.build_conditions(texts, **self._conditions_kwargs)
@@ -290,7 +297,8 @@ class DiffusionSupervisedSource(Remote):
             latents = self._encode.encode(Images(pixels=pixels)).latents
         if int(latents.shape[0]) != len(records):
             raise RuntimeError(
-                f"DiffusionSupervisedSource.build: encoded {int(latents.shape[0])} latents from {len(records)} records."
+                f"DiffusionSupervisedTrackBuilder.build: encoded {int(latents.shape[0])} latents "
+                f"from {len(records)} records."
             )
         pad = torch.tensor([0.0 if p else 1.0 for p in _pad_flags(records)], dtype=torch.float32)
         segment = make_image_segment(
@@ -319,7 +327,7 @@ class DiffusionSupervisedSource(Remote):
             uris = _media_uris(r, role="target")
             if len(uris) != 1:
                 raise ValueError(
-                    f"DiffusionSupervisedSource: record {r.get('sample_id')!r} must carry exactly one "
+                    f"DiffusionSupervisedTrackBuilder: record {r.get('sample_id')!r} must carry exactly one "
                     f"role='target' image media ref (got {len(uris)}) — diffusion SFT manifests are "
                     "(prompt, target image) pairs."
                 )
@@ -331,4 +339,8 @@ class DiffusionSupervisedSource(Remote):
         return torch.stack(rows, dim=0)
 
 
-__all__ = ["ARSupervisedSource", "DiffusionSupervisedSource"]
+__all__ = [
+    "ARSupervisedTrackBuilder",
+    "DiffusionSupervisedTrackBuilder",
+    "SupervisedTrackBuilder",
+]

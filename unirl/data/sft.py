@@ -18,7 +18,7 @@ against the manifest's directory):
   for ``prompt``)
 
 Rows are OPAQUE records driver-side — media loading and tokenization happen on
-the training workers (``unirl/train/sft/source.py``), so nothing heavy crosses
+the training workers (``unirl/train/sft/source.py`` track builders), so nothing heavy crosses
 the driver/Ray boundary.
 
 Epoch semantics: :class:`SupervisedDataSource` walks a per-epoch reshuffled
@@ -63,8 +63,8 @@ def normalize_supervised_example(
 
     Returns ``{"sample_id", "prompt", ["response"], ["media_refs"],
     ["metadata"]}``. ``response`` stays optional here — whether it is required
-    is a per-domain decision the worker-side source enforces (AR requires it;
-    diffusion requires a ``role="target"`` media ref instead).
+    is a per-domain decision the worker-side track builder enforces (AR
+    requires it; diffusion requires a ``role="target"`` media ref instead).
     """
     if not isinstance(item, dict):
         raise TypeError(f"Supervised example must be a dict, got {type(item).__name__}.")

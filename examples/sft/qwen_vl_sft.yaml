@@ -1,9 +1,9 @@
 # @package _global_
 # SFT — Qwen2.5-VL instruction tuning (VLM path: image + prompt → response).
 #
-# Same source/algorithm as the LLM recipe — the VLM delta lives entirely in the
+# Same track builder/algorithm as the LLM recipe — the VLM delta lives entirely in the
 # model package (QwenVLChatTemplateStage handles image expansion + M-RoPE);
-# ARSupervisedSource feeds it role="condition" images from the manifest.
+# ARSupervisedTrackBuilder feeds it role="condition" images from the manifest.
 #
 # Env:
 #   QWEN_VL_PATH    HF id or local checkpoint (default Qwen/Qwen2.5-VL-7B-Instruct)
@@ -90,8 +90,8 @@ stack:
   micro_batch_size: 1               # multimodal AR forward is heavy (full-logits padded path)
   max_grad_norm: 1.0
 
-source:
-  _target_: unirl.train.sft.source.ARSupervisedSource
+track_builder:
+  _target_: unirl.train.sft.source.ARSupervisedTrackBuilder
   max_response_length: 1024
 
 data_source:

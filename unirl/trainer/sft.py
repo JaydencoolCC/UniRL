@@ -3,12 +3,12 @@
 The supervised sibling of :class:`~unirl.trainer.ar.ARTrainer` /
 :class:`~unirl.trainer.diffusion.DiffusionTrainer`: same consumer side
 (``bundle → pipeline → backend → algorithm → stack`` siblings on one
-placement), but the data producer is a dataset-backed ``SupervisedSource``
+placement), but the data producer is a dataset-backed ``SupervisedTrackBuilder``
 instead of a rollout engine — no reward service, no advantages, no weight
 sync, no sampling params. Each step::
 
     records = data_source.get_samples(batch_size)       # driver-side rows
-    track   = source.build(records)                     # worker-side encode → RolloutTrack
+    track   = track_builder.build(records)              # worker-side encode → RolloutTrack
     result  = stack.train_track(track, ...)             # the SAME stack RL uses
 
 The algorithm (``unirl.algorithms.SFT`` / ``FlowMatchSFT``) declares
@@ -59,7 +59,7 @@ class SFTTrainer(BaseTrainer):
         backend_cfg: DictConfig,
         algorithm_cfg: DictConfig,
         stack_cfg: DictConfig,
-        source_cfg: DictConfig,
+        track_builder_cfg: DictConfig,
         data_source_cfg: DictConfig,
         logging_cfg: Optional[DictConfig] = None,
         eval_interval: int = 0,
@@ -74,7 +74,7 @@ class SFTTrainer(BaseTrainer):
         self.eval_num_samples = -1 if _num < 0 else _num
 
         # Driver-side data iterator (not a Remote) — records stay light dicts;
-        # tokenization / media loading run worker-side in the source.
+        # tokenization / media loading run worker-side in the track builder.
         self.data_source = instantiate(data_source_cfg)
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
@@ -83,7 +83,7 @@ class SFTTrainer(BaseTrainer):
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
-            self.source = remote_hydra(source_cfg, pipeline=self.pipeline)
+            self.track_builder = remote_hydra(track_builder_cfg, pipeline=self.pipeline)
 
         self.dp_size = int(self.stack.dp_size)
         if self.batch_size % self.dp_size:
@@ -96,12 +96,14 @@ class SFTTrainer(BaseTrainer):
 
     def train_step(self, records: List[Dict[str, Any]], *, training_progress: float = 0.0) -> TrainStepResult:
         """records → worker-side track build → stack train. No rollout legs."""
-        track = self.source.build(records)
+        track = self.track_builder.build(records)
         if int(track.batch_size) != len(records):
             # AReaL's single-controller once broadcast SFT batches instead of
             # scattering them — 8× duplicated tokens with a correct-LOOKING loss.
             # Token conservation is cheap to assert; assert it.
-            raise RuntimeError(f"SFTTrainer: source built {int(track.batch_size)} rows from {len(records)} records.")
+            raise RuntimeError(
+                f"SFTTrainer: track builder built {int(track.batch_size)} rows from {len(records)} records."
+            )
         return self.stack.train_track(track, training_progress=float(training_progress))
 
     # ------------------------------------------------------------------
@@ -115,7 +117,7 @@ class SFTTrainer(BaseTrainer):
         batches = 0
         for records in self.data_source.iter_eval_batches(self.eval_batch_size, eval_num_samples=self.eval_num_samples):
             records = self._pad_to_dp(records)
-            metrics = self.stack.eval_track(self.source.build(records))
+            metrics = self.stack.eval_track(self.track_builder.build(records))
             loss_sum += float(metrics["loss"]) * float(metrics["weight"])
             weight_sum += float(metrics["weight"])
             batches += 1
@@ -139,7 +141,7 @@ class SFTTrainer(BaseTrainer):
 
         DP_SCATTER needs divisibility; dropping the tail would silently shrink
         the eval set. Padded rows are duplicates flagged ``_eval_pad`` — the
-        sources zero their loss weight, so coverage stays exact.
+        track builders zero their loss weight, so coverage stays exact.
         """
         records = list(records)
         while len(records) % self.dp_size:

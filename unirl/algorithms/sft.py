@@ -18,8 +18,8 @@ Neither reads ``advantages`` / ``old_logp`` / SDE trajectories — both declare
 ``requires_advantages = False`` and leave :meth:`prepare_segment` as the no-op
 the base docstring promises for anchor-free algorithms. Both are driven by the
 regular :class:`~unirl.train.stack.TrainStack`; tracks come from a
-``SupervisedSource`` (``unirl/train/sft/source.py``) instead of a rollout
-engine.
+``SupervisedTrackBuilder`` (``unirl/train/sft/source.py``) instead of a
+rollout engine.
 
 Loss-normalization contract (the cross-framework lesson): token-level CE must
 be normalized by the GLOBAL valid-token count of one optimizer step — across
@@ -360,7 +360,7 @@ class FlowMatchSFT(StageAlgorithm):
         if segment is None or segment.latents is None:
             raise ValueError(
                 "FlowMatchSFT requires segment.latents with the clean target latent at "
-                "the last trajectory position (a SupervisedSource-built x0-only segment)."
+                "the last trajectory position (a SupervisedTrackBuilder-built x0-only segment)."
             )
         x0 = segment.latents[:, -1]
         if x0.numel() == 0:
