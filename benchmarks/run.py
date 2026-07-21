@@ -56,9 +56,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, help="t2i: image height (default: pipeline default)")
     parser.add_argument("--width", type=int, help="t2i: image width (default: pipeline default)")
     parser.add_argument("--shard", default="0/1", help="t2i generate: 'i/n' to split work across n processes")
-    parser.add_argument("--sim-even-batches", metavar="WxB",
-                        help="t2i: also report the metric under a simulated distributed eval that repeats "
-                             "the last partial wave (e.g. '32x32' = 32 GPUs x batch 32); default: 800 unique only")
+    parser.add_argument(
+        "--sim-even-batches",
+        metavar="WxB",
+        help="t2i: also report the metric under a simulated distributed eval that repeats "
+        "the last partial wave (e.g. '32x32' = 32 GPUs x batch 32); default: 800 unique only",
+    )
     parser.add_argument("--concurrency", type=int, default=8, help="text: concurrent requests to --endpoint")
     parser.add_argument("--dry-run", action="store_true", help="print the plan, touch nothing")
     return parser.parse_args()
@@ -114,9 +117,7 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
         # under CLI overrides. Without this, t2i benchmarks silently used the diffusers pipeline
         # defaults (~28 steps / cfg 7.0 / 1024px), a top cause of the issue #221 mismatch.
         gen_kwargs = dict(spec.gen)
-        gen_kwargs.update(
-            {T2I_KWARGS[k_]: v for k_, v in vars(args).items() if k_ in T2I_KWARGS and v is not None}
-        )
+        gen_kwargs.update({T2I_KWARGS[k_]: v for k_, v in vars(args).items() if k_ in T2I_KWARGS and v is not None})
         shard = tuple(int(x) for x in args.shard.split("/"))
         run_t2i(
             prompts,

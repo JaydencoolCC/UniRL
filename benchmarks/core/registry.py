@@ -94,8 +94,7 @@ _ALL = (
         # DPPO GenEval2 reproduction regime. Key params: 512px, 40 steps, cfg 1.0,
         # max_sequence_length 256 (SD3 default; passing 512 halves the score), + the linspace
         # flow-match sigma grid (t2i_linspace_sigmas). See benchmarks/image/geneval2/README.md.
-        gen={"num_inference_steps": 40, "guidance_scale": 1.0, "height": 512, "width": 512,
-             "max_sequence_length": 256},
+        gen={"num_inference_steps": 40, "guidance_scale": 1.0, "height": 512, "width": 512, "max_sequence_length": 256},
         t2i_linspace_sigmas=True,
         t2i_prompt_seed=True,
         notes="In-domain compositional T2I (Soft-TIFA VQAScore via Qwen3-VL); the DPPO GenEval2 train set. Eval at 512px/40-step/cfg1.0; see README for the reproduction configs.",

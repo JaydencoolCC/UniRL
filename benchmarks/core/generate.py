@@ -101,7 +101,7 @@ def run_t2i(
     def _seed(p: int, s: int) -> int:
         if prompt_seed:  # deterministic per prompt CONTENT (reproducible), CPU generator
             h = int.from_bytes(hashlib.sha256(prompts[p].encode()).digest()[:4], "big")
-            return (seed + h + s) % (2 ** 31)
+            return (seed + h + s) % (2**31)
         return seed + 1000 * p + s
 
     images_dir.mkdir(parents=True, exist_ok=True)

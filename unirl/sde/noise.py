@@ -38,7 +38,7 @@ def _derive_group_seed(base_seed: int, group_id: str) -> int:
     """
     gid = str(group_id)
     if gid.startswith(PROMPT_SEED_PREFIX):
-        prompt = gid[len(PROMPT_SEED_PREFIX):]
+        prompt = gid[len(PROMPT_SEED_PREFIX) :]
         digest = hashlib.sha256(prompt.encode("utf-8")).digest()
         return (int(base_seed) + int.from_bytes(digest[:4], "big")) % (2**31)
     payload = f"{int(base_seed)}::{gid}".encode("utf-8")
