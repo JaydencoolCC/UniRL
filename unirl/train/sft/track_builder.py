@@ -156,13 +156,21 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
     # ------------------------------------------------------------------
 
     def _embed_prompts(self, records: Sequence[Record]) -> Any:
-        for r in records:
-            if "messages" in r:
-                raise NotImplementedError(
-                    "ARSupervisedTrackBuilder: multi-turn 'messages' records are not supported yet — "
-                    "use single-turn {'prompt', 'response'} rows (multi-turn interleaved masking "
-                    "is a follow-up with its own template-consistency tests)."
+        agent_flags = ["messages" in r for r in records]
+        if any(agent_flags):
+            if not all(agent_flags):
+                raise ValueError("ARSupervisedTrackBuilder: a batch may not mix prompt/response and agent records.")
+            if any(r.get("media_refs") for r in records):
+                raise ValueError("ARSupervisedTrackBuilder: agent messages currently support text-only records.")
+            embed_messages = getattr(self._chat_stage, "embed_messages", None)
+            if not callable(embed_messages):
+                raise ValueError(
+                    "ARSupervisedTrackBuilder: this pipeline's chat stage does not support OpenAI-style messages."
                 )
+            histories = [r["messages"][:-1] for r in records]
+            tools = [r.get("tools") for r in records]
+            return embed_messages(histories, tools=tools)
+
         texts = Texts(texts=[str(r["prompt"]) for r in records])
         if not self._embed_takes_images:
             return self._chat_stage.embed(texts)
@@ -191,23 +199,29 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         masks: List[torch.Tensor] = []
         truncated = 0
         for r, is_pad in zip(records, _pad_flags(records)):
-            response = r.get("response")
-            if not isinstance(response, str) or not response:
-                raise ValueError(
-                    f"ARSupervisedTrackBuilder: record {r.get('sample_id')!r} has no non-empty 'response' — "
-                    "AR SFT manifests must carry the target text."
-                )
-            ids = self._tokenizer(response, add_special_tokens=False)["input_ids"]
+            if "messages" in r:
+                ids = self._tokenize_agent_target(r, eos_id=eos_id)
+            else:
+                response = r.get("response")
+                if not isinstance(response, str) or not response:
+                    raise ValueError(
+                        f"ARSupervisedTrackBuilder: record {r.get('sample_id')!r} has no non-empty 'response' — "
+                        "AR SFT manifests must carry the target text."
+                    )
+                ids = self._tokenizer(response, add_special_tokens=False)["input_ids"]
             if not ids:
                 raise ValueError(
-                    f"ARSupervisedTrackBuilder: response of record {r.get('sample_id')!r} tokenized to zero "
+                    f"ARSupervisedTrackBuilder: target of record {r.get('sample_id')!r} tokenized to zero "
                     "tokens — a sample with no supervision would poison the loss denominator."
                 )
-            budget = self.max_response_length - (1 if self.append_eos else 0)
+            needs_eos = self.append_eos and (not ids or ids[-1] != eos_id)
+            budget = self.max_response_length - (1 if needs_eos else 0)
             if len(ids) > budget:
-                ids = ids[:budget]
+                ids = list(ids[:budget])
                 truncated += 1
-            if self.append_eos:
+                if not needs_eos and eos_id is not None:
+                    ids[-1] = eos_id
+            if needs_eos:
                 ids = list(ids) + [eos_id]
             tokens.append(torch.tensor(ids, dtype=torch.long, device=device))
             # _eval_pad rows ride the forward but carry zero loss weight — the
@@ -224,6 +238,50 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
                 self.max_response_length,
             )
         return tokens, masks
+
+    def _tokenize_agent_target(self, record: Record, *, eos_id: Optional[int]) -> List[int]:
+        """Render one final assistant turn and return only its supervised suffix."""
+        messages = record["messages"]
+        history = messages[:-1]
+        tools = record.get("tools")
+        prompt_ids = self._apply_chat_template_ids(history, tools=tools, add_generation_prompt=True)
+        full_ids = self._apply_chat_template_ids(messages, tools=tools, add_generation_prompt=False)
+        if full_ids[: len(prompt_ids)] != prompt_ids:
+            raise ValueError(
+                "ARSupervisedTrackBuilder: agent target is not a suffix of its rendered history. "
+                "Ensure pipeline.enable_thinking matches the dataset's assistant reasoning format."
+            )
+        target_ids = full_ids[len(prompt_ids) :]
+        if eos_id is not None and eos_id in target_ids:
+            # Templates commonly append a newline after <|im_end|>. It is not
+            # part of the assistant turn and would supervise a token generated
+            # only after the model's stop token.
+            target_ids = target_ids[: len(target_ids) - target_ids[::-1].index(eos_id)]
+        return target_ids
+
+    def _apply_chat_template_ids(
+        self,
+        messages: Sequence[Dict[str, Any]],
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]],
+        add_generation_prompt: bool,
+    ) -> List[int]:
+        rendered = self._tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=bool(getattr(self._chat_stage, "enable_thinking", False)),
+            tokenize=True,
+            return_dict=False,
+            truncation=False,
+        )
+        if isinstance(rendered, dict):
+            rendered = rendered["input_ids"]
+        if isinstance(rendered, torch.Tensor):
+            rendered = rendered.tolist()
+        if rendered and isinstance(rendered[0], list):
+            rendered = rendered[0]
+        return [int(token_id) for token_id in rendered]
 
 
 class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
