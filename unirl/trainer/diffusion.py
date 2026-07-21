@@ -400,7 +400,26 @@ class DiffusionTrainer(BaseTrainer):
         init_noise_group_ids: list = []
         init_noise_latent_shape = self._noise_latent_shape
         if init_noise_latent_shape is not None:
-            if bool(getattr(base.get("diffusion"), "init_same_noise", False)):
+            # Eval (base_sampling is not None): seed x_T per prompt CONTENT so the same prompt
+            # yields the same image across steps/checkpoints -> reproducible, comparable eval.
+            # Pair with eval_samples_per_prompt=1 (siblings would otherwise share x_T).
+            # Training keeps per-rollout/per-sample varying noise.
+            is_eval = (
+                base_sampling is not None
+                and "text" in inputs.primitives
+                and hasattr(inputs.primitives["text"], "texts")
+            )
+            if is_eval:
+                from unirl.sde.noise import PROMPT_SEED_PREFIX
+
+                texts = list(inputs.primitives["text"].texts)
+                if len(texts) != len(inputs.sample_ids):
+                    raise ValueError(
+                        f"eval prompt-text count {len(texts)} != sample count "
+                        f"{len(inputs.sample_ids)}; cannot key x_T on prompt content."
+                    )
+                init_noise_group_ids = [f"{PROMPT_SEED_PREFIX}{t}" for t in texts]
+            elif bool(getattr(base.get("diffusion"), "init_same_noise", False)):
                 init_noise_group_ids = [f"r{rollout_id}:{g}" for g in inputs.group_ids]
             else:
                 init_noise_group_ids = [f"r{rollout_id}:{s}" for s in inputs.sample_ids]

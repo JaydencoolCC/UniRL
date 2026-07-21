@@ -56,6 +56,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, help="t2i: image height (default: pipeline default)")
     parser.add_argument("--width", type=int, help="t2i: image width (default: pipeline default)")
     parser.add_argument("--shard", default="0/1", help="t2i generate: 'i/n' to split work across n processes")
+    parser.add_argument("--sim-even-batches", metavar="WxB",
+                        help="t2i: also report the metric under a simulated distributed eval that repeats "
+                             "the last partial wave (e.g. '32x32' = 32 GPUs x batch 32); default: 800 unique only")
     parser.add_argument("--concurrency", type=int, default=8, help="text: concurrent requests to --endpoint")
     parser.add_argument("--dry-run", action="store_true", help="print the plan, touch nothing")
     return parser.parse_args()
@@ -107,7 +110,13 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
     if args.stage in ("all", "generate"):
         if resolved is None:
             raise SystemExit(f"{spec.name}: --ckpt is required to generate images")
-        gen_kwargs = {T2I_KWARGS[k_]: v for k_, v in vars(args).items() if k_ in T2I_KWARGS and v is not None}
+        # Spec generation defaults (diffusers kwarg names, e.g. geneval2 -> 512px/40-step/cfg1.0)
+        # under CLI overrides. Without this, t2i benchmarks silently used the diffusers pipeline
+        # defaults (~28 steps / cfg 7.0 / 1024px), a top cause of the issue #221 mismatch.
+        gen_kwargs = dict(spec.gen)
+        gen_kwargs.update(
+            {T2I_KWARGS[k_]: v for k_, v in vars(args).items() if k_ in T2I_KWARGS and v is not None}
+        )
         shard = tuple(int(x) for x in args.shard.split("/"))
         run_t2i(
             prompts,
@@ -118,6 +127,8 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
             seed=args.seed,
             gen_kwargs=gen_kwargs,
             shard=shard,
+            linspace_sigmas=spec.t2i_linspace_sigmas,
+            prompt_seed=spec.t2i_prompt_seed,
         )
     if args.stage in ("all", "score"):
         if not spec.rewards:
@@ -149,9 +160,23 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
                 f.write(json.dumps({"image": path.name, "prompt": prompt, "scores": row}) + "\n")
         scored = [row for row in rows if row]
         keys = sorted({k_ for row in scored for k_ in row})
+        # Config 1 (default): 800 unique prompts, plain mean.
         metrics = {
             k_: sum(row[k_] for row in scored if k_ in row) / max(1, sum(k_ in row for row in scored)) for k_ in keys
         }
+        # Config 2 (optional): simulate a distributed eval of WxB that repeats the last partial wave
+        # of batches to fill the world size, so a fixed prefix of prompts is double-counted.
+        if args.sim_even_batches:
+            world, bs = (int(x) for x in args.sim_even_batches.lower().split("x"))
+            n = len(prompts)
+            per_prompt = {k_: [rows[p * k + s].get(k_) for p in range(n) for s in range(k)] for k_ in keys}
+            n_batches = (n * k + bs - 1) // bs
+            pad = (world - n_batches % world) % world
+            order = list(range(n * k)) + [j for b in range(pad) for j in range(b * bs, min((b + 1) * bs, n * k))]
+            for k_ in keys:
+                vals = [per_prompt[k_][j] for j in order if per_prompt[k_][j] is not None]
+                if vals:
+                    metrics[f"{k_}_sim{world}x{bs}"] = sum(vals) / len(vals)
         _write_summary(
             bench_dir,
             spec,

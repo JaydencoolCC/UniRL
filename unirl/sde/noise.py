@@ -23,8 +23,25 @@ import torch
 MAX_TORCH_SEED = (1 << 63) - 1
 
 
+# Group-id prefix selecting prompt-content seeding: x_T is keyed only on the prompt text
+# (rank/step-independent), so the same prompt yields the same image across steps/checkpoints.
+# Used by eval for reproducible, comparable generations.
+PROMPT_SEED_PREFIX = "prompt:"
+
+
 def _derive_group_seed(base_seed: int, group_id: str) -> int:
-    payload = f"{int(base_seed)}::{str(group_id)}".encode("utf-8")
+    """Deterministic per-group seed for x_T generation.
+
+    * ``group_id == "prompt:<text>"`` -> ``(base_seed + int(SHA256(text)[:4])) % 2**31``:
+      keyed only on prompt content (rank/step-independent). Used for reproducible eval.
+    * otherwise -> blake2b of ``base_seed::group_id`` (per-rollout/per-sample varying) for training.
+    """
+    gid = str(group_id)
+    if gid.startswith(PROMPT_SEED_PREFIX):
+        prompt = gid[len(PROMPT_SEED_PREFIX):]
+        digest = hashlib.sha256(prompt.encode("utf-8")).digest()
+        return (int(base_seed) + int.from_bytes(digest[:4], "big")) % (2**31)
+    payload = f"{int(base_seed)}::{gid}".encode("utf-8")
     digest = hashlib.blake2b(payload, digest_size=8).digest()
     return int.from_bytes(digest, byteorder="big", signed=False) % (MAX_TORCH_SEED + 1)
 
