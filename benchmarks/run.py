@@ -24,7 +24,12 @@ from typing import Dict, List, Optional
 from benchmarks.core import checkpoints, report
 from benchmarks.core.generate import T2I_KWARGS, image_path, read_completions, run_t2i, run_text, server_model, t2i_jobs
 from benchmarks.core.registry import SPECS, BenchmarkSpec, load_items, load_metadata, load_prompts
-from benchmarks.core.score import GRADERS, RewardServiceClient, check_geneval2_metadata
+from benchmarks.core.score import (
+    GRADERS,
+    RewardServiceClient,
+    check_geneval2_metadata,
+    score_images_local_geneval2,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -61,6 +66,17 @@ def _parse_args() -> argparse.Namespace:
         metavar="WxB",
         help="t2i: also report the metric under a simulated distributed eval that repeats "
         "the last partial wave (e.g. '32x32' = 32 GPUs x batch 32); default: 800 unique only",
+    )
+    parser.add_argument(
+        "--local-geneval2",
+        action="store_true",
+        help="geneval2: score locally with transformers Qwen3-VL-8B (full-vocab softmax, geometric "
+        "mean) instead of --reward-url; required to reproduce the DPPO paper numbers",
+    )
+    parser.add_argument(
+        "--geneval2-model",
+        default="Qwen/Qwen3-VL-8B-Instruct",
+        help="local geneval2 scorer model id/path (used with --local-geneval2)",
     )
     parser.add_argument("--concurrency", type=int, default=8, help="text: concurrent requests to --endpoint")
     parser.add_argument("--dry-run", action="store_true", help="print the plan, touch nothing")
@@ -135,7 +151,8 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
         if not spec.rewards:
             print(f"[score] {spec.name} is scored externally — see benchmarks/{spec.name}/README.md")
             return
-        if not args.reward_url:
+        local_geneval2 = args.local_geneval2 and "geneval2" in spec.rewards
+        if not local_geneval2 and not args.reward_url:
             raise SystemExit(f"{spec.name}: --reward-url (or REWARD_SERVICE_URL) is required to score")
         pairs, missing = [], 0
         for p in range(len(prompts)):
@@ -147,15 +164,19 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
                     missing += 1
         if missing:
             raise SystemExit(f"{spec.name}: {missing} images missing — finish --stage generate (all shards) first")
-        client = RewardServiceClient(args.reward_url)
-        client.check(spec.rewards)
-        if "geneval2" in spec.rewards:
-            check_geneval2_metadata(client)  # fail fast instead of silently scoring non-Soft-TIFA
         metadatas = None
         if spec.send_metadata:
             per_prompt = load_metadata(spec)[: args.num_prompts or None]
             metadatas = [per_prompt[p] for p in range(len(prompts)) for _ in range(k)]  # pairs are prompt-major
-        rows, n_errors = client.score_images(pairs, spec.rewards, metadatas=metadatas)
+        if local_geneval2:
+            # Local transformers Qwen3-VL-8B (full-vocab softmax, GM) -- the DPPO reproduction scorer.
+            rows, n_errors = score_images_local_geneval2(pairs, metadatas=metadatas, model_name=args.geneval2_model)
+        else:
+            client = RewardServiceClient(args.reward_url)
+            client.check(spec.rewards)
+            if "geneval2" in spec.rewards:
+                check_geneval2_metadata(client)  # fail fast instead of silently scoring non-Soft-TIFA
+            rows, n_errors = client.score_images(pairs, spec.rewards, metadatas=metadatas)
         with open(bench_dir / "scores.jsonl", "w") as f:
             for (prompt, path), row in zip(pairs, rows):
                 f.write(json.dumps({"image": path.name, "prompt": prompt, "scores": row}) + "\n")

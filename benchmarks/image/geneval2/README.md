@@ -18,22 +18,33 @@ non-Soft-TIFA service). Use geometric-mean aggregation for the headline number.
 
 ## Scoring backends
 
-- **Reward service (vLLM)** — default; fast, for general benchmarking/monitoring. Reads top-k
-  logprobs, so it is an approximation of the full-vocab softmax.
-- **transformers Qwen3-VL-8B** — full-vocab softmax, geometric mean. **Required to reproduce the
-  DPPO paper numbers** (the vLLM top-k service gives close but non-identical scores). Use the
-  local scorer `unirl/reward/local/geneval2.py` (Qwen/Qwen3-VL-8B-Instruct).
+- **Reward service (vLLM)** — the default (`--reward-url`); fast, for general benchmarking /
+  monitoring. Reads top-k logprobs, so it approximates the full-vocab softmax.
+- **Local transformers Qwen3-VL-8B** (`--local-geneval2`) — full-vocab softmax, geometric mean, no
+  reward service. **Required to reproduce the DPPO paper numbers** (the vLLM top-k service gives
+  close but non-identical scores).
 
 ## Note: DPPO GenEval2 reproduction
 
 The `image/geneval2` spec pins the DPPO eval regime so `benchmarks.run` matches the recipes:
 512×512, 40 steps, cfg 1.0, `max_sequence_length=256`, `linspace(1, 1/steps, steps)` flow-match
-sigma grid, per-prompt-content seed, 1 sample/prompt; score with transformers Qwen3-VL-8B (GM).
-(`max_sequence_length=256` and the linspace grid are load-bearing — the diffusers pipeline
-defaults roughly halve the score.)
+sigma grid, per-prompt-content seed, 1 sample/prompt. Score with the local transformers scorer
+(`--local-geneval2`). (`max_sequence_length=256` and the linspace grid are load-bearing — the
+diffusers pipeline defaults roughly halve the score.)
+
+```bash
+# base model, exact 800 unique prompts
+python -m benchmarks.run -b image/geneval2 \
+    --ckpt stabilityai/stable-diffusion-3.5-medium --local-geneval2
+# DPPO single-reward LoRA, + the simulated 32-GPU x bs-32 config
+python -m benchmarks.run -b image/geneval2 \
+    --ckpt stabilityai/stable-diffusion-3.5-medium \
+    --lora Tencent-Hunyuan-Multimodal-RL/SD3.5-GenEval2-Single-Reward \
+    --local-geneval2 --sim-even-batches 32x32
+```
 
 Two eval configs:
 - **exact 800** (default): mean over the 800 unique prompts.
 - **simulated 32×32** (`--sim-even-batches 32x32`): the original distributed eval repeated the last
   partial wave of a 32-GPU × batch-32 loader, double-counting a fixed prefix of prompts; this flag
-  additionally reports that `*_sim32x32` metric.
+  additionally reports the `*_sim32x32` metric.
