@@ -22,11 +22,34 @@ are deferred so the driver can import this module for ``remote(...)``.
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any, Dict, Optional
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.weight_sync.full.base import FullWeightSync
+
+
+def _shared_run_id(explicit: Optional[str]) -> str:
+    """Return a filesystem-safe id shared by every rank in this Ray job."""
+    raw = str(explicit or os.environ.get("UNIRL_RUN_ID", "")).strip()
+    if not raw:
+        try:
+            import ray
+
+            job_id = ray.get_runtime_context().get_job_id()
+            as_hex = getattr(job_id, "hex", None)
+            raw = str(as_hex() if callable(as_hex) else job_id)
+        except Exception as exc:
+            raise RuntimeError(
+                "CheckpointWeightSync needs a run-unique id to avoid stale/concurrent "
+                "checkpoint markers. Set run_id=... or UNIRL_RUN_ID when no Ray job "
+                "context is available."
+            ) from exc
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._")
+    if not safe:
+        raise ValueError(f"CheckpointWeightSync run_id {raw!r} has no filesystem-safe characters.")
+    return safe
 
 
 class CheckpointWeightSync(FullWeightSync):
@@ -38,6 +61,7 @@ class CheckpointWeightSync(FullWeightSync):
         backend: Any,
         rollout: Any,
         sync_dir: str = "/tmp/unirl_fastvideo_weight_sync",
+        run_id: Optional[str] = None,
         wait_timeout_s: float = 1200.0,
         flush_cache: bool = True,
         lora_merged: bool = False,
@@ -59,7 +83,12 @@ class CheckpointWeightSync(FullWeightSync):
             wire_dtype=wire_dtype,
         )
         self._rollout = rollout  # local engine sibling (colocate)
-        self._dir = str(sync_dir)
+        # Isolate concurrent/restarted jobs. Ray's job id is identical on every
+        # train rank; the rollout class / track prefix isolates multiple checkpoint
+        # bridges within one job.
+        scope = self._track_prefix or type(rollout).__name__
+        scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", scope).strip("._") or "default"
+        self._dir = os.path.join(str(sync_dir), _shared_run_id(run_id), scope)
         self._wait_timeout_s = float(wait_timeout_s)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
@@ -74,37 +103,75 @@ class CheckpointWeightSync(FullWeightSync):
         """
         import torch
 
+        version = int(self.weight_version)
+        path = os.path.join(self._dir, f"weights_v{version}.pt")
+        marker = path + ".ready"
+
+        if self._my_rank == 0:
+            os.makedirs(self._dir, exist_ok=True)
+            # A restarted actor can reuse the same version inside the same Ray
+            # job. Remove that version's stale publication before the first FSDP
+            # all-gather; the collective then keeps every rank from reaching the
+            # marker wait until this cleanup has happened.
+            for stale in (path, path + ".tmp", marker, marker + ".tmp"):
+                try:
+                    os.remove(stale)
+                except FileNotFoundError:
+                    pass
+            self._cleanup_old_versions(version)
+
         state_dict: Dict[str, torch.Tensor] = {}
         for name, tensor in self._iter_full_tensors():
             if self._my_rank == 0:
                 state_dict[name] = tensor.detach().to("cpu", copy=True)
 
-        version = int(self.weight_version)
-        path = os.path.join(self._dir, f"weights_v{version}")
-        marker = path + ".ready"
-
         if self._my_rank == 0:
-            os.makedirs(self._dir, exist_ok=True)
             tmp = path + ".tmp"
             torch.save(state_dict, tmp)
             os.replace(tmp, path)  # atomic publish
-            with open(marker, "w") as fh:
-                fh.write("ok")
+            marker_tmp = marker + ".tmp"
+            with open(marker_tmp, "w") as fh:
+                fh.write(f"version={version}\npath={path}\n")
+            os.replace(marker_tmp, marker)  # marker becomes visible atomically
             del state_dict
 
-        self._wait_for_marker(marker)
+        self._wait_for_marker(marker, path)
         self._rollout.update_weights_from_path(path, track_prefix=self._track_prefix)
 
         self.weight_version += 1
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _wait_for_marker(self, marker: str) -> None:
+    def _cleanup_old_versions(self, publishing_version: int) -> None:
+        """Keep only the version being published and the last good fallback.
+
+        Cleanup runs at the *next* sync, after the previous driver-level
+        BROADCAST completed and after rollout ``wake_up`` consumed its cached
+        checkpoint. Retaining ``publishing_version - 1`` keeps wake fail-closed
+        if the new publication/load fails partway through.
+        """
+        keep = {publishing_version, max(0, publishing_version - 1)}
+        pattern = re.compile(r"^weights_v(\d+)\.pt(?:\..*)?$")
+        try:
+            entries = list(os.scandir(self._dir))
+        except FileNotFoundError:
+            return
+        for entry in entries:
+            match = pattern.match(entry.name)
+            if match is None or int(match.group(1)) in keep:
+                continue
+            try:
+                os.remove(entry.path)
+            except FileNotFoundError:
+                pass
+
+    def _wait_for_marker(self, marker: str, checkpoint_path: str) -> None:
         t0 = time.time()
-        while not os.path.exists(marker):
+        while not (os.path.exists(marker) and os.path.exists(checkpoint_path)):
             if time.time() - t0 > self._wait_timeout_s:
                 raise TimeoutError(
-                    f"CheckpointWeightSync: ready marker not found after {self._wait_timeout_s}s: {marker}"
+                    f"CheckpointWeightSync: checkpoint publication not ready after "
+                    f"{self._wait_timeout_s}s: path={checkpoint_path}, marker={marker}"
                 )
             time.sleep(0.2)
 

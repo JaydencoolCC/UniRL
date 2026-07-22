@@ -42,6 +42,9 @@ model_config:
   # FastVideo reapplies the shift, so rollout and trainer both consume shift=5.
   shift: 5.0
   max_sequence_length: 512
+  # FastVideo owns video decoding; the trainer-side pipeline only replays the
+  # returned latent trajectory and does not need a duplicate VAE on the same GPU.
+  load_vae: false
   # LoRA is configured via backend.lora_cfg only (faithful to the official
   # wan21_t2v_dancegrpo recipe — bundle.config sets no use_lora). The
   # lora_merged sync reads backend.model's adapters, not this node, and

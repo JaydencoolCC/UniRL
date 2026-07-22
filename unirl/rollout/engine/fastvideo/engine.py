@@ -45,6 +45,22 @@ from unirl.types.segments.latent import make_video_segment
 logger = logging.getLogger(__name__)
 
 
+def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List[int]], List[int]]:
+    """Return the FastVideo wire value and canonical segment indices.
+
+    ``None`` keeps FastVideo's legacy "all steps are SDE" spelling. An explicit
+    empty iterable remains empty (the framework's deterministic forward-process
+    contract). The segment always gets the resolved concrete list.
+    """
+    if raw_indices is None:
+        return None, list(range(int(num_steps)))
+    selected = sorted({int(i) for i in raw_indices})
+    bad = [i for i in selected if i < 0 or i >= int(num_steps)]
+    if bad:
+        raise ValueError(f"FastVideo SDE indices out of range for num_steps={num_steps}: {bad}")
+    return selected, selected
+
+
 class FastVideoRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by FastVideo ``VideoGenerator`` (RL fork, PR #1222)."""
 
@@ -299,9 +315,12 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         # noise ONLY on the trainer's SDE steps and runs the rest as a
         # deterministic Euler step (clean low-sigma tail). ``params.sde_indices``
         # is stamped per rollout by the trainer (resolve_sde_indices); it matches
-        # the columns the trainer replays. Empty/None => every step is SDE.
-        _sde_idx = getattr(params, "sde_indices", None)
-        sde_step_indices = [int(x) for x in _sde_idx] if _sde_idx else None
+        # the columns the trainer replays. ``None`` keeps the legacy all-steps
+        # fallback; an explicit empty list means no SDE steps.
+        sde_step_indices, _ = _resolve_sde_window(
+            getattr(params, "sde_indices", None),
+            int(params.num_inference_steps),
+        )
 
         all_log_probs: List[torch.Tensor] = []
         all_traj: List[torch.Tensor] = []
@@ -385,7 +404,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                 ntm = nm[0] if isinstance(nm, (list, tuple)) and len(nm) > 0 and torch.is_tensor(nm[0]) else None
                 all_neg_masks.append(ntm.detach().cpu() if ntm is not None else None)
 
-            if self.cfg.native_logprob:
+            if self.cfg.native_logprob and sde_step_indices != []:
                 lp = rl.log_probs if rl is not None else None
                 require(torch.is_tensor(lp), "FastVideo native rollout returned no log_probs")
                 all_log_probs.append(lp.detach().cpu())
@@ -477,13 +496,11 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         T = int(traj.shape[1]) - 1
         indices = torch.arange(traj.shape[1], dtype=torch.long, device=device)
 
-        # sde_indices is ALWAYS populated (the trainer needs to know which steps
-        # to replay). Mirror the SGLang reference: when the caller didn't pin a
-        # subset, every transition is an SDE step (arange(num_steps)).
-        sde_set = sorted(int(i) for i in (params.sde_indices or []))
-        if not sde_set:
-            sde_set = list(range(T))
-        sde_indices = torch.tensor(sde_set, dtype=torch.long, device=device)
+        # Mirror the SGLang reference: ``None`` means every transition is an SDE
+        # step, while an explicit empty list is a deterministic forward process
+        # and leaves ``sde_indices`` absent.
+        _, sde_set = _resolve_sde_window(getattr(params, "sde_indices", None), T)
+        sde_indices = torch.tensor(sde_set, dtype=torch.long, device=device) if sde_set else None
 
         # sde_logp: native per-step log-prob [B, T] from FastVideo's RLData. Slice
         # to the SDE columns when a strict subset was requested; otherwise the
@@ -549,16 +566,29 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     attempt,
                     max_port_attempts,
                 )
-        self._is_offloaded = False
         # ``from_fastvideo_args`` reloads the PRETRAINED transformer from
         # ``model_path``; without this the engine would sample under pretrained
         # weights on every wake that isn't immediately followed by a weight sync
         # (i.e. any ``weight_sync_interval > 1`` step). Re-apply the last synced
         # checkpoint so wake is weight-preserving, matching the other engines'
         # sleep/wake contract (sglang resume_memory keeps weights resident).
-        if self._last_weights_path is not None:
-            self._generator.update_transformer_weights_from_path(self._last_weights_path)
-            logger.info("fastvideo wake_up: re-applied synced weights from %s", self._last_weights_path)
+        try:
+            if self._last_weights_path is not None:
+                self._generator.update_transformer_weights_from_path(self._last_weights_path)
+                logger.info("fastvideo wake_up: re-applied synced weights from %s", self._last_weights_path)
+        except Exception:
+            # Fail closed: a rebuilt generator contains pretrained weights until
+            # the cached checkpoint is restored. Keep the engine offloaded so a
+            # retry cannot silently skip restoration and serve stale weights.
+            try:
+                if self._generator is not None:
+                    self._generator.shutdown()
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning("fastvideo wake_up cleanup after restore failure: %s", cleanup_exc)
+            self._generator = None
+            self._is_offloaded = True
+            raise
+        self._is_offloaded = False
 
     @property
     def is_offloaded(self) -> bool:
