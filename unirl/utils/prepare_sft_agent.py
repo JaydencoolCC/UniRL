@@ -105,7 +105,7 @@ def main() -> None:
     if len(rows) < 2:
         raise SystemExit(f"prepare_sft_agent: only {len(rows)} trajectories found.")
 
-    n_val = max(1, round(len(rows) * args.val_fraction))
+    n_val = min(len(rows) - 1, max(1, round(len(rows) * args.val_fraction)))
     val_rows, train_rows = rows[:n_val], rows[n_val:]
     train_examples = _expand(train_rows, dataset_name=args.dataset)
     val_examples = _expand(val_rows, dataset_name=args.dataset)
