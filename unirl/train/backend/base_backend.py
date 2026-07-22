@@ -24,7 +24,8 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Dict, List, Optional
+from concurrent.futures import Future
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -52,7 +53,84 @@ from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_f
 from unirl.train.lora import inject_lora
 from unirl.train.optim import build_lr_scheduler, build_optimizer
 
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
 logger = logging.getLogger(__name__)
+
+_PENDING_DCP_SAVE_FUTURE: Optional[Future] = None
+
+
+def _set_pending_dcp_save(future: Future) -> None:
+    """Register the one async DCP upload allowed in this worker process."""
+    global _PENDING_DCP_SAVE_FUTURE
+    if _PENDING_DCP_SAVE_FUTURE is not None:
+        raise RuntimeError("an async DCP save is already pending in this worker process")
+    _PENDING_DCP_SAVE_FUTURE = future
+
+
+def _drain_pending_dcp_save() -> None:
+    """Wait for the process-wide async DCP upload, if any."""
+    global _PENDING_DCP_SAVE_FUTURE
+    future = _PENDING_DCP_SAVE_FUTURE
+    if future is None:
+        return
+    try:
+        future.result()
+    finally:
+        if _PENDING_DCP_SAVE_FUTURE is future:
+            _PENDING_DCP_SAVE_FUTURE = None
+
+
+def _prepare_dcp_directory(
+    path: str,
+    metadata: Dict[str, object],
+    *,
+    process_group: Optional[dist.ProcessGroup],
+) -> None:
+    """Publish app metadata and invalidate any stale DCP completion marker.
+
+    DCP writes ``.metadata`` last. Removing an old copy before an overwrite
+    preserves that commit-marker contract while the new shards are in flight.
+    The rank-0 preparation error is broadcast so no peer enters DCP alone.
+    """
+    local_error: Optional[str] = None
+    local_exc: Optional[Exception] = None
+    metadata_path = os.path.join(path, "metadata.pt")
+    metadata_tmp = f"{metadata_path}.tmp"
+
+    if _current_rank() == 0:
+        try:
+            os.makedirs(path, exist_ok=True)
+            torch.save(metadata, metadata_tmp)
+            dcp_metadata_path = os.path.join(path, ".metadata")
+            if os.path.exists(dcp_metadata_path):
+                os.remove(dcp_metadata_path)
+            torch_checkpoint_path = os.path.join(path, "checkpoint.pt")
+            if os.path.exists(torch_checkpoint_path):
+                os.remove(torch_checkpoint_path)
+            os.replace(metadata_tmp, metadata_path)
+        except Exception as exc:
+            local_exc = exc
+            local_error = f"{type(exc).__name__}: {exc}"
+            try:
+                if os.path.exists(metadata_tmp):
+                    os.remove(metadata_tmp)
+            except OSError:
+                pass
+
+    if dist.is_available() and dist.is_initialized():
+        error_box: List[Optional[str]] = [local_error]
+        dist.broadcast_object_list(error_box, src=0, group=process_group)
+        error = error_box[0]
+    else:
+        error = local_error
+
+    if error is not None:
+        wrapped = RuntimeError(f"failed to prepare DCP checkpoint directory {path!r}: {error}")
+        if local_exc is not None:
+            raise wrapped from local_exc
+        raise wrapped
 
 
 class BaseFSDP2Backend(Remote):
@@ -78,6 +156,7 @@ class BaseFSDP2Backend(Remote):
     _rollout_adapter_name: str
     _defer_grad_sync: bool
     _grad_sync_enabled: bool
+    _loss_reduction_mesh: Optional["DeviceMesh"]
 
     # ------------------------------------------------------------------
     # Construction helpers (called in sequence from each leaf __init__)
@@ -115,7 +194,8 @@ class BaseFSDP2Backend(Remote):
                 model,
                 rank=ema_lora_cfg.rank,
                 alpha=ema_lora_cfg.alpha,
-                target_modules=tuple(ema_lora_cfg.target_modules),
+                target_modules=ema_lora_cfg.target_modules,
+                exclude_modules=ema_lora_cfg.exclude_modules,
                 default=ema_lora_cfg.default_adapter,
                 shadow=ema_lora_cfg.shadow_adapter,
                 dropout=ema_lora_cfg.dropout,
@@ -127,7 +207,8 @@ class BaseFSDP2Backend(Remote):
                 model,
                 rank=lora_cfg.rank,
                 alpha=lora_cfg.alpha,
-                target_modules=tuple(lora_cfg.target_modules),
+                target_modules=lora_cfg.target_modules,
+                exclude_modules=lora_cfg.exclude_modules,
                 dropout=lora_cfg.dropout,
                 bias=lora_cfg.bias,
                 task_type=lora_cfg.task_type,
@@ -155,6 +236,7 @@ class BaseFSDP2Backend(Remote):
         usable once the leaf ``__init__`` returns.
         """
         self.model = model
+        self._loss_reduction_mesh = self._find_loss_reduction_mesh(model)
 
         self.ema = None
         if shadow is not None:
@@ -168,6 +250,9 @@ class BaseFSDP2Backend(Remote):
         self.optimizer = build_optimizer(
             optimizer_cfg,
             params=list(trainable_params(model)),
+            # Names enable OptimizerConfig.param_group_lrs (per-substring LR groups,
+            # e.g. BAGEL UniGRPO's und vs "moe_gen" experts); ignored when unset.
+            named_params=list(model.named_parameters()),
         )
         self.scheduler = build_lr_scheduler(
             scheduler_cfg,
@@ -193,6 +278,7 @@ class BaseFSDP2Backend(Remote):
                 "rank": active_lora.rank,
                 "alpha": active_lora.alpha,
                 "target_modules": active_lora.target_modules,
+                "exclude_modules": active_lora.exclude_modules,
                 "dropout": active_lora.dropout,
                 "bias": active_lora.bias,
                 "task_type": active_lora.task_type,
@@ -262,11 +348,28 @@ class BaseFSDP2Backend(Remote):
         grad_norm = float(clipped.item()) if isinstance(clipped, torch.Tensor) else float(clipped or 0.0)
 
         if not math.isfinite(grad_norm):
+            # On a skipped step (already discarded), pinpoint which params carry the
+            # non-finite grad (sharded DTensor -> check the local shard) so the
+            # offending module is identifiable from the log. Runs only on this skip
+            # path, so it adds nothing to healthy steps.
+            bad_params = []
+            total_with_grad = 0
+            for _name, _p in self.model.named_parameters():
+                if _p.grad is None:
+                    continue
+                total_with_grad += 1
+                _gl = _p.grad.to_local() if hasattr(_p.grad, "to_local") else _p.grad
+                if _gl.numel() and not bool(torch.isfinite(_gl).all()):
+                    bad_params.append(_name)
             logger.warning(
-                "%s.optimizer_step: non-finite grad norm (%s) at step %d; skipping step.",
+                "%s.optimizer_step: non-finite grad norm (%s) at step %d; skipping step. "
+                "%d/%d grad-params non-finite; first: %s",
                 type(self).__name__,
                 grad_norm,
                 self._optimizer_step_count,
+                len(bad_params),
+                total_with_grad,
+                bad_params[:12],
             )
             self.optimizer.zero_grad(set_to_none=True)
             return grad_norm
@@ -354,11 +457,10 @@ class BaseFSDP2Backend(Remote):
         The optimizer gather is per-backend (DCP get-state for torch-native
         FSDP, plain ``state_dict()`` for VeOmni) via :meth:`_gather_optimizer_state`.
         """
+        self._reject_meta(operation="save", checkpoint_format="torch", mode=mode)
         if mode == "adapter":
-            self._reject_lora_meta_params("save")
             policy_state = gather_lora_state_dict(self.model)
         else:
-            self._reject_meta_params("save")
             policy_state = gather_state_dict(self.model)
         optimizer_state = self._gather_optimizer_state()
         state: Dict[str, object] = {
@@ -377,7 +479,22 @@ class BaseFSDP2Backend(Remote):
         if _current_rank() != 0:
             return
         os.makedirs(path, exist_ok=True)
-        torch.save(state, os.path.join(path, "checkpoint.pt"))
+        checkpoint_path = os.path.join(path, "checkpoint.pt")
+        checkpoint_tmp = f"{checkpoint_path}.tmp"
+        try:
+            torch.save(state, checkpoint_tmp)
+            for stale_dcp_file in (".metadata", "metadata.pt"):
+                stale_path = os.path.join(path, stale_dcp_file)
+                if os.path.exists(stale_path):
+                    os.remove(stale_path)
+            os.replace(checkpoint_tmp, checkpoint_path)
+        except Exception:
+            try:
+                if os.path.exists(checkpoint_tmp):
+                    os.remove(checkpoint_tmp)
+            except OSError:
+                pass
+            raise
 
     def _save_dcp(self, path: str, step: Optional[int], mode: str) -> None:
         """Sharded save: every rank writes its own shard under ``path``.
@@ -387,15 +504,21 @@ class BaseFSDP2Backend(Remote):
         data and are dropped here. Non-tensor metadata (step / save_mode /
         lora_config / scheduler / optimizer_step_count) is light and rides in a
         rank-0 ``metadata.pt`` beside DCP's own ``.metadata``.
+
+        With ``checkpoint_async`` the shard write runs off the train loop's
+        critical path: ``dcp.async_save`` stages (copies) the shards in-process
+        first — so the model is safe to keep training the moment it returns —
+        then flushes to storage on a background thread. The returned future is
+        drained before the next save (below) and by :meth:`wait_for_checkpoint`
+        (the trainer calls it after the final rollout, which has no next save).
         """
         import torch.distributed.checkpoint as dcp
 
-        # Frozen aux (vae / vit) on meta is expected and dropped below; a
-        # *trainable* param on meta means materialize missed it, and dropping it
-        # would write a checkpoint missing weights with no error. is_meta alone
-        # can't tell the two apart, but requires_grad can — so fail fast here.
-        self._reject_trainable_meta_params("save")
-        os.makedirs(path, exist_ok=True)
+        # Finish any in-flight async save before snapshotting fresh state: two
+        # concurrent DCP collectives can deadlock. The future is process-wide
+        # because PE can colocate two independent backends on the same workers.
+        self._drain_checkpoint()
+        self._reject_meta(operation="save", checkpoint_format="dcp", mode=mode)
         model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
         if mode == "adapter":
             model_sd = {k: v for k, v in model_sd.items() if "lora_A" in k or "lora_B" in k}
@@ -403,10 +526,6 @@ class BaseFSDP2Backend(Remote):
             "model": model_sd,
             "optim": sharded_optimizer_state_dict(self.model, self.optimizer),
         }
-        dcp.save(sharded_state, checkpoint_id=path)
-
-        if _current_rank() != 0:
-            return
         meta: Dict[str, object] = {
             "optimizer_step_count": self._optimizer_step_count,
             "step": step,
@@ -415,7 +534,46 @@ class BaseFSDP2Backend(Remote):
         }
         if self.scheduler is not None:
             meta["scheduler_state_dict"] = self.scheduler.state_dict()
-        torch.save(meta, os.path.join(path, "metadata.pt"))
+
+        pg = None
+        if self._checkpoint_async:
+            # async_save stages to CPU and coordinates on a CPU collective, so it
+            # needs a process group with a CPU (gloo) backend. The train PG is
+            # NCCL-only (fully_shard auto-init / backend="nccl"), which makes
+            # async_save assert "A CPU backend must be enabled for async save", so
+            # hand it a lazily-created, memoized gloo group. None when not
+            # distributed (single process) — async_save then runs no_dist.
+            if dist.is_available() and dist.is_initialized():
+                from unirl.utils.distributed_utils import init_gloo_group
+
+                pg = init_gloo_group()
+        _prepare_dcp_directory(path, meta, process_group=pg)
+
+        if self._checkpoint_async:
+            future = dcp.async_save(sharded_state, checkpoint_id=path, process_group=pg)
+            _set_pending_dcp_save(future)
+        else:
+            dcp.save(sharded_state, checkpoint_id=path)
+
+    def _drain_checkpoint(self) -> None:
+        """Block until a pending async DCP save finishes (no-op if none).
+
+        ``dcp.async_save`` returns a future that completes when the background
+        shard write lands. The future is process-wide so colocated backends
+        cannot start overlapping DCP collectives on the shared gloo group.
+        """
+        _drain_pending_dcp_save()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def wait_for_checkpoint(self) -> None:
+        """Flush the last async DCP save (driver-callable across all workers).
+
+        With ``checkpoint_async`` the shard write runs in the background and is
+        normally drained by the next save; the trainer calls this after the
+        final rollout so the last checkpoint is durable before the workers tear
+        down. A no-op under sync save or when nothing is pending.
+        """
+        self._drain_checkpoint()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def load(self, path: str) -> int:
@@ -430,6 +588,9 @@ class BaseFSDP2Backend(Remote):
         Adapter-mode checkpoints load non-strict — only the LoRA keys are
         present; the frozen base keeps the weights the bundle loaded.
         """
+        # Defensive: flush an in-flight async save before reading from disk
+        # (a save-then-load of the same dir in one process must see the shards).
+        self._drain_checkpoint()
         dcp_metadata_path = os.path.join(path, ".metadata")
         metadata_path = os.path.join(path, "metadata.pt")
         checkpoint_path = os.path.join(path, "checkpoint.pt")
@@ -479,11 +640,9 @@ class BaseFSDP2Backend(Remote):
         """
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
-        strict = checkpoint.get("save_mode", "full") == "full"
-        if strict:
-            self._reject_meta_params("load")
-        else:
-            self._reject_lora_meta_params("load")
+        mode = checkpoint.get("save_mode", "full")
+        strict = mode == "full"
+        self._reject_meta(operation="load", checkpoint_format="torch", mode=mode)
         load_model_state_dict(self.model, checkpoint["policy_state_dict"], strict=strict)
         self._load_optimizer_state(checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
@@ -511,12 +670,7 @@ class BaseFSDP2Backend(Remote):
         meta_path = os.path.join(path, "metadata.pt")
         meta: Dict[str, object] = torch.load(meta_path, map_location="cpu")
         mode = str(meta.get("save_mode", "full"))
-        # Symmetric with _save_dcp: a trainable param on meta would be dropped by
-        # drop_meta_entries below and then left unresolved by the non-strict load
-        # (has_meta_params relaxes strict), silently keeping its pre-load weights.
-        # Reject it here; the remaining meta is the frozen aux that legitimately
-        # relaxes strict.
-        self._reject_trainable_meta_params("load")
+        self._reject_meta(operation="load", checkpoint_format="dcp", mode=mode)
         has_meta_params = any(p.is_meta for p in self.model.parameters())
         strict = mode == "full" and not has_meta_params
 
@@ -537,50 +691,57 @@ class BaseFSDP2Backend(Remote):
             self._optimizer_step_count = int(meta["optimizer_step_count"])
         return int(meta.get("step") or 0)
 
-    def _reject_meta_params(self, op: str) -> None:
-        """Fail fast on never-materialized params (meta-init bundles, e.g. hi3 80B).
+    def _reject_meta(
+        self,
+        *,
+        operation: Literal["save", "load"],
+        checkpoint_format: Literal["torch", "dcp"],
+        mode: str,
+    ) -> None:
+        """Single materialization guard for every checkpoint save/load path.
 
-        Their frozen aux (vae / vit) stays on meta and a full-state-dict gather
-        would die deep inside DCP ("Cannot copy out of meta tensor"). Same
-        verdict on every rank, so raising here is collective-safe. Only the
-        legacy "torch" path needs this — the sharded "dcp" path drops meta keys
-        (they carry no data) instead of gathering them.
+        Args (keyword-only):
+            operation: the calling operation, for the error message ("save" / "load").
+            checkpoint_format: the storage format ("torch" full-gather / "dcp" sharded).
+            mode: the save mode read from the request / checkpoint ("full" / "adapter").
+
+        Raises if a param this ``(checkpoint_format, mode)`` path is responsible
+        for is still on meta. The dispatch below is the single source of truth, so
+        the guard cannot drift from the matching ``_save_*`` / ``_load_*`` (the bug
+        class behind the earlier duplicate / wrong-mode / missing checks). The
+        verdict is a pure function of model structure, identical on every rank, so
+        raising is collective-safe.
+
+        Responsibility by ``(checkpoint_format, mode)``:
+
+        - ``adapter`` (either format): every LoRA param — the trainable
+          ``default`` AND the frozen EMA ``old`` / shadow adapter, both of which
+          ride in the adapter checkpoint.
+        - ``full`` + ``"dcp"``: trainable params only. This is "what must not be
+          silently dropped", NOT "everything persisted": ``_save_dcp`` writes
+          every non-meta entry but ``drop_meta_entries`` drops the frozen aux.
+          Frozen-but-owned state (full-EMA mirror params, a frozen shadow LoRA
+          under full mode) is intentionally not guarded here — see
+          ``docs/dcp_checkpoint_impl.md``.
+        - ``full`` + ``"torch"``: every param — the rank-0 gather encodes the
+          whole model (frozen aux included) and cannot represent meta.
         """
-        meta = [name for name, p in self.model.named_parameters() if p.is_meta]
-        if meta:
-            raise RuntimeError(
-                f"{type(self).__name__}.{op}: {len(meta)} params are on meta (e.g. {meta[:3]}); "
-                "full-state-dict checkpointing of meta-init bundles is not supported under "
-                "checkpoint_format='torch' (use 'dcp')."
+        named = list(self.model.named_parameters())
+        if mode == "adapter":
+            meta = [n for n, p in named if p.is_meta and ("lora_A" in n or "lora_B" in n)]
+            why = "adapter checkpointing requires materialized LoRA params"
+        elif checkpoint_format == "dcp":
+            meta = [n for n, p in named if p.is_meta and p.requires_grad]
+            why = "trainable params on meta would be silently dropped from the DCP checkpoint (materialize missed them)"
+        else:  # full + torch
+            meta = [n for n, p in named if p.is_meta]
+            why = (
+                "full-state-dict checkpointing of meta-init bundles is not supported "
+                "under checkpoint_format='torch' (use 'dcp')"
             )
-
-    def _reject_trainable_meta_params(self, op: str) -> None:
-        """Fail fast on *trainable* params left on meta (the sharded "dcp" path).
-
-        Both DCP save and load drop every meta entry, which is correct for the
-        frozen aux (vae / vit) that meta-init bundles never materialize. But a param that is
-        ``requires_grad`` AND on meta is a materialize bug, not aux — dropping it
-        would silently produce a checkpoint missing trained weights. ``requires_grad``
-        is what tells the two apart, so this guard rejects only the former and
-        leaves the frozen aux to ``drop_meta_entries``. Same verdict on every rank.
-        """
-        meta = [name for name, param in self.model.named_parameters() if param.requires_grad and param.is_meta]
         if meta:
             raise RuntimeError(
-                f"{type(self).__name__}.{op}: {len(meta)} trainable params are on meta (e.g. {meta[:3]}); "
-                "they would be silently dropped from the DCP checkpoint (materialize missed them)."
-            )
-
-    def _reject_lora_meta_params(self, op: str) -> None:
-        meta = [
-            name
-            for name, param in self.model.named_parameters()
-            if param.is_meta and ("lora_A" in name or "lora_B" in name)
-        ]
-        if meta:
-            raise RuntimeError(
-                f"{type(self).__name__}.{op}: {len(meta)} LoRA params are on meta (e.g. {meta[:3]}); "
-                "adapter checkpointing requires materialized LoRA params."
+                f"{type(self).__name__}.{operation}: {len(meta)} params on meta (e.g. {meta[:3]}); {why}."
             )
 
     # ------------------------------------------------------------------
@@ -611,6 +772,48 @@ class BaseFSDP2Backend(Remote):
     # ------------------------------------------------------------------
     # Accessors
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_loss_reduction_mesh(model: nn.Module) -> Optional["DeviceMesh"]:
+        """Return the primary FSDP mesh from the model's DTensor parameters."""
+        from torch.distributed.tensor import DTensor
+
+        for param in model.parameters():
+            if isinstance(param, DTensor):
+                return param.device_mesh
+        return None
+
+    def gradient_average_world_size(self) -> int:
+        """Ranks in the FSDP mesh whose gradient averaging loss scaling cancels."""
+        mesh = self._loss_reduction_mesh
+        if mesh is not None:
+            return mesh.size()
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            raise RuntimeError(
+                f"{type(self).__name__}: distributed training has no FSDP DeviceMesh; "
+                "cannot determine the gradient-averaging world size."
+            )
+        return 1
+
+    def all_reduce_loss_sums(self, values: List[float]) -> List[float]:
+        """SUM loss statistics over the same FSDP mesh used for gradients.
+
+        An HSDP/folded mesh may be multi-dimensional. Reducing once along every
+        mesh dimension produces a full-mesh sum without assuming that the
+        default process group is the FSDP process group.
+        """
+        if not values:
+            return []
+        mesh = self._loss_reduction_mesh
+        world_size = self.gradient_average_world_size()
+        if world_size <= 1:
+            return list(values)
+        if mesh is None or not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError(f"{type(self).__name__}: FSDP loss reduction requires initialized distributed state.")
+        tensor = torch.tensor(values, dtype=torch.float64, device=self._device)
+        for group in mesh.get_all_groups():
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+        return tensor.tolist()
 
     def trainable_module(self) -> nn.Module:
         return self.model

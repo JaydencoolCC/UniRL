@@ -32,12 +32,23 @@ def _extract_canonical_lora(backend: Any, *, param_prefix: str, adapter_name: st
     ``extract_lora_tensors`` redistributes each FSDP ``DTensor`` shard to a full
     tensor — a collective across the train process group — so the caller MUST run
     this on every train rank in lockstep (``BROADCAST``).
+
+    The weight-sync dtype is the backend's FSDP compute dtype
+    (``backend.weight_sync_dtype``, i.e. ``param_dtype``), NOT the trainable
+    params' own dtype: under ``master_dtype=fp32`` (the reward-collapse fix) the
+    LoRA params are fp32, but the rollout engine's vLLM punica kernel requires
+    bf16/fp16 — so cast at the all-gather. Falls back to ``None`` (keep dtype) for
+    backends predating ``weight_sync_dtype`` (e.g. an all-bf16-master setup where
+    no cast is needed).
     """
     from unirl.distributed.weight_sync.payload import _peft_config_dict
     from unirl.utils.peft_merge import extract_lora_tensors
 
     model = backend.model
-    lora_tensors = extract_lora_tensors(model, param_prefix=param_prefix, adapter_name=adapter_name)
+    weight_sync_dtype = getattr(backend, "weight_sync_dtype", None)
+    lora_tensors = extract_lora_tensors(
+        model, param_prefix=param_prefix, adapter_name=adapter_name, dtype=weight_sync_dtype
+    )
     peft_config = _peft_config_dict(model, adapter_name)
     return lora_tensors, peft_config
 
@@ -122,8 +133,22 @@ class LoraWeightSyncBase(Remote):
         """
         for stage_id, per_rank in loaded.items():
             for rank_idx, layer_map in enumerate(per_rank):
-                act_a = sorted(f["lora_a"] for f in layer_map.values() if "lora_a" in f)
-                act_b = sorted(f["lora_b"] for f in layer_map.values() if "lora_b" in f)
+                # Plain layers expose ``lora_a`` / ``lora_b`` directly. Packed
+                # layers expose one checksum per fused projection as
+                # ``lora_a.<index>`` / ``lora_b.<index>``. Flatten both shapes
+                # into the same multisets before comparing with the trainer.
+                act_a = sorted(
+                    checksum
+                    for fields in layer_map.values()
+                    for field, checksum in fields.items()
+                    if field == "lora_a" or field.startswith("lora_a.")
+                )
+                act_b = sorted(
+                    checksum
+                    for fields in layer_map.values()
+                    for field, checksum in fields.items()
+                    if field == "lora_b" or field.startswith("lora_b.")
+                )
                 if act_a != exp_a or act_b != exp_b:
                     raise RuntimeError(
                         f"[LoRA-SYNC] verify FAILED on {label}, stage {stage_id} rank "

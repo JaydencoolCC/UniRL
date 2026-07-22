@@ -30,10 +30,10 @@ from .config import (
     LTX2_TEMPORAL_COMPRESSION,
     LTX2PipelineConfig,
 )
-from .diffusion import LTX2DiffusionStage
+from .diffusion import LTX2DiffusionStage, audio_latent_shape
 from .schedule import build_ltx2_schedule_policy
 from .text_embed import LTX2TextEmbedStage
-from .vae import LTX2VAEDecodeStage, LTX2VAEEncodeStage
+from .vae import LTX2AudioDecodeStage, LTX2VAEDecodeStage, LTX2VAEEncodeStage
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +56,14 @@ class LTX2Pipeline(Pipeline):
         vae_decode: LTX2VAEDecodeStage,
         vae_encode: Optional[LTX2VAEEncodeStage],
         config: LTX2PipelineConfig,
+        audio_decode: Optional[LTX2AudioDecodeStage] = None,
     ) -> None:
         self.bundle = bundle
         self.text_embed = text_embed
         self.diffusion = diffusion
         self.vae_decode = vae_decode
         self.vae_encode = vae_encode
+        self.audio_decode = audio_decode
         self.config = config
         # Exposed for the hosting engine (TrainsideRolloutEngine reads
         # ``pipeline.shift`` to build a FlowMatchSchedulePolicy at startup) —
@@ -101,9 +103,13 @@ class LTX2Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            audio_joint_sde=config.audio_joint_sde,
         )
         vae_decode = LTX2VAEDecodeStage(bundle)
         vae_encode = LTX2VAEEncodeStage(bundle)
+        # Audio decode is only meaningful for LTX-2.3 T2AV (bundle has audio_vae
+        # + vocoder). For T2V it stays None and the audio path is never taken.
+        audio_decode = LTX2AudioDecodeStage(bundle) if bundle.has_audio else None
 
         return cls(
             bundle=bundle,
@@ -112,6 +118,7 @@ class LTX2Pipeline(Pipeline):
             vae_decode=vae_decode,
             vae_encode=vae_encode,
             config=config,
+            audio_decode=audio_decode,
         )
 
     def build_schedule_policy(self):
@@ -271,7 +278,8 @@ class LTX2Pipeline(Pipeline):
         # ``resolve()`` returns None only under DISABLE_DRIVER_XT — then the
         # recipe shape is None too and we cannot draw video noise without a
         # shape, so that path is unsupported here.
-        latents_5d = NoiseRecipe.from_rollout_req(req).resolve(device=self.bundle.device)
+        video_recipe = NoiseRecipe.from_rollout_req(req)
+        latents_5d = video_recipe.resolve(device=self.bundle.device)
         if latents_5d is None:
             raise ValueError(
                 "LTX2Pipeline.generate: no initial latents. The driver x_T recipe "
@@ -282,6 +290,13 @@ class LTX2Pipeline(Pipeline):
         patch_size, patch_size_t = self._patch_sizes()
         initial_latents = self._pack_latents(latents_5d.to(self.bundle.device), patch_size, patch_size_t)
 
+        # Audio x_T: an ``::audio``-salted sibling of the SAME video recipe
+        # (driver-authoritative, independent but reproducible) instead of a bare
+        # randn inside the stage.
+        initial_audio_latents = video_recipe.resolve(
+            device=self.bundle.device, salt="audio", latent_shape=audio_latent_shape(params)
+        )
+
         # 5. Diffusion loop
         sde_indices = list(params.sde_indices) if params.sde_indices is not None else None
         segment = self.diffusion.generate(
@@ -289,6 +304,7 @@ class LTX2Pipeline(Pipeline):
             params=params,
             sigmas=sigmas,
             initial_latents=initial_latents,
+            initial_audio_latents=initial_audio_latents,
             sde_indices=sde_indices,
         )
 
@@ -301,18 +317,49 @@ class LTX2Pipeline(Pipeline):
         unpacked = self._denormalize_latents(unpacked)
         decoded = self.vae_decode.decode(unpacked)  # → varlen-packed Videos
 
+        # 6b. LTX-2.3 T2AV: decode the jointly-generated audio. The audio latent
+        # trajectory rides on ``segment.aux_latents`` (same sparse indices as
+        # the video latents), so the clean final-step audio is at step T. Decode
+        # it to a waveform and carry it as a parallel ``Audios`` on the track so
+        # the reward service can feed audio scorers (CLAP / ImageBind) alongside
+        # the video. T2V (no audio_decode) skips this entirely.
+        decoded_audio = None
+        audio_sample_rate = None
+        if self.audio_decode is not None and segment.aux_latents is not None:
+            from .diffusion import _LTX2_FRAME_RATE, _audio_num_frames
+
+            audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
+            final_audio = segment.aux_latents_at(int(params.num_inference_steps))
+            waveforms = self.audio_decode.decode(final_audio, audio_latent_length=audio_t)
+            # vocoder output: (B, C, L) or (B, L); package one Audio per sample.
+            from unirl.types.primitives import Audio, Audios
+
+            wf = waveforms.detach().float().cpu()
+            # Store one mono ``[L]`` waveform per sample so ``Audios`` packs
+            # cleanly along its varlen L axis and ``to_list`` recovers ``[L]``.
+            audio_list = []
+            for i in range(int(wf.shape[0])):
+                w = wf[i]
+                if w.ndim == 2:
+                    w = w.mean(dim=0) if w.shape[0] <= w.shape[1] else w.mean(dim=1)
+                audio_list.append(Audio(waveform=w.reshape(-1)))
+            decoded_audio = Audios.from_list(audio_list)
+            audio_sample_rate = int(self.bundle.vocoder.config.output_sampling_rate)
+
         # 7. Build response. ``parent_ids=req.group_ids`` makes sibling samples
         # of one prompt a GRPO group (RolloutTrack.group_ids is a derived
         # read-only property — NOT a constructor arg). ``decoded`` is the single
         # Videos primitive for this track (the reward service reads it directly),
         # not a modality-keyed dict. Track key ``"video"`` matches the WAN21
-        # video convention.
+        # video convention. ``decoded_audio`` (T2AV only) is the parallel audio.
         track = RolloutTrack(
             sample_ids=list(req.sample_ids),
             parent_ids=list(req.group_ids),
             conditions=conditions.to_dict(),
             segment=segment,
             decoded=decoded,
+            decoded_audio=decoded_audio,
+            audio_sample_rate=audio_sample_rate,
         )
 
         return RolloutResp(tracks={"video": track})

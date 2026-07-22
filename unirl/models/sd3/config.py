@@ -36,6 +36,9 @@ class SD3PipelineConfig:
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
+    # See SD3DiffusionStage.batch_replay_steps; exposed here so non-trainside
+    # recipes can opt in via SD3Pipeline.from_config.
+    batch_replay_steps: bool = False
 
     # Diffusion schedule policy. ``shift`` is the FlowMatch time-shift used
     # by ``sde.runtime.get_sigma_schedule`` (static branch); defaults to
@@ -56,6 +59,9 @@ class SD3PipelineConfig:
     # model_config.  ``None`` / ``False`` are the default (no LoRA).
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
+
+    # Trainer-side VAE. False for separate-engine recipes (engine owns encode/decode).
+    load_vae: bool = True
 
     # VeOmniBackend lifecycle: build the transformer on the meta device
     # (architecture only, no weight allocation). VeOmni's parallelize
