@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import time
 from typing import Any, Dict, Optional
 
@@ -174,6 +175,22 @@ class CheckpointWeightSync(FullWeightSync):
                     f"{self._wait_timeout_s}s: path={checkpoint_path}, marker={marker}"
                 )
             time.sleep(0.2)
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def cleanup(self) -> None:
+        """Remove this run's checkpoint namespace during trainer teardown."""
+        if self._my_rank != 0:
+            return
+        shutil.rmtree(self._dir, ignore_errors=True)
+        # Remove now-empty scope/run/root directories without touching siblings
+        # belonging to another bridge or concurrent Ray job.
+        parent = os.path.dirname(self._dir)
+        root = os.path.dirname(parent)
+        for directory in (parent, root):
+            try:
+                os.rmdir(directory)
+            except OSError:
+                pass
 
 
 __all__ = ["CheckpointWeightSync"]

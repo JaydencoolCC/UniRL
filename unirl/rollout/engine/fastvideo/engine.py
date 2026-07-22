@@ -274,7 +274,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
     ) -> Dict[str, Any]:
         """PR #1222 native-logprob path via executor.execute_forward + RLData.
 
-        Returns dict(trajectory=[B,T+1,...], log_probs=[B,T], samples=[B,...]).
+        Returns dict(trajectory=[B,T+1,...], log_probs=[B,T], decoded=[B,...]).
         """
         from copy import deepcopy
 
@@ -292,7 +292,10 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         sp.num_videos_per_prompt = 1
         sp.save_video = False
         sp.return_frames = False
-        sp.return_trajectory_latents = True
+        # RLData already stores the trajectory directly on CPU. Enabling the
+        # generic trajectory output as well retains a second full copy on GPU
+        # throughout denoising and then copies it to CPU again.
+        sp.return_trajectory_latents = False
         sp.return_trajectory_decoded = False
         # σ SSOT — AVOID the double-shift bug. ``req.sigmas`` is ALREADY the
         # shift-applied flow-match schedule (σ = shift·t/(1+(shift-1)·t)), but
@@ -324,7 +327,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
 
         all_log_probs: List[torch.Tensor] = []
         all_traj: List[torch.Tensor] = []
-        all_samples: List[torch.Tensor] = []
         all_decoded: List[torch.Tensor] = []
         all_text_embeds: List[torch.Tensor] = []
         all_text_masks: List[Optional[torch.Tensor]] = []
@@ -366,8 +368,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             if traj.dim() == 5:
                 traj = traj.unsqueeze(0)
             all_traj.append(traj.detach().cpu())
-            samples = out.latents.cpu() if out.latents is not None else traj[:, -1].cpu()
-            all_samples.append(samples.detach().cpu())
             # Decoded pixels: the FastVideo pipeline's DecodingStage writes the
             # final video to batch.output as [B, C, T, H, W] in [0, 1] (float32,
             # CPU). The reward path needs this as track.decoded (Videos).
@@ -413,13 +413,12 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             # video's GPU tensors before the next iteration. This — not
             # ``forward_batch_size`` — is what actually bounds peak GPU memory,
             # since the forward runs one video at a time.
-            del out, rl, traj, samples, dec
+            del out, rl, traj, dec
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         return {
             "trajectory": torch.cat(all_traj, dim=0),
-            "samples": torch.cat(all_samples, dim=0),
             "decoded": torch.cat(all_decoded, dim=0),
             "log_probs": torch.cat(all_log_probs, dim=0) if all_log_probs else None,
             "text_embeds": all_text_embeds,
