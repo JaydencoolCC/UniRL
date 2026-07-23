@@ -56,6 +56,55 @@ _SUPERVISED_EXCLUDED_KEYS = {
 }
 
 
+def tokenize_agent_target(
+    record: Dict[str, Any],
+    *,
+    tokenizer: Any,
+    enable_thinking: bool,
+) -> List[int]:
+    """Render an agent record and return only its final assistant-turn tokens."""
+    messages = record["messages"]
+    history = messages[:-1]
+    tools = record.get("tools")
+
+    def apply_template(turns: List[Dict[str, Any]], *, add_generation_prompt: bool) -> List[int]:
+        rendered = tokenizer.apply_chat_template(
+            turns,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            tokenize=True,
+            return_dict=False,
+            truncation=False,
+        )
+        if isinstance(rendered, dict):
+            rendered = rendered["input_ids"]
+        if hasattr(rendered, "tolist"):
+            rendered = rendered.tolist()
+        if rendered and isinstance(rendered[0], list):
+            rendered = rendered[0]
+        return [int(token_id) for token_id in rendered]
+
+    prompt_ids = apply_template(history, add_generation_prompt=True)
+    full_ids = apply_template(messages, add_generation_prompt=False)
+    if full_ids[: len(prompt_ids)] != prompt_ids:
+        raise ValueError(
+            "Agent target is not a suffix of its rendered history. "
+            "Ensure enable_thinking matches the dataset's assistant reasoning format."
+        )
+
+    target_ids = full_ids[len(prompt_ids) :]
+    eos_id = tokenizer.eos_token_id
+    if isinstance(eos_id, (list, tuple)):
+        eos_id = eos_id[0] if eos_id else None
+    if eos_id is not None and eos_id in target_ids:
+        # Templates commonly append a newline after <|im_end|>. It is not part
+        # of the assistant turn and follows the model's stop token.
+        last_eos = len(target_ids) - 1 - target_ids[::-1].index(eos_id)
+        target_ids = target_ids[: last_eos + 1]
+    return target_ids
+
+
 def normalize_supervised_example(
     item: Dict[str, Any],
     *,
@@ -290,4 +339,5 @@ __all__ = [
     "SupervisedDataSource",
     "SupervisedDataset",
     "normalize_supervised_example",
+    "tokenize_agent_target",
 ]

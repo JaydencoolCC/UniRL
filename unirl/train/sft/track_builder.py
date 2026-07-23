@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from unirl.data.sft import tokenize_agent_target
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.primitives import Images, Texts
@@ -94,7 +95,8 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             any pipeline exposing a chat stage + tokenizer-carrying bundle).
         chat_stage_attr: chat/template stage attribute on the pipeline.
         max_response_length: hard token cap per response (uncapped targets OOM'd
-            other frameworks); truncated responses keep their EOS and log once.
+            other frameworks); legacy responses are truncated with EOS kept,
+            while agent targets must be filtered before training.
         append_eos: append ``tokenizer.eos_token_id`` to every response —
             disable only for models whose template ends turns with a non-EOS
             token that the dataset already includes.
@@ -200,7 +202,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         truncated = 0
         for r, is_pad in zip(records, _pad_flags(records)):
             if "messages" in r:
-                ids = self._tokenize_agent_target(r, eos_id=eos_id)
+                ids = self._tokenize_agent_target(r)
             else:
                 response = r.get("response")
                 if not isinstance(response, str) or not response:
@@ -217,9 +219,15 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             needs_eos = self.append_eos and (not ids or ids[-1] != eos_id)
             budget = self.max_response_length - (1 if needs_eos else 0)
             if len(ids) > budget:
+                if "messages" in r:
+                    raise ValueError(
+                        f"ARSupervisedTrackBuilder: agent target of record {r.get('sample_id')!r} exceeds "
+                        f"max_response_length={self.max_response_length}; filter overlong agent targets "
+                        "during manifest preparation instead of truncating a structured assistant turn."
+                    )
                 ids = list(ids[:budget])
                 truncated += 1
-                if not needs_eos and eos_id is not None:
+                if self.append_eos and not needs_eos and eos_id is not None:
                     ids[-1] = eos_id
             if needs_eos:
                 ids = list(ids) + [eos_id]
@@ -231,57 +239,22 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         if truncated and not self._warned_truncation:
             self._warned_truncation = True
             logger.warning(
-                "ARSupervisedTrackBuilder: %d/%d responses truncated to max_response_length=%d (EOS kept). "
-                "This warning is emitted once.",
+                "ARSupervisedTrackBuilder: %d/%d responses truncated to max_response_length=%d "
+                "(append_eos=%s). This warning is emitted once.",
                 truncated,
                 len(records),
                 self.max_response_length,
+                self.append_eos,
             )
         return tokens, masks
 
-    def _tokenize_agent_target(self, record: Record, *, eos_id: Optional[int]) -> List[int]:
+    def _tokenize_agent_target(self, record: Record) -> List[int]:
         """Render one final assistant turn and return only its supervised suffix."""
-        messages = record["messages"]
-        history = messages[:-1]
-        tools = record.get("tools")
-        prompt_ids = self._apply_chat_template_ids(history, tools=tools, add_generation_prompt=True)
-        full_ids = self._apply_chat_template_ids(messages, tools=tools, add_generation_prompt=False)
-        if full_ids[: len(prompt_ids)] != prompt_ids:
-            raise ValueError(
-                "ARSupervisedTrackBuilder: agent target is not a suffix of its rendered history. "
-                "Ensure pipeline.enable_thinking matches the dataset's assistant reasoning format."
-            )
-        target_ids = full_ids[len(prompt_ids) :]
-        if eos_id is not None and eos_id in target_ids:
-            # Templates commonly append a newline after <|im_end|>. It is not
-            # part of the assistant turn and would supervise a token generated
-            # only after the model's stop token.
-            target_ids = target_ids[: len(target_ids) - target_ids[::-1].index(eos_id)]
-        return target_ids
-
-    def _apply_chat_template_ids(
-        self,
-        messages: Sequence[Dict[str, Any]],
-        *,
-        tools: Optional[Sequence[Dict[str, Any]]],
-        add_generation_prompt: bool,
-    ) -> List[int]:
-        rendered = self._tokenizer.apply_chat_template(
-            messages,
-            tools=tools,
-            add_generation_prompt=add_generation_prompt,
+        return tokenize_agent_target(
+            record,
+            tokenizer=self._tokenizer,
             enable_thinking=bool(getattr(self._chat_stage, "enable_thinking", False)),
-            tokenize=True,
-            return_dict=False,
-            truncation=False,
         )
-        if isinstance(rendered, dict):
-            rendered = rendered["input_ids"]
-        if isinstance(rendered, torch.Tensor):
-            rendered = rendered.tolist()
-        if rendered and isinstance(rendered[0], list):
-            rendered = rendered[0]
-        return [int(token_id) for token_id in rendered]
 
 
 class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
