@@ -100,6 +100,21 @@ def _geneval2_answer_forms(question: str, expected: str) -> Tuple[str, ...]:
     return _YES_SURFACE_FORMS
 
 
+def _geneval2_answer_token_ids(tokenizer, question: str, expected: str) -> List[int]:
+    """First answer-token ids without BOS/EOS injection or duplicate probability mass."""
+    token_ids: List[int] = []
+    seen: set[int] = set()
+    for form in _geneval2_answer_forms(question, expected):
+        encoded = tokenizer.encode(form, add_special_tokens=False)
+        if not encoded:
+            continue
+        token_id = int(encoded[0])
+        if token_id not in seen:
+            seen.add(token_id)
+            token_ids.append(token_id)
+    return token_ids
+
+
 def score_images_local_geneval2(
     pairs: Sequence[Tuple[str, Path]],
     metadatas: Optional[Sequence[Optional[Dict]]] = None,
@@ -151,9 +166,7 @@ def score_images_local_geneval2(
     def _soft_tifa(vqa_list: List, image: "Image.Image") -> float:
         scores: List[float] = []
         for q, a in ((v[0], v[1]) for v in vqa_list):
-            tids = [
-                enc[0] for form in _geneval2_answer_forms(q, a) for enc in [processor.tokenizer.encode(form)] if enc
-            ]
+            tids = _geneval2_answer_token_ids(processor.tokenizer, q, a)
             if tids:
                 scores.append(_answer_prob(q, image, tids))
         if not scores:

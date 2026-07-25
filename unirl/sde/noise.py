@@ -15,6 +15,7 @@ present, i.e. the engine draws its own noise.
 """
 
 import hashlib
+import json
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -29,18 +30,45 @@ MAX_TORCH_SEED = (1 << 63) - 1
 PROMPT_SEED_PREFIX = "prompt:"
 
 
+def make_prompt_seed_group_id(prompt: str, sample_ordinal: int = 0) -> str:
+    """Encode prompt content and a sibling-sample ordinal into an eval noise group id."""
+    ordinal = int(sample_ordinal)
+    if ordinal < 0:
+        raise ValueError(f"sample_ordinal must be non-negative, got {ordinal}")
+    payload = json.dumps(
+        {"prompt": str(prompt), "sample": ordinal},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"{PROMPT_SEED_PREFIX}{payload}"
+
+
 def _derive_group_seed(base_seed: int, group_id: str) -> int:
     """Deterministic per-group seed for x_T generation.
 
-    * ``group_id == "prompt:<text>"`` -> ``(base_seed + int(SHA256(text)[:4])) % 2**31``:
-      keyed only on prompt content (rank/step-independent). Used for reproducible eval.
+    * prompt-seed group ids -> ``(base_seed + int(SHA256(text)[:4]) + sample_ordinal)
+      % 2**31``: keyed on prompt content and sibling ordinal (rank/step-independent).
+      Used for reproducible eval.
     * otherwise -> blake2b of ``base_seed::group_id`` (per-rollout/per-sample varying) for training.
     """
     gid = str(group_id)
     if gid.startswith(PROMPT_SEED_PREFIX):
-        prompt = gid[len(PROMPT_SEED_PREFIX) :]
+        payload = gid[len(PROMPT_SEED_PREFIX) :]
+        sample_ordinal = 0
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError:
+            prompt = payload
+        else:
+            if not isinstance(decoded, dict) or not isinstance(decoded.get("prompt"), str):
+                raise ValueError(f"invalid prompt-seed group id: {gid!r}")
+            prompt = decoded["prompt"]
+            sample_ordinal = int(decoded.get("sample", 0))
+            if sample_ordinal < 0:
+                raise ValueError(f"invalid prompt-seed sample ordinal: {sample_ordinal}")
         digest = hashlib.sha256(prompt.encode("utf-8")).digest()
-        return (int(base_seed) + int.from_bytes(digest[:4], "big")) % (2**31)
+        return (int(base_seed) + int.from_bytes(digest[:4], "big") + sample_ordinal) % (2**31)
     payload = f"{int(base_seed)}::{gid}".encode("utf-8")
     digest = hashlib.blake2b(payload, digest_size=8).digest()
     return int.from_bytes(digest, byteorder="big", signed=False) % (MAX_TORCH_SEED + 1)

@@ -32,6 +32,44 @@ from benchmarks.core.score import (
 )
 
 
+def _parse_sim_even_batches(value: str) -> tuple[int, int]:
+    try:
+        parts = value.lower().split("x")
+        if len(parts) != 2:
+            raise ValueError
+        world, batch_size = (int(part) for part in parts)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("expected WxB with positive integers, for example 32x32") from exc
+    if world <= 0 or batch_size <= 0:
+        raise argparse.ArgumentTypeError("W and B must both be positive integers")
+    return world, batch_size
+
+
+def _sim_even_order(num_items: int, world: int, batch_size: int) -> List[int]:
+    """Indices after repeating the dataset prefix to fill complete W×B waves."""
+    if num_items <= 0:
+        return []
+    wave_size = world * batch_size
+    target_size = ((num_items + wave_size - 1) // wave_size) * wave_size
+    return list(range(num_items)) + [index % num_items for index in range(target_size - num_items)]
+
+
+def _sim_even_metrics(
+    rows: List[Optional[Dict[str, float]]],
+    keys: List[str],
+    *,
+    world: int,
+    batch_size: int,
+) -> Dict[str, float]:
+    order = _sim_even_order(len(rows), world, batch_size)
+    metrics: Dict[str, float] = {}
+    for key in keys:
+        values = [rows[index][key] for index in order if isinstance(rows[index], dict) and key in rows[index]]
+        if values:
+            metrics[f"{key}_sim{world}x{batch_size}"] = sum(values) / len(values)
+    return metrics
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -64,6 +102,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sim-even-batches",
         metavar="WxB",
+        type=_parse_sim_even_batches,
         help="t2i: also report the metric under a simulated distributed eval that repeats "
         "the last partial wave (e.g. '32x32' = 32 GPUs x batch 32); default: 800 unique only",
     )
@@ -189,16 +228,8 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
         # Config 2 (optional): simulate a distributed eval of WxB that repeats the last partial wave
         # of batches to fill the world size, so a fixed prefix of prompts is double-counted.
         if args.sim_even_batches:
-            world, bs = (int(x) for x in args.sim_even_batches.lower().split("x"))
-            n = len(prompts)
-            per_prompt = {k_: [rows[p * k + s].get(k_) for p in range(n) for s in range(k)] for k_ in keys}
-            n_batches = (n * k + bs - 1) // bs
-            pad = (world - n_batches % world) % world
-            order = list(range(n * k)) + [j for b in range(pad) for j in range(b * bs, min((b + 1) * bs, n * k))]
-            for k_ in keys:
-                vals = [per_prompt[k_][j] for j in order if per_prompt[k_][j] is not None]
-                if vals:
-                    metrics[f"{k_}_sim{world}x{bs}"] = sum(vals) / len(vals)
+            world, batch_size = args.sim_even_batches
+            metrics.update(_sim_even_metrics(rows, keys, world=world, batch_size=batch_size))
         _write_summary(
             bench_dir,
             spec,
