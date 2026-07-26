@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from unirl.data.sft import tokenize_agent_target
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.primitives import Images, Texts
@@ -206,7 +207,8 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             any pipeline exposing a chat stage + tokenizer-carrying bundle).
         chat_stage_attr: chat/template stage attribute on the pipeline.
         max_response_length: hard token cap per response (uncapped targets OOM'd
-            other frameworks); truncated responses keep their EOS and log once.
+            other frameworks); legacy responses are truncated with EOS kept,
+            while agent targets must be filtered before training.
         append_eos: append ``tokenizer.eos_token_id`` to every response —
             disable only for models whose template ends turns with a non-EOS
             token that the dataset already includes.
@@ -243,15 +245,11 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         self.max_response_length = max_response_length
         self.append_eos = append_eos
         if int(image_load_workers) < 1:
-            raise ValueError(
-                f"ARSupervisedTrackBuilder: image_load_workers must be >= 1; got {image_load_workers!r}"
-            )
+            raise ValueError(f"ARSupervisedTrackBuilder: image_load_workers must be >= 1; got {image_load_workers!r}")
         self.image_load_workers = int(image_load_workers)
         self.prefetch_cpu = bool(prefetch_cpu)
         self._prefetch_executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="sft-prefetch")
-            if self.prefetch_cpu
-            else None
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="sft-prefetch") if self.prefetch_cpu else None
         )
         self._prefetch_future = None
         self._prefetch_key = None
@@ -321,7 +319,14 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         self,
         records: Sequence[Record],
     ) -> Tuple[List[Optional[Any]], List[List[int]]]:
-        images = self._load_prompt_images(records) if self._embed_takes_images else [None] * len(records)
+        agent_flags = ["messages" in record for record in records]
+        if any(agent_flags) and not all(agent_flags):
+            raise ValueError("ARSupervisedTrackBuilder: a batch may not mix prompt/response and agent records.")
+        images = (
+            self._load_prompt_images(records)
+            if self._embed_takes_images and not any(agent_flags)
+            else [None] * len(records)
+        )
         return images, self._batch_token_ids(records)
 
     def _load_prompt_images(self, records: Sequence[Record]) -> List[Optional[Any]]:
@@ -342,13 +347,21 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         *,
         images: Optional[List[Optional[Any]]] = None,
     ) -> Any:
-        for r in records:
-            if "messages" in r:
-                raise NotImplementedError(
-                    "ARSupervisedTrackBuilder: multi-turn 'messages' records are not supported yet — "
-                    "use single-turn {'prompt', 'response'} rows (multi-turn interleaved masking "
-                    "is a follow-up with its own template-consistency tests)."
+        agent_flags = ["messages" in r for r in records]
+        if any(agent_flags):
+            if not all(agent_flags):
+                raise ValueError("ARSupervisedTrackBuilder: a batch may not mix prompt/response and agent records.")
+            if any(r.get("media_refs") for r in records):
+                raise ValueError("ARSupervisedTrackBuilder: agent messages currently support text-only records.")
+            embed_messages = getattr(self._chat_stage, "embed_messages", None)
+            if not callable(embed_messages):
+                raise ValueError(
+                    "ARSupervisedTrackBuilder: this pipeline's chat stage does not support OpenAI-style messages."
                 )
+            histories = [r["messages"][:-1] for r in records]
+            tools = [r.get("tools") for r in records]
+            return embed_messages(histories, tools=tools)
+
         texts = Texts(texts=[str(r["prompt"]) for r in records])
         if not self._embed_takes_images:
             return self._chat_stage.embed(texts)
@@ -359,6 +372,12 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         return self._chat_stage.embed(texts, images)
 
     def _batch_token_ids(self, records: Sequence[Record]) -> List[List[int]]:
+        agent_flags = ["messages" in record for record in records]
+        if any(agent_flags):
+            if not all(agent_flags):
+                raise ValueError("ARSupervisedTrackBuilder: a batch may not mix prompt/response and agent records.")
+            return [self._tokenize_agent_target(record) for record in records]
+
         responses: List[str] = []
         for record in records:
             response = record.get("response")
@@ -368,19 +387,25 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
                     "AR SFT manifests must carry the target text."
                 )
             responses.append(response)
-        encoded = self._tokenizer(
-            responses,
-            add_special_tokens=False,
-            padding=False,
-            truncation=False,
+        tokenizer_kwargs: Dict[str, Any] = {"add_special_tokens": False}
+        try:
+            tokenizer_parameters = inspect.signature(self._tokenizer).parameters
+        except (TypeError, ValueError):
+            tokenizer_parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in tokenizer_parameters.values()
         )
+        if accepts_kwargs or "padding" in tokenizer_parameters:
+            tokenizer_kwargs["padding"] = False
+        if accepts_kwargs or "truncation" in tokenizer_parameters:
+            tokenizer_kwargs["truncation"] = False
+        encoded = self._tokenizer(responses, **tokenizer_kwargs)
         batch_ids = encoded["input_ids"]
         if len(responses) == 1 and batch_ids and isinstance(batch_ids[0], int):
             batch_ids = [batch_ids]
         if len(batch_ids) != len(records):
             raise RuntimeError(
-                f"ARSupervisedTrackBuilder: tokenizer returned {len(batch_ids)} rows "
-                f"for {len(records)} responses."
+                f"ARSupervisedTrackBuilder: tokenizer returned {len(batch_ids)} rows for {len(records)} responses."
             )
         return [list(ids) for ids in batch_ids]
 
@@ -398,6 +423,10 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             raise ValueError("ARSupervisedTrackBuilder: append_eos=True but the tokenizer has no eos_token_id.")
         if batch_ids is None:
             batch_ids = self._batch_token_ids(records)
+        elif len(batch_ids) != len(records):
+            raise RuntimeError(
+                f"ARSupervisedTrackBuilder: received {len(batch_ids)} prefetched token rows for {len(records)} records."
+            )
 
         tokens: List[torch.Tensor] = []
         masks: List[torch.Tensor] = []
@@ -405,16 +434,25 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         for r, is_pad, ids in zip(records, _pad_flags(records), batch_ids):
             if not ids:
                 raise ValueError(
-                    f"ARSupervisedTrackBuilder: response of record {r.get('sample_id')!r} tokenized to zero "
+                    f"ARSupervisedTrackBuilder: target of record {r.get('sample_id')!r} tokenized to zero "
                     "tokens — a sample with no supervision would poison the loss denominator."
                 )
             ids = list(ids)
-            budget = self.max_response_length - (1 if self.append_eos else 0)
+            needs_eos = self.append_eos and (not ids or ids[-1] != eos_id)
+            budget = self.max_response_length - (1 if needs_eos else 0)
             if len(ids) > budget:
-                ids = ids[:budget]
+                if "messages" in r:
+                    raise ValueError(
+                        f"ARSupervisedTrackBuilder: agent target of record {r.get('sample_id')!r} exceeds "
+                        f"max_response_length={self.max_response_length}; filter overlong agent targets "
+                        "during manifest preparation instead of truncating a structured assistant turn."
+                    )
+                ids = list(ids[:budget])
                 truncated += 1
-            if self.append_eos:
-                ids.append(eos_id)
+                if self.append_eos and not needs_eos and eos_id is not None:
+                    ids[-1] = eos_id
+            if needs_eos:
+                ids = list(ids) + [eos_id]
             tokens.append(torch.tensor(ids, dtype=torch.long, device=device))
             # _eval_pad rows ride the forward but carry zero loss weight — the
             # trainer pads eval batches to the DP width with duplicates.
@@ -423,13 +461,22 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         if truncated and not self._warned_truncation:
             self._warned_truncation = True
             logger.warning(
-                "ARSupervisedTrackBuilder: %d/%d responses truncated to max_response_length=%d (EOS kept). "
-                "This warning is emitted once.",
+                "ARSupervisedTrackBuilder: %d/%d responses truncated to max_response_length=%d "
+                "(append_eos=%s). This warning is emitted once.",
                 truncated,
                 len(records),
                 self.max_response_length,
+                self.append_eos,
             )
         return tokens, masks
+
+    def _tokenize_agent_target(self, record: Record) -> List[int]:
+        """Render one final assistant turn and return only its supervised suffix."""
+        return tokenize_agent_target(
+            record,
+            tokenizer=self._tokenizer,
+            enable_thinking=bool(getattr(self._chat_stage, "enable_thinking", False)),
+        )
 
 
 class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
