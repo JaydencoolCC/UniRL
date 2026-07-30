@@ -1,11 +1,4 @@
-"""Rollout engine base class for the ``Sample`` → ``Sample`` path.
-
-Concrete engines take all runtime deps as ``__init__`` kwargs and complete
-construction in one shot — no separate ``initialize(device)`` step. After
-``__init__`` returns the engine is fully usable: model loaded, worker
-subprocesses spawned, dist groups brought up. This matches the actor flow where
-``_setup_distributed_env`` runs before the engine is built.
-"""
+"""Rollout engine base classes. Engines complete construction in ``__init__``; no separate initialize step."""
 
 from __future__ import annotations
 
@@ -18,60 +11,35 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.sample import Sample
 
-#: The rollout batch contract (LIN-522). Single-turn engines return one ``Sample``;
-#: the agentic engine returns a list of variable-depth trajectory ``Sample``s (one
-#: per rollout). The broad generation method uses this union; the single-turn
-#: subclass refines its return to ``Sample``.
+# Single-turn engines return one Sample; the agentic engine returns a trajectory list.
 RolloutOutput = Union[Sample, List[Sample]]
 
 
 class BaseEngineConfig(ABC):
-    """Marker base for all rollout engine config dataclasses.
-
-    Used as the type annotation / base class for the engine config dataclasses.
-    Each concrete engine config maps itself to its runtime engine class via
-    :meth:`make_engine`.
-    """
+    """Marker base for rollout engine config dataclasses."""
 
     def make_engine(self, **deps: Any) -> "BaseRolloutEngine":
-        """Construct the runtime engine declared by this config.
-
-        ``deps`` carry the runtime injections (``device``, ``strategy``,
-        ``rank``, ``model_config``); the engine ctor contract is uniformly
-        ``Engine(config=self, **deps)``. Subclasses override to import (lazily,
-        so config modules stay importable without the engine's heavy optional
-        deps) and return their engine class.
-        """
+        """Construct the runtime engine declared by this config; ctor contract is ``Engine(config=self, **deps)``."""
         raise NotImplementedError(f"{type(self).__name__} must implement make_engine()")
 
 
 class BaseRolloutEngine(Remote, ABC):
-    """Rollout engine ABC. One-shot construction; new types only."""
+    """Rollout engine ABC."""
 
-    # ------------------------------------------------------------------
     # Lifecycle
-    # ------------------------------------------------------------------
 
     @abstractmethod
     def shutdown(self) -> None:
         """Release worker subprocesses and any other engine-owned resources."""
 
+    # Overrides of sleep/wake_up must re-apply @distributed; Handle binds the subclass attribute only.
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        """Best-effort runtime offload. Default no-op.
-
-        Decorated so the driver-side ``Handle.sleep()`` dispatches to every
-        worker. Subclasses that override should re-apply ``@distributed``
-        on their override (Handle's method-binding sees the subclass's
-        attribute and won't pick up a base-class decorator alone).
-        """
+        """Best-effort runtime offload. Default no-op."""
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
-        """Restore runtime resources after ``sleep``. Default no-op.
-
-        Same dispatch contract as :meth:`sleep`; see its docstring.
-        """
+        """Restore runtime resources after ``sleep``. Default no-op."""
 
     def onload_weights(self, *, track_prefix: str = "") -> None:
         """Restore the resources needed to receive a weight update."""
@@ -88,7 +56,7 @@ class BaseRolloutEngine(Remote, ABC):
         return True
 
     def get_memory_info(self) -> Dict[str, float]:
-        """Per-engine GPU memory snapshot. Default reads CUDA totals."""
+        """Per-engine GPU memory snapshot."""
         if not torch.cuda.is_available():
             return {}
         return {
@@ -96,31 +64,16 @@ class BaseRolloutEngine(Remote, ABC):
             "cached_gb": torch.cuda.memory_reserved() / 1e9,
         }
 
-    # ------------------------------------------------------------------
     # Generation
-    # ------------------------------------------------------------------
 
     @abstractmethod
     def generate(self, sample: Sample) -> RolloutOutput:
-        """Synchronously run rollout generation for one request batch.
+        """Synchronously run rollout generation; each concrete contract owns its dispatch mode."""
 
-        Dispatch belongs to each concrete contract: single-turn engines use
-        ``DP_SCATTER`` and return one ``Sample``; the agentic coordinator uses
-        ``BROADCAST + RANK_ZERO`` and returns a trajectory list.
-        """
-
-    # ------------------------------------------------------------------
-    # Control plane — sync methods reached via the raw ``Worker.call`` RPC (the
-    # un-decorated weight-sync pattern), so they interleave with an in-flight
-    # ``generate`` on a threaded Worker (``worker_max_concurrency>1``).
-    # ------------------------------------------------------------------
+    # Control plane — reached via raw Worker.call, so calls interleave with an in-flight generate.
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
-        """Best-effort cancel of in-flight generation; return any partials.
-
-        Default no-op (``[]``). Engines whose backend supports it (SGLang) cancel
-        running requests; sync/batch backends can only drop not-yet-started work.
-        """
+        """Best-effort cancel of in-flight generation; return any partials. Default no-op."""
         del ids
         return []
 
@@ -130,9 +83,7 @@ class BaseRolloutEngine(Remote, ABC):
     def resume(self) -> None:
         """Resume generation after :meth:`pause`. Default no-op."""
 
-    # ------------------------------------------------------------------
-    # Weight sync — bucketed CUDA-IPC (verl-omni pattern)
-    # ------------------------------------------------------------------
+    # Weight sync — bucketed CUDA-IPC
 
     def update_weights_from_ipc(
         self,
@@ -145,9 +96,7 @@ class BaseRolloutEngine(Remote, ABC):
         """Receive a state dict over a per-rank ZMQ + CUDA-IPC channel."""
         raise NotImplementedError
 
-    # ------------------------------------------------------------------
     # Weight sync — NCCL broadcast
-    # ------------------------------------------------------------------
 
     def init_weights_update_group(
         self,
@@ -186,9 +135,7 @@ class BaseRolloutEngine(Remote, ABC):
         """Tear down a previously-initialized NCCL update group."""
         raise NotImplementedError
 
-    # ------------------------------------------------------------------
     # Weight sync — LoRA tensor bag
-    # ------------------------------------------------------------------
 
     def set_lora_from_tensors(
         self,
@@ -200,9 +147,7 @@ class BaseRolloutEngine(Remote, ABC):
         """Load a LoRA adapter directly from in-memory tensors."""
         raise NotImplementedError
 
-    # ------------------------------------------------------------------
     # Weight sync — SGLang-shape one-bag tensor payload
-    # ------------------------------------------------------------------
 
     def update_weights_from_tensor(
         self,
@@ -219,19 +164,9 @@ class BaseRolloutEngine(Remote, ABC):
 
 
 class BaseSingleTurnRolloutEngine(BaseRolloutEngine, ABC):
-    """Nominal contract for engines that fill and return one ``Sample``.
+    """Engines that fill and return one ``Sample``; ``generate`` may be called concurrently (agentic drain)."""
 
-    The class intentionally does not prescribe batching or provide a batching
-    wrapper. Each engine owns those semantics and applies its own
-    ``@distributed`` decorator. The contract is synchronous. An engine meant to
-    serve as an agentic inner must make ``generate`` safe for CONCURRENT
-    callers (the agentic drain calls it from one thread per trajectory and
-    relies on the backend batching the in-flight requests together); an engine
-    that cannot serve concurrently serializes internally instead.
-    """
-
-    #: Policy weight version the current weights correspond to (bumped on each
-    #: weight sync; stamped onto generated Parts by :meth:`_stamp_weight_version`).
+    # Policy weight version of the current weights; bumped on each weight sync.
     _weight_version: int = 0
 
     @abstractmethod
