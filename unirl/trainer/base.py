@@ -506,3 +506,97 @@ class BaseTrainer:
                 num_rollouts,
             )
         return start
+
+    # ------------------------------------------------------------------
+    # Synchronous training-loop template.
+    # ------------------------------------------------------------------
+    # The sync-family trainers (diffusion / AR; pe / unified_model / sft to
+    # migrate next) share this exact outer loop; subclasses supply the four
+    # hooks below plus ``train_step`` / ``_build_request_sample``.
+
+    eval_interval: int = 0
+
+    def train_step(self, sample, *, training_progress: float, sync_weights: bool, rollout_id: int):
+        raise NotImplementedError(f"{type(self).__name__} must implement train_step(...)")
+
+    def _build_request_sample(self, inputs, rollout_id: int):
+        raise NotImplementedError(f"{type(self).__name__} must implement _build_request_sample(...)")
+
+    def _wandb_extra(self) -> Optional[Dict[str, Any]]:
+        """Extra run-config keys for ``_init_wandb`` (hook)."""
+        return None
+
+    def evaluate_baseline(self, start_rollout: int) -> None:
+        """Baseline eval before any training (hook; called when eval_interval > 0)."""
+        self.evaluate(start_rollout)  # type: ignore[attr-defined]
+
+    def evaluate_periodic(self, rollout_id: int) -> None:
+        """Periodic eval inside the loop (hook; called when eval_interval > 0)."""
+        self.evaluate(rollout_id + 1)  # type: ignore[attr-defined]
+
+    def on_train_end(self) -> None:
+        """Runs LAST in the loop's ``finally`` — release trainer-owned runtimes (hook)."""
+
+    def train(
+        self,
+        *,
+        num_rollouts: int,
+        weight_sync_interval: int = 1,
+        save_interval: int = 0,
+        save_dir: Optional[str] = None,
+        load_dir: Optional[str] = None,
+        save_mode: str = "auto",
+    ) -> None:
+        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
+
+        ``weight_sync_interval``: sync the adapter into the engine every N
+        rollouts (fused into ``train_step``'s generate; no-op trainside).
+
+        ``save_interval``: write a checkpoint every N rollouts (and on the last
+        one); ``0`` disables it. ``save_dir`` is the output folder (defaults to
+        ``./checkpoints``); ``save_mode="auto"`` writes LoRA-only checkpoints
+        when LoRA is active and full checkpoints otherwise.
+        ``load_dir``: restore from a checkpoint directory and RESUME from its
+        saved step — ``num_rollouts`` is the TOTAL budget, so resuming
+        checkpoint-500 with ``num_rollouts=600`` runs rollouts 500..599.
+        """
+        progress_logger = logging.getLogger(type(self).__module__)
+        interval = max(1, weight_sync_interval)
+        start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
+        resumed = bool(load_dir)
+        # Fast-forward the data stream to the resume point — exact when
+        # run.seed is set (deterministic shuffle); with seed=null the stream
+        # is non-reproducible anyway.
+        for _ in range(start_rollout):
+            self.data_source.get_samples(self.batch_size)
+        self._init_wandb(num_rollouts=num_rollouts, extra=self._wandb_extra())
+        try:
+            if self.eval_interval > 0:
+                self.evaluate_baseline(start_rollout)
+            for rollout_id in range(start_rollout, num_rollouts):
+                training_progress = rollout_id / max(1, num_rollouts - 1)
+                inputs = self.data_source.get_samples(self.batch_size)
+                sample = self._build_request_sample(inputs, rollout_id)
+                # Sync before generate; skip step 0 (nothing trained yet). On
+                # resume, force the first sync — the engine booted with fresh
+                # weights and needs the restored adapter before generate.
+                sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
+                    resumed and rollout_id == start_rollout
+                )
+                result, mean_reward = self.train_step(
+                    sample,
+                    training_progress=training_progress,
+                    sync_weights=sync_weights,
+                    rollout_id=rollout_id,
+                )
+                self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=progress_logger)
+                if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
+                    self.evaluate_periodic(rollout_id)
+                self.maybe_save_checkpoint(
+                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                )
+        finally:
+            try:
+                self._finish_wandb()
+            finally:
+                self.on_train_end()

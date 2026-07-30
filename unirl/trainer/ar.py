@@ -561,75 +561,18 @@ class ARTrainer(BaseTrainer):
         except Exception as exc:  # debug path — never let it kill training
             logger.warning("rollout sample dump failed: %s", exc)
 
-    def train(
-        self,
-        *,
-        num_rollouts: int,
-        weight_sync_interval: int = 1,
-        save_interval: int = 0,
-        save_dir: Optional[str] = None,
-        load_dir: Optional[str] = None,
-        save_mode: str = "auto",
-    ) -> None:
-        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
+    def _wandb_extra(self):
+        return {"adv_normalization_scope": self.adv_normalization_scope}
 
-        ``weight_sync_interval``: sync the adapter into the engine every N
-        rollouts (fused into ``train_step``'s generate; no-op trainside).
+    def evaluate_baseline(self, start_rollout: int) -> None:
+        del start_rollout
+        self.evaluate(rollout_id=-1)  # baseline evaluation at step 0
 
-        ``save_interval``: write a checkpoint every N rollouts (and on the last
-        one); ``0`` disables it. ``save_dir`` is the output folder (defaults to
-        ``./checkpoints``); ``save_mode="auto"`` writes LoRA-only checkpoints
-        when LoRA is active and full checkpoints otherwise.
-        ``load_dir``: restore from a checkpoint directory and RESUME from its
-        saved step — ``num_rollouts`` is the TOTAL budget.
+    def evaluate_periodic(self, rollout_id: int) -> None:
+        self.evaluate(rollout_id=rollout_id)
 
-        Evaluation follows ``self.eval_interval``. Multiple optimizer updates
-        per rollout are configured on the train stack with
-        ``num_updates_per_batch``; the stack partitions its shard into disjoint
-        updates while keeping the pre-update policy anchor fixed.
-        """
-        interval = max(1, weight_sync_interval)
-        start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
-        resumed = bool(load_dir)
-        # Fast-forward the data stream to the resume point — exact when
-        # run.seed is set (deterministic shuffle); with seed=null the stream
-        # is non-reproducible anyway.
-        for _ in range(start_rollout):
-            self.data_source.get_samples(self.batch_size)
-        self._init_wandb(
-            num_rollouts=num_rollouts,
-            extra={"adv_normalization_scope": self.adv_normalization_scope},
-        )
-        try:
-            if self.eval_interval > 0:
-                self.evaluate(rollout_id=-1)  # baseline evaluation at step 0
-            for rollout_id in range(start_rollout, num_rollouts):
-                training_progress = rollout_id / max(1, num_rollouts - 1)
-                inputs = self.data_source.get_samples(self.batch_size)
-                sample = self._build_request_sample(inputs, rollout_id)
-                # Sync before generate; skip step 0 (nothing trained yet). On
-                # resume, force the first sync — the engine booted with fresh
-                # weights and needs the restored adapter before generate.
-                sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
-                    resumed and rollout_id == start_rollout
-                )
-                result, mean_reward = self.train_step(
-                    sample,
-                    training_progress=training_progress,
-                    sync_weights=sync_weights,
-                    rollout_id=rollout_id,
-                )
-                self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
-                if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
-                    self.evaluate(rollout_id=rollout_id)
-                self.maybe_save_checkpoint(
-                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
-                )
-        finally:
-            try:
-                self._finish_wandb()
-            finally:
-                self._shutdown_runtime()
+    def on_train_end(self) -> None:
+        self._shutdown_runtime()
 
     def shutdown(self) -> None:
         """Release every runtime resource this trainer owns. Idempotent.
