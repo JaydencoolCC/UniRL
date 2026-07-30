@@ -308,7 +308,13 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         clean_prompt = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
-        with torch.no_grad(), self._autocast_ctx(device):
+        # ``update_context_text`` reaches the navit via the packed-query
+        # ``forward_inference`` signature, which the module only dispatches to in
+        # eval(). Replay is called with the MoT in train() (TrainStack switches to
+        # train() before the gradient-bearing replay so HF gradient checkpointing
+        # engages), so without this the kwargs land in ``forward_train``:
+        # "unexpected keyword argument 'packed_query_sequence'".
+        with rl_ops.inference_dispatch(self.model.model), torch.no_grad(), self._autocast_ctx(device):
             cfg_text = deepcopy(gen)  # snapshot before the prompt text → unconditional
             gen = inf.update_context_text(clean_prompt, gen)
             cfg_img = inf.update_context_text(clean_prompt, cfg_img)
@@ -544,8 +550,14 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         :class:`ReplayResult` with ``log_probs [1, S']`` aligned with
         ``segment.sde_logp`` plus ``prev_sample_means [1, S', seq, C]`` for KL.
 
-        Caller owns ``.train()`` mode + grad scope; this method manages only the
-        autocast scope (mirrors ``SD3DiffusionStage.replay``).
+        Caller owns the grad scope; this method manages only the autocast scope
+        (mirrors ``SD3DiffusionStage.replay``). Unlike SD3, the caller does NOT own
+        ``.train()`` mode: BAGEL's navit routes ``forward_train`` vs
+        ``forward_inference`` on ``self.training`` while replay uses the packed-query
+        (inference) signature, so eval() is a correctness requirement rather than a
+        caller preference. Each packed-query region forces it for itself —
+        ``forward_flow`` per call, and ``_build_contexts_from_prompt`` via
+        ``rl_ops.inference_dispatch``.
         """
         if segment.sde_indices is None or segment.latents is None or segment.sigmas is None:
             raise ValueError("BagelDiffusionStage.replay: segment.sde_indices / latents / sigmas missing")

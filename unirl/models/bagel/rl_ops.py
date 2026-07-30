@@ -63,7 +63,8 @@ function serves rollout, the ratio test, and training.
 from __future__ import annotations
 
 import sys
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -73,6 +74,7 @@ __all__ = [
     "decode_text",
     "disable_inference_cache",
     "forward_flow",
+    "inference_dispatch",
     "init_und_context",
     "pack_und_forward_inputs",
     "prefill_text_split",
@@ -152,6 +154,36 @@ def forward_flow(model: Any, **kwargs: Any) -> Any:
 # ---------------------------------------------------------------------------
 # AR (text-out) adapters
 # ---------------------------------------------------------------------------
+
+
+@contextmanager
+def inference_dispatch(model: Any) -> Iterator[None]:
+    """Force the MoT into eval() for a packed-query (``forward_inference``) region.
+
+    Every navit module routes ``forward_train`` vs ``forward_inference`` on
+    ``self.training``, so any region that passes the packed-query kwargs must run
+    in eval() no matter what mode the caller left the module in — a ``.train()``
+    module raises ``unexpected keyword argument 'packed_query_sequence'``. The
+    enclosing :class:`~unirl.train.stack.TrainStack` deliberately switches to
+    ``train()`` before the gradient-bearing replay, so the requirement cannot be
+    delegated to the caller.
+
+    Restores the previous mode only when NO backward follows (grads disabled).
+    Under grad the module is left in eval() on purpose: activation-checkpointing
+    recompute during the later ``.backward()`` re-enters these forwards, and a
+    restored ``train()`` would dispatch them into ``forward_train``. This is the
+    same rule :func:`_forward_flow_train_safe` applies around its own call.
+    """
+    lm = model.language_model
+    was_training = lm.training
+    grad_enabled = torch.is_grad_enabled()
+    if was_training:
+        lm.eval()
+    try:
+        yield
+    finally:
+        if was_training and not grad_enabled:
+            lm.train()
 
 
 def require_inference_dispatch(model: Any) -> None:
