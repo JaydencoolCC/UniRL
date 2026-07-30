@@ -84,3 +84,26 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
   *not* the engine's actual temperature, biasing every ratio with no raise. Watch
   `rollout_replay_logp_absdiff_mean` — it should be ~0 on an on-policy step.
+
+## Placement policy (RFC)
+
+`unirl/algorithms/` is a curated set, not an accumulation point. Where a
+loss algorithm lives follows three rules:
+
+1. **Core keeps the canon**: the reference family bases (GRPO, FlowGRPO,
+   SFT losses) and the team-flagship published algorithms (CPPO, DRPO,
+   FlowDPPO — the repo's advertised surface). These carry core review and
+   stability guarantees.
+2. **Variants start in `experimental/`**: model-specific one-offs and
+   unpublished experimental variants belong to the package that needs
+   them (`experimental/<pkg>/`), selected via `_target_` exactly like
+   core algorithms — the trainer never changes either way. New variants
+   default here first.
+3. **Movement is a deliberate PR in either direction**: a variant
+   graduates into core when it becomes a recommended default (with its
+   config dotpaths migrated in the same PR — `check_recipe_targets`
+   gates stale paths); a core resident that stays model-specific or
+   unadopted is a candidate to move down. Never both copies at once.
+
+In-flight algorithm PRs choose their home under this policy at land
+time. (RFC: comment on the placement PR if you want different lines.)
