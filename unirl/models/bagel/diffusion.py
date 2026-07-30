@@ -308,30 +308,21 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         clean_prompt = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
-        # eval() is load-bearing, same contract as ``rl_ops.forward_flow``: the
-        # vendored inferencer reaches the navit through its *inference*
-        # (packed-query) signature, and every navit module dispatches
-        # ``forward_train`` vs ``forward_inference`` on ``self.training``, so
-        # train() mode routes the packed kwargs into ``forward_train`` →
-        # "unexpected keyword argument 'packed_query_sequence'".
-        # ``TrainStack.train_track`` puts the model in train() before the
-        # gradient-bearing replay (HF gradient checkpointing is gated on it), so
-        # replay arrives here in train() mode. Restoring the caller's mode is safe
-        # because nothing here is gradient-bearing — the und/text path is frozen
-        # and the whole block runs under ``no_grad``, so no activation-checkpoint
-        # recompute can revisit it during ``.backward()``.
+        # eval() is load-bearing (same contract as ``rl_ops.forward_flow``): navit
+        # dispatches ``forward_train`` vs ``forward_inference`` on ``self.training``
+        # and ``update_context_text`` uses the packed-query inference signature,
+        # while ``TrainStack.train_track`` leaves the model in train() before the
+        # gradient-bearing replay.
         mot = self.model.transformer
         was_training = mot.training
-        if was_training:
-            mot.eval()
+        mot.eval()
         try:
             with torch.no_grad(), self._autocast_ctx(device):
                 cfg_text = deepcopy(gen)  # snapshot before the prompt text → unconditional
                 gen = inf.update_context_text(clean_prompt, gen)
                 cfg_img = inf.update_context_text(clean_prompt, cfg_img)
         finally:
-            if was_training:
-                mot.train()
+            mot.train(was_training)
         return gen, cfg_text, cfg_img
 
     def _resolve_single(self, conditions: BagelDiffusionConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
