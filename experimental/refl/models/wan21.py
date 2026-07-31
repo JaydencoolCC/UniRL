@@ -218,12 +218,17 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
                 )
             latents = initial_latents.to(device=device, dtype=self.trajectory_dtype)
         else:
+            if params.seed is None:
+                raise ValueError(
+                    "REFL's fixed-noise regime needs an explicit sampling seed "
+                    "(roles.py: params.seed is used verbatim every rollout/rank); set sampling.seed."
+                )
             latents = self.generate_latents(
                 batch_size=batch_size,
                 latent_shape=latent_shape,
                 device=device,
                 dtype=self.trajectory_dtype,
-                base_seed=None if params.seed is None else int(params.seed),
+                base_seed=int(params.seed),
             )
 
         # BPTT knobs.

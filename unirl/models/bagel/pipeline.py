@@ -292,7 +292,9 @@ class BagelPipeline(Pipeline):
         # and ``rl_ops.forward_flow``): navit dispatches ``forward_train`` vs ``forward_inference``
         # on ``self.training`` and these prefills use the packed-query inference signature — in
         # train() they TypeError. SFT/trainside callers can reach here mid-training, so guard
-        # and restore rather than assume the mode.
+        # and restore rather than assume the mode. The transformer handle is sufficient: vae and
+        # vit_model stay in their load-time eval() (bundle.py) — training mode-flips only the
+        # ``transformer`` trainable module, and siglip has no signature dispatch anyway.
         mot = self.bundle.transformer
         was_training = mot.training
         mot.eval()
