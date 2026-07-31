@@ -223,7 +223,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
                 latent_shape=latent_shape,
                 device=device,
                 dtype=self.trajectory_dtype,
-                base_seed=int(params.seed),
+                base_seed=None if params.seed is None else int(params.seed),
             )
 
         # BPTT knobs.
