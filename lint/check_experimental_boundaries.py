@@ -146,10 +146,10 @@ def check_requirements_additive_only(errors: list[str]) -> None:
                     "declare additive name-based pins only"
                 )
                 continue
-            name_part = line.split(" @ ", 1)[0].strip()
-            match = _REQ_NAME_RE.match(name_part)
-            rest = name_part[match.end() :] if match else ""
-            if not match or (rest and rest[0] not in " [<>=!~;,"):
+            match = _REQ_NAME_RE.match(line)
+            rest = line[match.end() :] if match else ""
+            # "@" covers PEP 508 direct references, spaced or not (name@git+https://...).
+            if not match or (rest and rest[0] not in " @[<>=!~;,"):
                 errors.append(f"{rel}:{lineno}: {line!r} — unparseable requirement; use PEP 508 name-based pins")
             elif _normalize(match.group(1)) in core:
                 errors.append(

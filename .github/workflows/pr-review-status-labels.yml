@@ -15,9 +15,14 @@ permissions:
   pull-requests: write
   issues: write
 
-# No concurrency group: GitHub keeps only one pending run per group, so a shared
-# group silently drops the earlier PR's sync when reviews land on two PRs within
-# seconds. Parallel runs are safe — each re-reads live PR state and converges.
+# Per-PR concurrency: a shared group silently drops the earlier PR's sync when
+# reviews land on two PRs within seconds (GitHub keeps one pending run per
+# group), while no group at all lets same-PR runs race each other's label
+# writes. workflow_run.pull_requests is empty for fork PRs — those fall back to
+# a per-run group (no serialization; the tolerant DELETE below absorbs races).
+concurrency:
+  group: pr-review-status-labels-${{ github.event.workflow_run.pull_requests[0].number || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   sync-labels:
@@ -75,9 +80,10 @@ jobs:
               [ "$label" = "$target" ] && continue
               if jq -e --arg name "$label" '.labels | any(.name == $name)' <<<"$pr" >/dev/null; then
                 encoded=$(jq -rn --arg label "$label" '$label | @uri')
+                # || true: a parallel fork-PR run may have removed it already (404 is benign).
                 gh api --method DELETE \
                   "repos/$GITHUB_REPOSITORY/issues/$number/labels/$encoded" \
-                  >/dev/null
+                  >/dev/null || true
               fi
             done
 

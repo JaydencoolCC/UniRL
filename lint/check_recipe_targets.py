@@ -145,7 +145,12 @@ def main() -> int:
                 tier.append(
                     f"{rel}:{lineno}: core recipe targets '{dotted}' — the dependency arrow points the other way"
                 )
-            elif len(rel.parts) > 2 and dotted.split(".")[1] != rel.parts[1]:
+            elif len(rel.parts) == 2:
+                tier.append(
+                    f"{rel}:{lineno}: recipe at the experimental/ root targets '{dotted}' — "
+                    "a recipe belongs inside one package (experimental/<name>/...)"
+                )
+            elif dotted.split(".")[1] != rel.parts[1]:
                 tier.append(
                     f"{rel}:{lineno}: recipe under 'experimental/{rel.parts[1]}/' targets sibling '{dotted}' — "
                     "shared code graduates into core"
