@@ -15,9 +15,9 @@ permissions:
   pull-requests: write
   issues: write
 
-concurrency:
-  group: pr-review-status-labels
-  cancel-in-progress: false
+# No concurrency group: GitHub keeps only one pending run per group, so a shared
+# group silently drops the earlier PR's sync when reviews land on two PRs within
+# seconds. Parallel runs are safe — each re-reads live PR state and converges.
 
 jobs:
   sync-labels:
