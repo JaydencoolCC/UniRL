@@ -38,8 +38,12 @@ actor:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
-    # master_dtype deliberately omitted → LoRA stays bf16 (uniform dtype);
-    # fp32 LoRA over a bf16 base trips torch FSDP2's uniform-dtype assert.
+    # fp32 LoRA master over the bf16 base — the setting the historical ReFL
+    # curves (#120 era) were trained with; a bf16 master rounds away most
+    # AdamW steps at lora_A's magnitude. Needs the pinned torch (>=2.11):
+    # older FSDP2 asserts uniform dtype over ALL params in a group; the
+    # pinned family checks trainables only.
+    master_dtype: fp32
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full
