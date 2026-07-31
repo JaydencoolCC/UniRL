@@ -58,4 +58,4 @@ core stack.
 | `wan21_t2v_videoalign_refl` (2-rollout smoke, full 81f/480x832 geometry) | 8xH20, fleet image | `40b3f4c9` | PASS — grads flow reward → VAE → DiT LoRA |
 | VideoAlign load + differentiable fwd/bwd on transformers 5.6.2 + peft 0.20 | 8xH20 (isolated venv) | `9087a671` | PASS — `grad_abs_mean=3.5e-3` |
 | `wan22_i2v_face_refl` | 8xH20 | current head | pending (needs face assets + I2V dataset) |
-| `sd3_pickscore_refl` (ported from the legacy core path; hyperparameters preserved) | 8xH20 | current head | pending smoke |
+| `sd3_pickscore_refl` (200 rollouts, ported from the legacy core path; hyperparameters preserved) | 8xH20 (torch 2.11 + transformers 5.6.2 + peft 0.20, fp32 LoRA master) | `9edcab00` | PASS — reward first-10 0.743 → last-10 0.903, matching the legacy-path curve (#120: 0.757 → 0.899) |
