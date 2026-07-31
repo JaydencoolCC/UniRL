@@ -352,8 +352,7 @@ class PendingHandleCall:
         handle = self._handle
         results = ray.get(self._refs)
         results = [
-            handle._rebind_tree(r, handle.workers[i], worker_local=self._worker_local)
-            for i, r in enumerate(results)
+            handle._rebind_tree(r, handle.workers[i], worker_local=self._worker_local) for i, r in enumerate(results)
         ]
         _, _, collect_fn, _ = handle._method_configs[self._method_name]
         self._value = collect_fn(handle, results)
