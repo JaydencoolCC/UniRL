@@ -8,9 +8,11 @@ from typing import Any, Optional
 import torch
 
 from unirl.models.types.pipeline import Pipeline
-from unirl.models.wan21.conditions import WAN21Conditions
-from unirl.models.wan21.text_embed import WAN21TextEmbedStage
-from unirl.models.wan21.vae import WAN21VAEDecodeStage
+from unirl.models.wan.conditions import WANConditions
+from unirl.models.wan.geometry import wan_latent_shape
+from unirl.models.wan.pipeline import build_wan_text_conditions
+from unirl.models.wan.text_embed import WANTextEmbedStage
+from unirl.models.wan.vae import WANVAEDecodeStage
 from unirl.models.wan22.bundle import WAN22Bundle
 from unirl.models.wan22.diffusion import WAN22DiffusionStage, WAN22DiffusionStep
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
@@ -31,9 +33,9 @@ class WAN22V2VPipeline(Pipeline):
         self,
         *,
         bundle: WAN22Bundle,
-        text_embed: Optional[WAN21TextEmbedStage] = None,
+        text_embed: Optional[WANTextEmbedStage] = None,
         diffusion: Optional[WAN22DiffusionStage] = None,
-        vae_decode: Optional[WAN21VAEDecodeStage] = None,
+        vae_decode: Optional[WANVAEDecodeStage] = None,
         strategy: Optional[StepStrategy] = None,
         shift: float = 5.0,
         strength: float = DEFAULT_V2V_STRENGTH,
@@ -49,7 +51,7 @@ class WAN22V2VPipeline(Pipeline):
         self.text_embed = (
             text_embed
             if text_embed is not None
-            else WAN21TextEmbedStage(bundle, max_sequence_length=int(max_sequence_length))
+            else WANTextEmbedStage(bundle, max_sequence_length=int(max_sequence_length))
         )
         if diffusion is None:
             diffusion = WAN22DiffusionStage(
@@ -61,7 +63,7 @@ class WAN22V2VPipeline(Pipeline):
                 logprob_precision=logprob_precision,
             )
         self.diffusion = diffusion
-        self.vae_decode = vae_decode if vae_decode is not None else WAN21VAEDecodeStage(bundle)
+        self.vae_decode = vae_decode if vae_decode is not None else WANVAEDecodeStage(bundle)
 
     @staticmethod
     def _sde_indices_in_trimmed_frame(sde_indices: Any, *, t_full: int, t_eff: int) -> list:
@@ -85,16 +87,11 @@ class WAN22V2VPipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
-        num_frames = int(sampling_spec.num_frames)
-        if (num_frames - 1) % 4 != 0:
-            raise ValueError(
-                f"WAN VAE temporal_downsample=4 requires (num_frames - 1) % 4 == 0, "
-                f"got num_frames={num_frames}; valid choices: 1, 5, 9, 13, 17, 21, ..."
-            )
-        latent_t = (num_frames - 1) // 4 + 1
-        return (16, latent_t, height // 8, width // 8)
+        return wan_latent_shape(
+            num_frames=int(sampling_spec.num_frames),
+            height=int(sampling_spec.height),
+            width=int(sampling_spec.width),
+        )
 
     @classmethod
     def from_config(
@@ -121,18 +118,15 @@ class WAN22V2VPipeline(Pipeline):
         *,
         negatives: Optional[Texts] = None,
         guidance_scale: float = 1.0,
-    ) -> WAN21Conditions:
+    ) -> WANConditions:
         """Build WAN text conditions; source-video encoding stays in generate."""
-        if negatives is not None and len(negatives.texts) != len(texts.texts):
-            raise ValueError(
-                f"WAN22V2VPipeline.build_conditions: negative_text length "
-                f"{len(negatives.texts)} != text length {len(texts.texts)}"
-            )
-        if negatives is None and float(guidance_scale) > 1.0:
-            negatives = Texts(texts=[""] * len(texts.texts))
-        text_cond = self.text_embed.embed(texts)
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
-        return WAN21Conditions(text=text_cond, negative_text=negative_text_cond)
+        return build_wan_text_conditions(
+            text_embed=self.text_embed,
+            texts=texts,
+            negatives=negatives,
+            guidance_scale=guidance_scale,
+            owner=type(self).__name__,
+        )
 
     def generate(self, sample: Sample) -> Sample:
         """Run V2V over the trimmed denoising tail and fill the frontier Part."""

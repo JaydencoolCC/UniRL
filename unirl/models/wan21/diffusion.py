@@ -45,20 +45,21 @@ import torch
 
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
+from unirl.models.wan.conditions import WANConditions
+from unirl.models.wan.geometry import wan_latent_shape
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .bundle import WAN21Bundle
-from .conditions import WAN21Conditions
 
 # WAN training-time timestep scale: sigma ∈ [0, 1] → timestep ∈ [0, 1000].
 # Matches ``WAN21ModelBundle.TIMESTEP_SCALE`` in ``models/wan21.py``.
 _WAN_TIMESTEP_SCALE: float = 1000.0
 
 
-class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
+class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WANConditions]):
     """Per-step WAN 2.1 denoising kernel — stateless.
 
     ``step`` / ``step_with_logp`` take the model + conditions + an SDE
@@ -72,7 +73,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         model: WAN21Bundle,
         sample: torch.Tensor,
         sigma: torch.Tensor,
-        conditions: WAN21Conditions,
+        conditions: WANConditions,
         *,
         guidance_scale: float,
     ) -> torch.Tensor:
@@ -192,7 +193,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
     def step(
         self,
         model: WAN21Bundle,
-        conditions: WAN21Conditions,
+        conditions: WANConditions,
         *,
         strategy: StepStrategy,
         sample: torch.Tensor,
@@ -224,7 +225,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
     def step_with_logp(
         self,
         model: WAN21Bundle,
-        conditions: WAN21Conditions,
+        conditions: WANConditions,
         *,
         strategy: StepStrategy,
         sample: torch.Tensor,
@@ -256,7 +257,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         )
 
 
-class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
+class WAN21DiffusionStage(DiffusionStage[WANConditions]):
     """WAN 2.1 T2V rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (stateful strategies require a stable
@@ -321,16 +322,14 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         implementation and the legacy sampler at
         ``samplers/fsdp/wan_sampler.py``.
         """
-        if (int(num_frames) - 1) % self._TEMPORAL_DOWNSAMPLE != 0:
-            raise ValueError(
-                f"WAN VAE temporal_downsample={self._TEMPORAL_DOWNSAMPLE} requires "
-                f"(num_frames - 1) % {self._TEMPORAL_DOWNSAMPLE} == 0, got num_frames={num_frames}; "
-                f"valid choices: 1, 5, 9, 13, 17, 21, ..."
-            )
-        latent_t = (int(num_frames) - 1) // self.temporal_scale_factor + 1
-        latent_h = int(height) // self.vae_scale_factor
-        latent_w = int(width) // self.vae_scale_factor
-        return (self.latent_channels, latent_t, latent_h, latent_w)
+        return wan_latent_shape(
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            latent_channels=self.latent_channels,
+            spatial_downsample=self.vae_scale_factor,
+            temporal_downsample=self.temporal_scale_factor,
+        )
 
     # ------------------------------------------------------------------
     # Sampling
@@ -338,7 +337,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
 
     def diffuse(
         self,
-        conditions: WAN21Conditions,
+        conditions: WANConditions,
         *,
         schedule: torch.Tensor,
         params: DiffusionSamplingParams,
@@ -472,7 +471,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
 
     def replay(
         self,
-        conditions: WAN21Conditions,
+        conditions: WANConditions,
         *,
         segment: LatentSegment,
         params: DiffusionSamplingParams,
@@ -558,7 +557,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
 
     def predict_noise_at_step(
         self,
-        conditions: WAN21Conditions,
+        conditions: WANConditions,
         *,
         sample: torch.Tensor,
         sigma: torch.Tensor,
