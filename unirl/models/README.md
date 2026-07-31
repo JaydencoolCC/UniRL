@@ -13,9 +13,12 @@
 ## What it is
 
 `unirl/models/` holds one self-contained subpackage per model (`sd3/`, `qwen3/`,
-`hunyuan_image3/`, `pe/`, …). Each implements the shared **bundle / pipeline /
-stage / conditions** contract so the same model code, on the same weights, serves
-*both* the rollout engine (generate) and the train stack (replay).
+`hunyuan_image3/`, `pe/`, …). A model family may additionally own a neutral
+shared package, such as `wan/`, when multiple versioned packages consume the
+same conditions, codecs, geometry, and pipeline behavior. Each implements the
+shared **bundle / pipeline / stage / conditions** contract so the same model
+code, on the same weights, serves *both* the rollout engine (generate) and the
+train stack (replay).
 
 > Not to be confused with the repository-root `models/` directory, which only holds
 > local checkpoint and reward-model symlinks.
