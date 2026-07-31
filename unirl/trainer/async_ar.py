@@ -139,6 +139,11 @@ class AsyncARTrainer(ARTrainer):
                 "separate slab; the trainside direct-sampling engine needs the pipeline "
                 "as a local sibling and cannot live cross-slab."
             )
+        # Inherited ``ARTrainer.evaluate`` reads this but only ``ARTrainer.__init__``
+        # sets it, which we skip above. The disaggregated layout is always the SPMD
+        # rollout path — the anchored branch is colocate-only — so None is the
+        # correct value, and it keeps ``evaluate`` on its ``nullcontext``/non-anchored path.
+        self._rollout_anchor_device = None
 
         # ---- async state ----
         self._train_fraction = float(train_fraction)
