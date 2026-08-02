@@ -106,7 +106,7 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
 class ToolEnvironment:
     """Agentic :class:`Environment`: parse tool calls, run tools, observe results, stop on a final answer.
 
-    Drives :class:`~unirl.rollout.loop.agent_loop.AgentLoop` over a frontier of one-or-more samples
+    Driven by :class:`~unirl.rollout.harness.tool_agent.ToolAgentHarness` over a frontier of one-or-more samples
     (the GRPO group / continuations). :meth:`step` parses each frontier sample's text, executes any
     tool call, and returns a row-aligned observation. The batch's ``done`` is True once **no** sample
     emits a tool call (all gave a final answer) or ``max_turns`` is reached.
