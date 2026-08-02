@@ -9,9 +9,10 @@ Mechanisms (policy-free — launch ceilings, reap/launch ordering, and step
 loops live in the trainers):
 
 - :class:`VersionedBuffer` — payload-agnostic freshness/staleness buffer.
-- :class:`InflightPool` — non-blocking generation pool over one Handle method.
+- :class:`InflightPool` — non-blocking pool of distributed ``generate`` calls.
 
-Engines, sharing the :class:`AsyncRolloutEngine` protocol:
+Engines, sharing one consumer surface (``poll`` / ``drain_freshest`` /
+``pop_evicted`` / ``quiesce`` + engine-owned ``weight_version``):
 
 - :class:`AsyncBatchRolloutEngine` — batch granularity over a single-turn
   engine slab; one ``submit`` is one non-blocking distributed ``generate``.
@@ -23,8 +24,8 @@ Engines, sharing the :class:`AsyncRolloutEngine` protocol:
   trajectory is corrected per-token by each gen Part's own ``weight_version``.
 
 Submission is deliberately engine-specific (incompatible signatures and
-stamping semantics); the protocol is the shared consumer surface the async
-trainers program against. The colocate barrier path (``AgenticTrainer``) keeps
+stamping semantics); the consumer verbs above are what the async trainers
+program against. The colocate barrier path (``AgenticTrainer``) keeps
 calling ``rollout.generate(sample)[0]`` directly.
 """
 
@@ -41,7 +42,6 @@ from typing import (
     Iterable,
     List,
     Optional,
-    Protocol,
     Tuple,
     TypeVar,
 )
@@ -52,7 +52,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
-G = TypeVar("G")
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +123,7 @@ class _InflightJob:
 
 
 class InflightPool:
-    """Non-blocking generation pool over one ``@distributed`` Handle method.
+    """Non-blocking pool of distributed ``generate`` launches on a rollout Handle.
 
     Mechanism only: launch ceilings, reap/launch ordering, and step loops are
     caller policy. Jobs are launched via ``Handle.launch_nowait`` and completed
@@ -133,9 +132,8 @@ class InflightPool:
     whose completion raises stays in flight for retry.
     """
 
-    def __init__(self, rollout: Any, *, start_gen_id: int = 0, method: str = "generate") -> None:
+    def __init__(self, rollout: Any, *, start_gen_id: int = 0) -> None:
         self._rollout = rollout
-        self._method = method
         self._next_gen_id = int(start_gen_id)
         self._jobs: List[_InflightJob] = []
 
@@ -148,7 +146,7 @@ class InflightPool:
 
     def launch(self, sample: Any, *, weight_version: int) -> int:
         gen_id = self._next_gen_id
-        pending = self._rollout.launch_nowait(self._method, sample)
+        pending = self._rollout.launch_nowait("generate", sample)
         self._jobs.append(_InflightJob(gen_id, int(weight_version), pending))
         self._next_gen_id += 1
         return gen_id
@@ -209,49 +207,12 @@ class InflightPool:
 
 
 # ---------------------------------------------------------------------------
-# The async engine contract
-# ---------------------------------------------------------------------------
-
-
-class AsyncRolloutEngine(Protocol[G]):
-    """Driver-side async rollout engine: version-stamped buffering over a rollout Handle.
-
-    The shared consumer surface; each concrete engine adds its own submission
-    verbs. ``drain_freshest`` uses the engine's own ``weight_version`` as the
-    current version, so trainers only announce syncs via ``bump_weight_version``.
-    """
-
-    @property
-    def weight_version(self) -> int: ...
-
-    def bump_weight_version(self) -> int:
-        """Advance the policy-version counter; call right after ``weight_sync.sync()``."""
-        ...
-
-    def poll(self) -> int:
-        """Non-blocking: move finished work into the buffer; returns the count ingested."""
-        ...
-
-    def drain_freshest(self, n: int, *, max_staleness: int) -> Optional[List[G]]:
-        """Pop the ``n`` freshest groups within ``max_staleness``, or ``None`` if short."""
-        ...
-
-    def pop_evicted(self) -> List[G]:
-        """Return and clear groups rejected by the latest staleness checks."""
-        ...
-
-    def quiesce(self) -> List["Sample"]:
-        """Stop in-flight work and return the carried tail (``[]`` for the batch engine)."""
-        ...
-
-
-# ---------------------------------------------------------------------------
 # Batch engine
 # ---------------------------------------------------------------------------
 
 
 class AsyncBatchRolloutEngine:
-    """``AsyncRolloutEngine[Sample]`` over a ``SyncRolloutEngine`` slab Handle.
+    """Batch-granular async engine over a ``SyncRolloutEngine`` slab Handle; buffers ``Sample`` groups.
 
     ``complete(gen_id, completed) -> groups`` runs at reap time — scoring must
     precede training, and on transfer-sensitive backends the next launch. All
@@ -367,8 +328,8 @@ class PendingGroups:
 
 
 class AsyncAgenticRolloutEngine:
-    """``AsyncRolloutEngine[List[Sample]]`` over the ``AgenticRolloutEngine``
-    rank-0 coordinator Handle.
+    """Trajectory-granular async engine over the ``AgenticRolloutEngine``
+    rank-0 coordinator Handle; buffers ``List[Sample]`` sibling groups.
 
     Normalizes the coordinator's BROADCAST+RANK_ZERO returns (every value
     unwraps ``[0]``). Groups are stamped at COMPLETION: ``weight_version`` is
@@ -448,10 +409,5 @@ class AsyncAgenticRolloutEngine:
 __all__ = [
     "AsyncAgenticRolloutEngine",
     "AsyncBatchRolloutEngine",
-    "AsyncRolloutEngine",
-    "Complete",
-    "InflightPool",
-    "PendingGroups",
-    "VersionedBuffer",
     "root_of",
 ]

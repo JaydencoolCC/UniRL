@@ -64,10 +64,9 @@ wrong objective.
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
   plus offload/onload and `sync:`.
 - **Driver-side async engines** (`engine/asynchronous.py`, the driver-side half next
-  to `engine/synchronous.py`'s worker-side sync contracts). The `AsyncRolloutEngine`
-  protocol — the async sibling of `SyncRolloutEngine` — is what the async
-  trainers program against: `poll` / `drain_freshest` / `pop_evicted` / `quiesce` +
-  engine-owned `weight_version`. Two concretes: `AsyncBatchRolloutEngine`
+  to `engine/synchronous.py`'s worker-side sync contracts). Both engines expose the
+  same consumer verbs the async trainers program against: `poll` / `drain_freshest` /
+  `pop_evicted` / `quiesce` + engine-owned `weight_version`. `AsyncBatchRolloutEngine`
   (batch granularity; non-blocking `Handle.launch_nowait` generations, stamps
   versions at launch, used by `AsyncARTrainer`/`AsyncDiffusionTrainer`) and
   `AsyncAgenticRolloutEngine` (trajectory granularity over the agentic rank-0
