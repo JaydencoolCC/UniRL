@@ -370,8 +370,10 @@ class AsyncAgenticRolloutEngine:
                 "finalize_if_drained() to report it done or quiesce() first (a second "
                 "drain would double-pull the coordinator queue)."
             )
-        self._rollout.submit(tasks)
+        # Fail closed: the coordinator may start a drive before its call reports
+        # an error, so only finalize_if_drained() or quiesce() may re-arm submit.
         self._drive_live = True
+        self._rollout.submit(tasks)
 
     def poll(self) -> int:
         return self._ingest(self._rollout.poll()[0])
