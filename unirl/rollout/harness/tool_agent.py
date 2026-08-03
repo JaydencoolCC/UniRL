@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from unirl.rollout.harness.protocol import HarnessContext, HarnessOutcome
 
 if TYPE_CHECKING:
+    from unirl.rollout.env.protocol import Environment
     from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ class ToolAgentHarness:
 
     ENGINE = "policy"
 
-    def __init__(self, *, env: Any, sampling: Any, max_turns: int) -> None:
+    def __init__(self, *, env: "Environment", sampling: Any, max_turns: int) -> None:
         self.env = env
         self.sampling = sampling
         self.max_turns = int(max_turns)
