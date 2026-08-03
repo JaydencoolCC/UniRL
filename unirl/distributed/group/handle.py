@@ -321,9 +321,9 @@ class PendingHandleCall:
     """Future-like result of :meth:`Handle.launch_nowait`: launched, not yet collected.
 
     ``ready()`` probes without blocking; ``wait()`` blocks without collecting;
-    ``result()`` blocks if needed, then runs the rebind + collect half of
-    ``handle_fn`` and returns the method's collected value. The collect half
-    runs at most once — rebind registers GC finalizers on the result refs — so
+    ``result()`` blocks if needed, then runs the resolution phase of
+    ``handle_fn`` and returns the method's collected value. The resolution
+    phase runs at most once — rebind registers GC finalizers on the result refs — so
     a successful ``result()`` caches its value and later calls return it; a
     ``result()`` that raised may be retried.
     """
@@ -351,7 +351,7 @@ class PendingHandleCall:
             return self._value
         handle = self._handle
         _, _, collect_fn, _ = handle._method_configs[self._method_name]
-        self._value = handle._collect_half(collect_fn, self._refs, worker_local=self._worker_local)
+        self._value = handle._resolve_call(collect_fn, self._refs, worker_local=self._worker_local)
         self._consumed = True
         return self._value
 
@@ -603,7 +603,7 @@ class Handle:
 
         Both this blocking form and :meth:`launch_nowait` +
         :meth:`PendingHandleCall.result` are thin sequencing over the shared
-        :meth:`_launch_half` / :meth:`_collect_half`.
+        :meth:`_launch_call` / :meth:`_resolve_call` phases.
         """
 
         def handle_fn(*args, **kwargs):
@@ -624,7 +624,7 @@ class Handle:
                 call_id = f"{method_name}_{next(self._grad_call_counter)}"
                 input_metas = collect_leaves(args, TensorRef) + collect_leaves(tuple(kwargs.values()), TensorRef)
 
-            refs, worker_local = self._launch_half(
+            refs, worker_local = self._launch_call(
                 method_name,
                 dispatch_mode,
                 dispatch_fn,
@@ -634,7 +634,7 @@ class Handle:
                 grad_mode=ctx is not None,
                 call_id=call_id,
             )
-            collected = self._collect_half(
+            collected = self._resolve_call(
                 collect_fn,
                 refs,
                 worker_local=worker_local,
@@ -659,9 +659,9 @@ class Handle:
         handle_fn.__doc__ = f"SPMD handle: {method_name} (dispatch={dispatch_fn.__name__})"
         return handle_fn
 
-    # ── Shared call halves ──
+    # ── Shared call phases ──
 
-    def _launch_half(
+    def _launch_call(
         self,
         method_name: str,
         dispatch_mode: Dispatch,
@@ -673,10 +673,10 @@ class Handle:
         grad_mode: bool,
         call_id: Optional[str],
     ) -> Tuple[List, bool]:
-        """dispatch → localize → execute; returns ``(refs, worker_local)``.
+        """Launch a distributed call; returns ``(refs, worker_local)``.
 
-        The launch half shared by the blocking ``handle_fn`` and the
-        non-blocking :meth:`launch_nowait`.
+        Runs dispatch → localize → execute for both the blocking
+        ``handle_fn`` and the non-blocking :meth:`launch_nowait`.
         """
         batch_size = infer_batch_size(args, kwargs)
         # Only DP_SCATTER/DP_SCATTER_HEAD split the per-sample batch by dp_size, so only
@@ -700,7 +700,7 @@ class Handle:
         refs = execute_fn(method_name, shards, grad_mode=grad_mode, call_id=call_id)
         return refs, worker_local
 
-    def _collect_half(
+    def _resolve_call(
         self,
         collect_fn: Callable,
         refs: List,
@@ -708,10 +708,10 @@ class Handle:
         worker_local: bool,
         ray_get_timeout: Optional[float] = None,
     ):
-        """ray.get → rebind → collect: the collected method return value.
+        """Resolve a launched call into its collected method return value.
 
-        The collect half shared by the blocking ``handle_fn`` and
-        :meth:`PendingHandleCall.result`.
+        Runs ray.get → rebind → collect for both the blocking
+        ``handle_fn`` and :meth:`PendingHandleCall.result`.
         """
         results = ray.get(refs, timeout=ray_get_timeout)
         # Rebind before collect: results[i] comes from workers[i],
@@ -725,13 +725,13 @@ class Handle:
     # ── Non-blocking launch ──
 
     def launch_nowait(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
-        """Launch a @distributed method without blocking: the launch half of
+        """Launch a @distributed method without blocking: the launch phase of
         ``handle_fn``, stopping before ``ray.get``.
 
         Always ``grad_mode=False`` / ``call_id=None`` (a pending call is never
         valid under a GradContext, so the ``_grad_call_counter`` single-thread
         assumption is untouched). ``result()`` on the returned
-        :class:`PendingHandleCall` runs the collect half.
+        :class:`PendingHandleCall` runs the resolution phase.
         """
         try:
             dispatch_mode, dispatch_fn, _, execute_fn = self._method_configs[method_name]
@@ -740,7 +740,7 @@ class Handle:
                 f"{method_name!r} is not a @distributed method of {_owning_class(self.role_cls).__name__}"
             ) from None
 
-        refs, worker_local = self._launch_half(
+        refs, worker_local = self._launch_call(
             method_name,
             dispatch_mode,
             dispatch_fn,
