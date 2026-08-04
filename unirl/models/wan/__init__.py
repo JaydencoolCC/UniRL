@@ -10,7 +10,7 @@ from unirl.models.wan.image_encode import (
     WAN21ImageLatentEncodeStage,
     WANImageLatentEncodeStage,
 )
-from unirl.models.wan.pipeline import build_wan_text_conditions, generate_wan_t2v_or_i2v
+from unirl.models.wan.pipeline import build_wan_text_conditions
 from unirl.models.wan.text_embed import WAN21TextEmbedStage, WANTextEmbedStage
 from unirl.models.wan.vae import WAN21VAEDecodeStage, WANVAEDecodeStage
 
@@ -26,6 +26,5 @@ __all__ = [
     "WANTextEmbedStage",
     "WANVAEDecodeStage",
     "build_wan_text_conditions",
-    "generate_wan_t2v_or_i2v",
     "wan_latent_shape",
 ]

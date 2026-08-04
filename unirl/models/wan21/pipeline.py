@@ -23,17 +23,22 @@ with the configured ``shift``. This mirrors legacy
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Optional
 
 from unirl.models.types.pipeline import Pipeline
+from unirl.models.wan.clip_vision_encode import WANCLIPVisionEncodeStage
 from unirl.models.wan.conditions import WANConditions
 from unirl.models.wan.geometry import wan_latent_shape
-from unirl.models.wan.pipeline import build_wan_text_conditions, generate_wan_t2v_or_i2v
+from unirl.models.wan.image_encode import WANImageLatentEncodeStage
+from unirl.models.wan.pipeline import build_wan_text_conditions
 from unirl.models.wan.text_embed import WANTextEmbedStage
 from unirl.models.wan.vae import WANVAEDecodeStage
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
-from unirl.types.primitives import Texts
+from unirl.types.noise_recipe import NoiseRecipe
+from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import WAN21Bundle
 from .config import WAN21PipelineConfig
@@ -184,15 +189,64 @@ class WAN21Pipeline(Pipeline):
         by the hosting engine before the call; see the σ ownership note in
         ``unirl.models.types.pipeline``.
         """
-        return generate_wan_t2v_or_i2v(
-            sample=sample,
-            owner=type(self).__name__,
-            bundle=self.bundle,
-            build_conditions=self.build_conditions,
-            diffusion=self.diffusion,
-            vae_decode=self.vae_decode,
-            use_secondary_guidance=False,
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise TypeError(
+                f"WAN21Pipeline.generate: frontier gen Part must carry DiffusionSamplingParams, "
+                f"got {type(params).__name__ if params is not None else 'None'}"
+            )
+        if params.sigmas is None:
+            raise ValueError(
+                "WAN21Pipeline.generate: gen part sampling_params.sigmas is None. The hosting "
+                "engine must pin σ before invoking pipeline.generate; see the σ ownership note "
+                "in unirl.models.types.pipeline."
+            )
+
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
+        if not isinstance(texts, Texts):
+            raise TypeError(
+                f"WAN21Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
+                f"got {type(texts).__name__ if texts is not None else 'None'}"
+            )
+        images_prim = next((value for value in conditioning[1:] if isinstance(value, Images)), None)
+
+        wan_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        if images_prim is not None:
+            if images_prim.pixels is None or int(images_prim.pixels.shape[0]) != len(texts.texts):
+                raise ValueError(
+                    f"WAN21Pipeline.generate: image count "
+                    f"{None if images_prim.pixels is None else int(images_prim.pixels.shape[0])} "
+                    f"!= text count {len(texts.texts)}"
+                )
+            image_latent = WANImageLatentEncodeStage(
+                self.bundle,
+                num_frames=int(params.num_frames),
+                height=int(params.height),
+                width=int(params.width),
+            ).encode(images_prim)
+            image_embed = (
+                WANCLIPVisionEncodeStage(self.bundle).encode(images_prim) if self.bundle.uses_clip_vision else None
+            )
+            wan_conds = dataclasses.replace(
+                wan_conds,
+                image_latent=image_latent,
+                image_embed=image_embed,
+            )
+
+        schedule = params.sigmas.to(self.bundle.device)
+        initial_latents = NoiseRecipe.from_sample(sample).resolve()
+        latent_seg = self.diffusion.diffuse(
+            wan_conds,
+            schedule=schedule,
+            params=params,
+            initial_latents=initial_latents,
         )
+        videos = self.vae_decode.decode(latent_seg)
+
+        filled = frontier.fill(segment=latent_seg, primitives={"video": videos}, conditions=wan_conds.to_dict())
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
 __all__ = ["WAN21Pipeline"]
