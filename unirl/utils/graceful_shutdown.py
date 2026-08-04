@@ -2,7 +2,7 @@
 
 A training driver that dies on an unhandled ``SIGTERM`` never runs its
 ``finally`` blocks, so the rollout engine's subprocess tree is never asked to
-shut down. On the anchored vLLM-Omni topology that stranded four ``Worker_TP``
+shut down. On a vLLM-Omni TP=4 rollout group that stranded four ``Worker_TP``
 processes holding ~7.3 GiB of device memory each until they were reaped by
 hand.
 

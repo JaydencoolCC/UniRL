@@ -59,8 +59,11 @@ unmaintainable. This layer hides it behind two ideas:
 - **Placement** (`group/device_pool.py`, `group/placement.py`). A `DevicePool`
   reserves one Ray placement group per node (one GPU per "bundle"). A `placement(…)`
   scope claims a slab of devices and builds the workers in it — pure data-parallel by
-  default (`rank == dp_rank`); any TP/FSDP sharding is set up inside each role's
-  `initialize()`.
+  default (`rank == dp_rank`). Rollout engines may opt into Handle-owned TP: Handle
+  derives `(dp, tp, pp)` ranks, verifies each TP group is node-local, and injects a
+  `RolloutParallelContext` containing the scheduler-issued CUDA tokens. `tp_rank=0`
+  launches that group's backend process tree; peers remain SPMD shells for training
+  collectives. FSDP/SP sharding continues to be initialized by its owning role.
 - **The data plane — how rollout data reaches train** (`tensor/`). The subtle part,
   and the one most worth understanding:
   1. `generate` runs `DP_SCATTER` on the rollout workers. As each worker returns,
@@ -90,7 +93,11 @@ unmaintainable. This layer hides it behind two ideas:
 **Extending it:** a new dispatch mode is an enum entry + a `(dispatch, collect)` pair
 in `group/dispatch.py`; a new transport is a backend under `tensor/backend/`
 implementing the transport ABC and wired into the `build_transport()` kind-dispatch in `tensor/factory.py`; a new physical
-layout is a `placement(…)` wiring in the trainer (`trainer/diffusion.py`).
+layout is a `placement(…)` wiring in the trainer (`trainer/diffusion.py`). A rollout
+engine that launches a multi-GPU runtime sets
+`_accepts_rollout_parallel_context = True`, declares `tp_size` in its config, and
+consumes the injected context instead of deriving devices from global rank or a
+stage-specific anchor.
 
 ## Gotchas
 

@@ -26,7 +26,7 @@ Driver wiring (in the trainer, once both slabs exist; engine workers alive)::
 
     addr, port = ws.pick_master()[0]
     tp = rollout.tp_size
-    targets = [w for w, ri in zip(rollout.workers, rollout.rank_infos) if ri.tp_rank == 0]
+    targets = rollout.engine_launcher_workers
     ws.set_rollout_targets(targets, rollout.role_name)
     ws.connect(master_addr=addr, master_port=port, num_rollout_gpus=len(targets)*tp, tp_size=tp)
     ...

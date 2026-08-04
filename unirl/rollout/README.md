@@ -63,6 +63,12 @@ wrong objective.
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
   plus offload/onload and `sync:`.
+- **Backend-neutral rollout TP.** SGLang and vLLM-Omni use the same
+  `RolloutParallelContext` supplied by the distributed `Handle`. `tp_size` declares
+  how many DevicePool workers one backend process tree owns; Handle derives the
+  remaining DP replicas, validates node-local placement, and passes scheduler GPU
+  tokens to the group launcher. Engine adapters and stage YAML describe model
+  execution, not physical cluster ownership.
 - **Driver-side async engines** (`engine/asynchronous.py`, the driver-side half next
   to `engine/synchronous.py`'s worker-side sync contracts). Both engines expose the
   same consumer verbs the async trainers program against: `poll` / `drain_freshest` /
@@ -78,7 +84,9 @@ wrong objective.
 `engine/<name>/engine.py` (subclass `SyncRolloutEngine`, implement
 synchronous generation over the whole-`Sample` contract — thread-safe for
 concurrent callers if it should serve as an agentic inner, else serialized
-internally — and dispatch `generate` with `DP_SCATTER`). A dedicated engine also
+internally — and dispatch `generate` with `DP_SCATTER`). A multi-GPU engine opts
+into the common parallel context rather than adding placement kwargs to Handle.
+A dedicated engine also
 implements its weight-receive method and a matching `sync:` handler in
 `../distributed/weight_sync`.
 

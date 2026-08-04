@@ -48,17 +48,51 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
             track_prefix=track_prefix,
         )
         self._rollout = rollout
+        self._cached = None
+
+    def _is_engine_launcher(self) -> bool:
+        return self.rank_info is None or int(self.rank_info.tp_rank) == 0
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def extract(self) -> None:
+        """Collectively extract LoRA; cache it on each rollout replica launcher."""
+
+        self._extract_to_cache()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def push(self) -> None:
+        """Push the cached LoRA after the trainer has made room for rollout."""
+
+        self._push_from_cache()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
         """Extract LoRA from the local FSDP model and load it into the engine.
 
         Runs on every Worker (``BROADCAST``); the extract is a train-mesh
-        collective that lines up because every rank runs together. The engine must
-        be awake (the caller wakes it before ``sync``); ``set_lora_from_tensors``
-        drops any existing adapter and loads the new one on every stage's workers.
+        collective that lines up because every rank runs together. Each TP group's
+        launcher keeps one CPU payload and pushes it to its sibling engine; shell
+        ranks discard theirs. The engine must be awake before the push.
         """
+        self._extract_to_cache()
+        self._push_from_cache()
+
+    def _extract_to_cache(self) -> None:
+        """Run the train-mesh collective and retain one CPU copy per TP group."""
+
         lora_tensors, peft_config = self._extract()
+        if self._is_engine_launcher():
+            self._cached = (lora_tensors, peft_config)
+
+    def _push_from_cache(self) -> None:
+        """Load the cached adapter into this launcher's sibling engine."""
+
+        if not self._is_engine_launcher():
+            return
+        if self._cached is None:
+            raise RuntimeError("LocalLoraWeightSync.push: call extract() (or sync()) first")
+        lora_tensors, peft_config = self._cached
+        self._cached = None
         self._rollout.set_lora_from_tensors(self._adapter_name, lora_tensors, peft_config=peft_config)
         rank = self.rank_info.rank if self.rank_info is not None else 0
         logger.info(

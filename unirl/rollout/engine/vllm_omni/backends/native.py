@@ -11,9 +11,10 @@ Boot sequence (load-bearing order — see each step's note):
    ``mp.Process`` wrap that re-installs them inside every spawn child.
 2. ``mp.set_start_method("spawn", force=True)`` — before any Omni mp object
    exists (fork-context SemLocks can't cross into spawn workers).
-3. ``CUDA_VISIBLE_DEVICES`` pop when the adapter's boot intent asks for it
-   (HI3 multi-GPU stages; the documented last-resort env override — vllm-omni
-   reads CVD for per-stage device pinning and has no arg for it).
+3. Apply a spawn-scoped ``CUDA_VISIBLE_DEVICES`` policy. Handle-owned rollout
+   TP supplies one scheduler-approved device group; legacy HI3 adapters may
+   still request an unscoped view. The Worker environment is restored after
+   the runtime has spawned.
 4. ``Omni(...)`` with the PRISTINE packaged stage YAML + ctor kwargs —
    ``enable_sleep_mode`` / ``master_port`` ride the runtime's own override
    channel (the ``base_engine_args`` merge + the dedicated sleep-mode
@@ -34,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
 from pprint import pformat
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -157,6 +159,41 @@ def _assemble_omni_kwargs(intent: Dict[str, Any]) -> Dict[str, Any]:
     return omni_kwargs
 
 
+@contextmanager
+def _spawn_device_visibility(intent: Dict[str, Any]):
+    """Apply boot-only CUDA visibility and restore the Worker environment.
+
+    vLLM-Omni v0.20.0 interprets stage-YAML device ids as logical indices into
+    the current ``CUDA_VISIBLE_DEVICES`` list. A rollout TP group therefore
+    passes DevicePool/Ray-issued tokens here; clearing CVD would escape the
+    scheduler allocation and let independent replicas overlap physical GPUs.
+    """
+
+    requested = intent.get("cuda_visible_devices")
+    clear = bool(intent.get("clear_cuda_visible")) and requested is None
+    if requested is None and not clear:
+        yield
+        return
+
+    existed = "CUDA_VISIBLE_DEVICES" in os.environ
+    previous = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if requested is not None:
+        tokens = [str(token).strip() for token in requested if str(token).strip()]
+        if not tokens:
+            raise ValueError("cuda_visible_devices must contain at least one scheduler device token")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(tokens)
+    else:
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+    try:
+        yield
+    finally:
+        if existed:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(previous)
+        else:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+
 class VLLMOmniBackend:
     """The native ``Backend`` impl over the ``Omni`` orchestrator."""
 
@@ -197,9 +234,6 @@ class VLLMOmniBackend:
 
         rt = _import_omni_runtime()
 
-        if intent.get("clear_cuda_visible"):
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-
         import fcntl
 
         # Release the trainer CUDA cache before spawning the engine process.
@@ -231,11 +265,12 @@ class VLLMOmniBackend:
             try:
                 if lock_file is not None:
                     fcntl.flock(lock_file, fcntl.LOCK_EX)
-                omni = rt["Omni"](
-                    model=str(intent["model_path"]),
-                    stage_configs_path=yaml_path,
-                    **omni_kwargs,
-                )
+                with _spawn_device_visibility(intent):
+                    omni = rt["Omni"](
+                        model=str(intent["model_path"]),
+                        stage_configs_path=yaml_path,
+                        **omni_kwargs,
+                    )
             finally:
                 if lock_file is not None:
                     fcntl.flock(lock_file, fcntl.LOCK_UN)

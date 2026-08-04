@@ -41,6 +41,7 @@ from unirl.distributed.group.dispatch import (
     Execute,
     resolve_backward_dispatch_mode,
 )
+from unirl.distributed.group.parallelism import RolloutParallelContext
 from unirl.distributed.group.remote import RankInfo, Remote
 from unirl.distributed.tensor import TensorRef, WorkerLocalTransport, map_tree
 from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
@@ -102,19 +103,15 @@ def _cfg_get(cfg: Any, key: str, default: int) -> int:
     return int(val or default)
 
 
-def _is_sglang_rollout_role(role_cls: Type[Remote]) -> bool:
-    """True if ``role_cls`` opts into per-rank rollout-TP kwargs.
+def _accepts_rollout_parallel_context(role_cls: Type[Remote]) -> bool:
+    """True when ``role_cls`` consumes Handle-owned rollout placement.
 
-    SGLangRolloutEngine sets ``_accepts_rollout_tp_kwargs = True`` so Handle
-    injects ``tp_rank``/``tp_size``/``tp_visible_devices``/``pp_rank``/``ep_size``
-    into its ``__init__``. Other roles (weight sync, reward, algorithms) do NOT
-    set this flag — they share the rollout Handle's layout via ``HandleRef``
-    but their ``__init__`` doesn't accept these kwargs, so injecting would
-    raise ``TypeError``. A class-attribute flag (vs a string name check) survives
-    rename and subclassing without silently dropping the injection.
+    Opted-in engines receive one :class:`RolloutParallelContext` instead of a
+    backend-specific bag of TP kwargs. Other roles inherit the same rank layout
+    through ``HandleRef`` but do not receive an extra constructor argument.
     """
     cls = _owning_class(role_cls)
-    return getattr(cls, "_accepts_rollout_tp_kwargs", False) is True
+    return getattr(cls, "_accepts_rollout_parallel_context", False) is True
 
 
 def _parallel_shape_from_init_kwargs(
@@ -125,10 +122,10 @@ def _parallel_shape_from_init_kwargs(
     """Resolve ``(sp, tp, pp, ep)`` layout hints for this handle.
 
     ``sp_size`` keeps the existing VeOmni/Ulysses inheritance behavior. Rollout
-    TP/PP/EP is only read from ``SGLangRolloutEngine`` config (or inherited from
-    a sibling ``HandleRef`` such as ``rollout=...`` on weight sync roles) so
-    diffusion engines with their own ``tp_size`` config do not accidentally adopt
-    the AR rollout layout.
+    TP/PP/EP is read only for engines that opt into the common placement contract
+    (or inherited from a sibling ``HandleRef`` such as ``rollout=...`` on a
+    weight-sync role). Diffusion configs with an unrelated ``tp_size`` therefore
+    do not accidentally change their Handle layout.
     """
     if not init_kwargs:
         return 1, 1, 1, 1
@@ -144,7 +141,7 @@ def _parallel_shape_from_init_kwargs(
     pp = int(init_kwargs.get("pp_size") or 1)
     ep = int(init_kwargs.get("ep_size") or 1)
 
-    if _is_sglang_rollout_role(role_cls):
+    if _accepts_rollout_parallel_context(role_cls):
         cfg = init_kwargs.get("config")
         if cfg is not None:
             tp = max(tp, _cfg_get(cfg, "tp_size", 1))
@@ -181,7 +178,7 @@ def _build_rank_infos(
 
     The default ``tp=pp=sp=1`` reproduces the flat one-rank-per-DP layout.
     Ulysses SP keeps its historical contiguous ``(dp, sp)`` layout. Rollout TP
-    uses ``(dp, pp, tp)`` with TP rank fastest so one SGLang engine owns a
+    uses ``(dp, pp, tp)`` with TP rank fastest so one rollout engine owns a
     contiguous ``tp_size`` block of workers.
     """
     if sp_size > 1:
@@ -230,9 +227,9 @@ def _build_tp_visible_device_map(
     MIG tokens instead of integers. Querying each Worker is therefore the only
     reliable source of the scheduler visibility list.
 
-    TP groups must be node-local because one SGLang engine spawns all of its TP
-    scheduler processes from the ``tp_rank==0`` Worker. Invalid topology fails
-    before any role is constructed or GPU process is started.
+    TP groups must be node-local because the ``tp_rank==0`` worker launches the
+    backend process tree for the whole group. Invalid topology fails before any
+    role is constructed or GPU process is started.
     """
     size = len(rank_infos)
     if len(node_ips) != size or len(cuda_visible_devices) != size:
@@ -258,24 +255,24 @@ def _build_tp_visible_device_map(
         group_nodes = [str(node_ips[index]).strip() for index in ordered]
         if any(not node for node in group_nodes) or len(set(group_nodes)) != 1:
             raise ValueError(
-                f"each SGLang TP group must be placed on a single node; group={group_key}, nodes={group_nodes}"
+                f"each rollout TP group must be placed on a single node; group={group_key}, nodes={group_nodes}"
             )
 
         tokens: List[str] = []
         for index in ordered:
             raw = str(cuda_visible_devices[index]).strip()
             if not raw:
-                raise ValueError(f"SGLang TP worker {index} has an empty CUDA_VISIBLE_DEVICES token")
+                raise ValueError(f"rollout TP worker {index} has an empty CUDA_VISIBLE_DEVICES token")
             split = [token.strip() for token in raw.split(",") if token.strip()]
             if len(split) != 1:
                 raise ValueError(
-                    "each SGLang TP Worker must expose exactly one CUDA_VISIBLE_DEVICES "
+                    "each rollout TP Worker must expose exactly one CUDA_VISIBLE_DEVICES "
                     f"token; worker={index}, value={raw!r}"
                 )
             tokens.append(split[0])
         if len(set(tokens)) != len(tokens):
             raise ValueError(
-                "CUDA_VISIBLE_DEVICES tokens within an SGLang TP group must be unique; "
+                "CUDA_VISIBLE_DEVICES tokens within a rollout TP group must be unique; "
                 f"group={group_key}, tokens={tokens}"
             )
 
@@ -419,9 +416,9 @@ class Handle:
             self.rank_infos[0].pp_size,
             self.rank_infos[0].ep_size,
         )
-        is_tp_engine = _is_sglang_rollout_role(role_cls)
+        accepts_parallel_context = _accepts_rollout_parallel_context(role_cls)
         tp_visible_device_map: Dict[int, List[str]] = {}
-        if is_tp_engine and any(rank_info.tp_size > 1 for rank_info in self.rank_infos):
+        if accepts_parallel_context and any(rank_info.tp_size > 1 for rank_info in self.rank_infos):
             node_ips = ray.get([worker.get_node_ip.remote() for worker in self.workers])
             cuda_visible_devices = ray.get([worker.get_cuda_visible_devices.remote() for worker in self.workers])
             tp_visible_device_map = _build_tp_visible_device_map(
@@ -436,20 +433,19 @@ class Handle:
         def _rank_init_kwargs(i: int) -> Dict[str, Any]:
             kwargs = dict(base_init_kwargs)
             ri = self.rank_infos[i]
-            if not is_tp_engine or (ri.tp_size <= 1 and ri.pp_size <= 1 and ri.ep_size <= 1):
+            if not accepts_parallel_context:
                 return kwargs
-            kwargs.update(
-                {
-                    "tp_rank": ri.tp_rank,
-                    "tp_size": ri.tp_size,
-                    "pp_rank": ri.pp_rank,
-                    "pp_size": ri.pp_size,
-                    "ep_rank": ri.ep_rank,
-                    "ep_size": ri.ep_size,
-                }
+            kwargs["rollout_parallel"] = RolloutParallelContext(
+                dp_rank=ri.dp_rank,
+                dp_size=ri.dp_size,
+                tp_rank=ri.tp_rank,
+                tp_size=ri.tp_size,
+                pp_rank=ri.pp_rank,
+                pp_size=ri.pp_size,
+                ep_rank=ri.ep_rank,
+                ep_size=ri.ep_size,
+                visible_devices=tuple(tp_visible_device_map.get(i, ())),
             )
-            if ri.tp_size > 1:
-                kwargs["tp_visible_devices"] = tp_visible_device_map[i]
             return kwargs
 
         ray.get(
@@ -500,12 +496,18 @@ class Handle:
 
     @property
     def tp_zero_workers(self) -> List[Any]:
-        """Worker actor handles that host a SGLang engine (tp_rank==0).
+        """Backward-compatible alias for :attr:`engine_launcher_workers`."""
+        return self.engine_launcher_workers
 
-        With rollout TP, one SGLang engine per TP group is hosted by its
-        tp_rank==0 worker; the others are no-op shells. Weight sync targets and
-        server-actor discovery must use this filtered list. ``tp_size==1``
-        returns every worker (identical to ``self.workers``)."""
+    @property
+    def engine_launcher_workers(self) -> List[Any]:
+        """Worker actors that launch one backend process tree (``tp_rank==0``).
+
+        With rollout TP, one engine per TP group is hosted by its launcher; the
+        remaining workers are no-op engine shells. Weight-sync targets and
+        server discovery must use this filtered list. For TP=1 this returns all
+        workers, identical to ``self.workers``.
+        """
         return [w for w, ri in zip(self.workers, self.rank_infos) if ri.tp_rank == 0]
 
     def initialize(self, *args, **kwargs) -> None:

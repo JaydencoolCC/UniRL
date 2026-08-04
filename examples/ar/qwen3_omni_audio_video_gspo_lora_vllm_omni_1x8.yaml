@@ -1,6 +1,7 @@
 # @package _global_
 # Qwen3-Omni Thinker · GSPO + LoRA · Daily-Omni audio/video MCQA · vLLM-Omni.
 # TP=4 is required because TP must divide the audio tower's 20 attention heads.
+# DevicePool forms two TP=4 rollout replicas from the eight colocated workers.
 #
 # Launch from the repository root:
 #   QWEN3_OMNI_PATH=/path/to/Qwen3-Omni-30B-A3B-Instruct \
@@ -23,8 +24,6 @@ eval_num_prompts: -1
 eval_samples_per_prompt: 1
 eval_temperature: 1.0
 
-# The anchor must differ from rank 0 to avoid a synchronous self-call.
-rollout_anchor_device: 1
 # Offload training state while the colocated rollout engine is awake.
 enable_fsdp_offload: true
 
@@ -105,7 +104,7 @@ backend:
     # PEFT injects adapters by name even under frozen encoder modules.
     exclude_modules: ".*visual.*|.*audio_tower.*"
 
-# vLLM-Omni thinker rollout, TP=4.
+# vLLM-Omni thinker rollout, DP=2 x TP=4.
 rollout:
   _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
   model_config: ${bundle.config}
@@ -113,6 +112,7 @@ rollout:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
     model_path: ${oc.env:QWEN3_OMNI_PATH,/path/to/Qwen3-Omni-30B-A3B-Instruct}
     modality: qwen3_omni_thinker
+    tp_size: 4
     stage_yaml_override: qwen3_omni_thinker_only_rl_1x4.yaml   # TP=4 (audio tower 20 heads)
     enable_sleep_mode: true
     max_prompt_length: 16384
@@ -124,12 +124,11 @@ rollout:
       init_timeout: 1800
 
 sync:
-  _target_: unirl.distributed.weight_sync.lora.RemoteLoraWeightSync
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
   # vLLM-Omni's thinker mapper requires this prefix.
   param_prefix: "thinker."
   adapter_name: default
   verify: true
-  copy: true
 
 reward:
   _target_: unirl.reward.service.RewardService

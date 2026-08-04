@@ -41,8 +41,9 @@ materialization.
   streams them in buckets.
 - **`sync()` is a train-mesh collective.** Extracting weights redistributes each
   FSDP `DTensor` shard to a full tensor — a collective every train rank must run —
-  so `sync()` is dispatched `BROADCAST`. Only the *push* is rank-0 (for NCCL and
-  Remote-LoRA); ranks ≥1 run the all-gather and discard.
+  so `sync()` is dispatched `BROADCAST`. Only the *push* is rank-0 for
+  separate-slab transports; colocated rollout TP pushes once from each TP group's
+  engine launcher. Other ranks run the all-gather and discard.
 - **Transports.** LoRA: `LocalLoraWeightSync` (colocate, in-process sibling) and
   `RemoteLoraWeightSync` (cross-slab rank-0 Ray push). Full: `NCCLWeightSync`
   (separate slabs, cross-node capable), `TensorWeightSync` (colocate serialized
@@ -63,7 +64,7 @@ matching receiver on the engine side (`../../rollout/engine/`).
 ## Gotchas
 
 - **`sync()` is a train-mesh collective** — the FSDP→full materialization runs on
-  *every* train rank; never gate it behind `if rank == 0`. Only the push is rank-0.
+  *every* train rank; never gate it behind `if rank == 0`. Only the push is filtered.
 - **`transfer_queue` is not weight sync** — that's the rollout→trainer data plane
   for bulky rollout outputs (segments, conditions, decoded media); weight sync is
   trainer→rollout. Don't conflate them.

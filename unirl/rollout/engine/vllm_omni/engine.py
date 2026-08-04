@@ -31,6 +31,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.distributed.group.parallelism import RolloutParallelContext
 from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
@@ -46,6 +47,7 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
     """Rollout engine backed by vllm-omni's ``Omni`` orchestrator (v2 layout)."""
 
     _component_name = "vllm_omni"
+    _accepts_rollout_parallel_context: bool = True
 
     def __init__(
         self,
@@ -56,8 +58,11 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         rank: Optional[int] = None,
         model_config: Any = None,
         ports: Optional[VLLMOmniPorts] = None,
+        rollout_parallel: Optional[RolloutParallelContext] = None,
     ) -> None:
         self.cfg = config
+        self._parallel = rollout_parallel or RolloutParallelContext()
+        self._is_engine_launcher = self._parallel.is_engine_launcher
         self._weight_version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
@@ -68,12 +73,34 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         self.rank = rank
         self.model_config = model_config
         self._is_offloaded = False
+        self.adapter = None
+        self.schedule_policy = None
+        self._backend = None
+        self._weight_sync = None
         logger.info(
-            "VLLM-Omni engine config (complete typed config): %s; model_config_available=%s model_config=%s",
+            "VLLM-Omni engine config: %s; rollout_parallel=%s; model_config_available=%s model_config=%s",
             config,
+            self._parallel,
             model_config is not None,
             model_config,
         )
+
+        expected_group_size = int(config.tp_size or 1)
+        require(
+            expected_group_size == int(self._parallel.tp_size),
+            "VLLMOmniRolloutEngine placement mismatch: config.tp_size declares "
+            f"{expected_group_size}, but Handle assigned tp_size={self._parallel.tp_size}. "
+            "Construct TP engines through a rollout Handle so DevicePool owns placement.",
+        )
+        if not self._is_engine_launcher:
+            logger.info(
+                "VLLMOmniRolloutEngine: tp_rank=%d/%d is a no-op shell (rank=%s); "
+                "Omni orchestrator hosted by tp_rank=0 of this TP group",
+                self._parallel.tp_rank,
+                self._parallel.tp_size,
+                rank,
+            )
+            return
 
         self.adapter = get_adapter(config.modality)(
             config, model_config, strategy=strategy, tokenize_fn=self._tokenize_prompt
@@ -89,7 +116,21 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
             ports=ports,
             extra=self.adapter.boot_kwargs(),
         )
+        if self._parallel.visible_devices:
+            intent["cuda_visible_devices"] = list(self._parallel.visible_devices)
         self._backend = VLLMOmniBackend.boot(intent)
+
+        stage_tp = self._backend.tp_per_stage()
+        if config.tp_size is not None:
+            try:
+                require(
+                    bool(stage_tp) and max(stage_tp.values()) == expected_group_size,
+                    "VLLMOmniRolloutEngine TP declaration does not match the resolved "
+                    f"stage topology: config.tp_size={expected_group_size}, tp_per_stage={stage_tp}",
+                )
+            except BaseException:
+                self._backend.shutdown()
+                raise
 
         self._weight_sync = WeightSync(
             self._backend,
@@ -104,6 +145,8 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
         """Generate one whole DP shard synchronously."""
+        if not self._is_engine_launcher:
+            return None
         return self._generate_locked(sample)
 
     def _generate_locked(self, sample: Sample) -> Sample:
@@ -141,6 +184,8 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
         """Fan ``handle_sleep_task`` to every stage's workers (level 2)."""
+        if not self._is_engine_launcher:
+            return
         if self._is_offloaded:
             return
         self._backend.sleep_task()
@@ -150,6 +195,8 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
         """Fan ``handle_wake_task`` to every stage's workers + restore LoRA."""
+        if not self._is_engine_launcher:
+            return
         if not self._is_offloaded:
             return
         if torch.cuda.is_available():
@@ -167,10 +214,14 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         return bool(self._is_offloaded)
 
     def health_check(self) -> bool:
+        if not self._is_engine_launcher:
+            return True
         return self._backend.ping()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
+        if not self._is_engine_launcher:
+            return
         shutdown_lock = getattr(self, "_shutdown_lock", None)
         if shutdown_lock is None:
             backend = getattr(self, "_backend", None)
@@ -201,6 +252,8 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         """``{stage_id: tensor_parallel_size}`` per stage (parsed from the
         stage YAML at boot). The IPC weight-sync handler needs this to skip
         orphan train ranks that exceed a stage's TP size."""
+        if not self._is_engine_launcher:
+            return {}
         return self._backend.tp_per_stage()
 
     def update_weights_from_ipc(
@@ -213,6 +266,10 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
+        if not self._is_engine_launcher:
+            return
+        if replica_rank is None:
+            replica_rank = int(self._parallel.dp_rank)
         self._weight_sync.update_weights_from_ipc(
             peft_config=peft_config,
             base_sync_done=base_sync_done,
@@ -233,6 +290,8 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
+        if not self._is_engine_launcher:
+            return
         self._weight_sync.init_weights_update_group(
             master_address=master_address,
             master_port=master_port,
@@ -254,6 +313,8 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
+        if not self._is_engine_launcher:
+            return
         self._weight_sync.update_weights_from_distributed(
             names=names,
             dtypes=dtypes,
@@ -271,6 +332,8 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
+        if not self._is_engine_launcher:
+            return
         self._weight_sync.destroy_weights_update_group(group_name=group_name)
 
     def update_weights_from_tensor(
@@ -283,6 +346,8 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
+        if not self._is_engine_launcher:
+            return
         self._weight_sync.update_weights_from_tensor(
             serialized_named_tensors=serialized_named_tensors,
             target_modules=target_modules,
@@ -298,7 +363,12 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
-        self._weight_sync.set_lora_from_tensors(adapter_name, lora_tensors, peft_config=peft_config)
+        if not self._is_engine_launcher:
+            return
+        if self.adapter.lora_copy_transport:
+            self._weight_sync.set_lora_from_tensors_copy(adapter_name, lora_tensors, peft_config=peft_config)
+        else:
+            self._weight_sync.set_lora_from_tensors(adapter_name, lora_tensors, peft_config=peft_config)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def set_lora_from_tensors_copy(
@@ -314,17 +384,25 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         ``RemoteLoraWeightSync(copy=True)`` reaches the disjoint-partition HI3
         engines through this entry point.
         """
+        if not self._is_engine_launcher:
+            return
         self._weight_sync.set_lora_from_tensors_copy(adapter_name, lora_tensors, peft_config=peft_config)
 
     def loaded_param_checksums(self, *, names: List[str]) -> dict:
+        if not self._is_engine_launcher:
+            return {}
         return self._weight_sync.loaded_param_checksums(names=names)
 
     def loaded_lora_checksums(self, *, adapter_id: int, names: Optional[List[str]] = None) -> dict:
+        if not self._is_engine_launcher:
+            return {}
         return self._weight_sync.loaded_lora_checksums(adapter_id=adapter_id, names=names)
 
     @property
     def lora_dirty(self) -> bool:
         """True when LoRA is in use but the adapter must be (re)pushed."""
+        if not self._is_engine_launcher:
+            return False
         return self._weight_sync.lora_dirty
 
 

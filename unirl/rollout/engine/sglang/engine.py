@@ -28,6 +28,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.distributed.group.parallelism import RolloutParallelContext
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
@@ -44,7 +45,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
 
     _component_name = "sglang"
 
-    _accepts_rollout_tp_kwargs: bool = True
+    _accepts_rollout_parallel_context: bool = True
 
     def __init__(
         self,
@@ -55,14 +56,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
         rank: Optional[int] = None,
         model_config: Optional[Any] = None,
         ports: Optional[SGLangPorts] = None,
-        tp_rank: int = 0,
-        tp_size: int = 1,
-        tp_visible_devices: Optional[List[str]] = None,
-        tp_device_ids: Optional[List[int]] = None,
-        pp_rank: int = 0,
-        pp_size: int = 1,
-        ep_rank: int = 0,
-        ep_size: int = 1,
+        rollout_parallel: Optional[RolloutParallelContext] = None,
     ) -> None:
         require(
             isinstance(config, SGLangEngineConfig),
@@ -81,22 +75,27 @@ class SGLangRolloutEngine(SyncRolloutEngine):
         self._is_offloaded = False
         self._weights_onloaded_for_sync = False
 
-        self._tp_rank = int(tp_rank)
-        self._tp_size = int(tp_size)
-        self._pp_rank = int(pp_rank)
-        self._pp_size = int(pp_size)
-        self._ep_rank = int(ep_rank)
-        self._ep_size = int(ep_size)
-        if tp_visible_devices is not None and tp_device_ids is not None:
-            raise ValueError("set only one of tp_visible_devices or tp_device_ids")
-        if tp_visible_devices is not None:
-            self._tp_visible_devices = [str(token) for token in tp_visible_devices]
-        elif tp_device_ids is not None:
-            self._tp_visible_devices = [str(device_id) for device_id in tp_device_ids]
-        else:
-            self._tp_visible_devices = None
-        self._tp_device_ids = list(tp_device_ids) if tp_device_ids is not None else None
-        self._is_tp_zero = self._tp_rank == 0
+        self._parallel = rollout_parallel or RolloutParallelContext()
+        self._tp_rank = int(self._parallel.tp_rank)
+        self._tp_size = int(self._parallel.tp_size)
+        self._pp_rank = int(self._parallel.pp_rank)
+        self._pp_size = int(self._parallel.pp_size)
+        self._ep_rank = int(self._parallel.ep_rank)
+        self._ep_size = int(self._parallel.ep_size)
+        self._tp_visible_devices = list(self._parallel.visible_devices) or None
+        self._is_tp_zero = self._parallel.is_engine_launcher
+        expected_shape = (
+            int(config.tp_size or 1),
+            int(config.pp_size or 1),
+            int(config.ep_size or 1),
+        )
+        assigned_shape = (self._tp_size, self._pp_size, self._ep_size)
+        require(
+            expected_shape == assigned_shape,
+            "SGLangRolloutEngine placement mismatch: config declares "
+            f"(tp, pp, ep)={expected_shape}, but Handle assigned {assigned_shape}. "
+            "Construct parallel engines through a rollout Handle so DevicePool owns placement.",
+        )
 
         if not self._is_tp_zero:
             self.adapter = None

@@ -65,7 +65,7 @@ def install_fate_sharing(anchor_pid: int, *, arm_pdeathsig: bool) -> None:
     """Bind this process's lifetime to the root of its spawn chain.
 
     Without this the engine subprocess tree outlives the run. Measured on the
-    Qwen3-Omni anchored TP=4 topology: ``kill -TERM`` on the driver takes down
+    Qwen3-Omni TP=4 rollout topology: ``kill -TERM`` on the driver takes down
     the driver, the Ray actors and ``StageEngineCoreProc``, but the four
     ``Worker_TP*`` processes reparent to init and sit there holding ~7.3 GiB of
     device memory each until reaped by hand.

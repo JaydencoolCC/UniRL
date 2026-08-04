@@ -477,7 +477,6 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
     needs_sigmas = False
     needs_driver_tokenizer = False
     ar_lora_passthrough = True
-    clear_cuda_visible = True
     lora_copy_transport = True
 
     def __init__(
@@ -489,6 +488,11 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
         tokenize_fn: Any = None,
     ) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
+        require(
+            getattr(config, "tp_size", None) is not None,
+            "Qwen3OmniThinkerAdapter requires an explicit config.tp_size so Handle/DevicePool "
+            "owns the GPUs referenced by the stage YAML.",
+        )
 
         mc = model_config
         model_path = str(config.model_path)

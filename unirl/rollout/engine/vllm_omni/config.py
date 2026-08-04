@@ -61,6 +61,11 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
     model_path: str = MISSING
     modality: str = "hi3_t2i"
 
+    # Physical devices allocated to one Omni orchestrator. Handle derives the
+    # number of DP replicas as world_size // tp_size; stage YAML device ids stay
+    # logical within each replica's visible-device group.
+    tp_size: Optional[int] = None
+
     enable_sleep_mode: bool = True
 
     stage_yaml_override: Optional[str] = None
@@ -75,6 +80,10 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
 
     def __post_init__(self) -> None:
         self.modality = str(self.modality or "").strip().lower()
+        require(
+            self.tp_size is None or int(self.tp_size) >= 1,
+            f"VLLMOmniEngineConfig.tp_size must be >= 1 when set; got {self.tp_size!r}",
+        )
         from unirl.rollout.engine.vllm_omni.adapters import registered_adapters
 
         valid = registered_adapters()
