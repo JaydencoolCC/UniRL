@@ -38,6 +38,7 @@ from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.trainer.eval_sampling import build_eval_sampling, cfg_scale_of
 from unirl.trainer.eval_suites import build_eval_suites
 from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
@@ -102,8 +103,9 @@ class PETrainer(BaseTrainer):
         diffusion_group_scope: str = "rewrite",
         eval_interval: int = 0,
         eval_num_prompts: int = 8,
-        eval_cfg_text_scale: float = 4.0,
+        eval_cfg_text_scale: Optional[float] = None,
         eval_eta: float = 0.0,
+        eval_sampling_cfg: Optional[Any] = None,
         eval_rewards_cfg: Optional[Any] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
@@ -120,8 +122,10 @@ class PETrainer(BaseTrainer):
 
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
-        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
+        # None = inherit the training guidance, so a CFG-off run cannot silently eval with CFG on.
+        self.eval_cfg_text_scale = None if eval_cfg_text_scale is None else float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
+        self._eval_sampling_cfg = eval_sampling_cfg
 
         pe = pe_cfg if pe_cfg is not None else {}
         self._pe_instruction = pe.get("pe_instruction", None)
@@ -323,14 +327,13 @@ class PETrainer(BaseTrainer):
         land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``); returns
         ``eval/reward``.
         """
-        base_diffusion = self.sampling_params.get("diffusion")
-        replace_kwargs = dict(eta=self.eval_eta)
-        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
-            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
-        else:
-            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
-        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
-        eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
+        eval_sp = build_eval_sampling(
+            self.sampling_params,
+            cfg_text_scale=self.eval_cfg_text_scale,
+            eta=self.eval_eta,
+            overrides=self._eval_sampling_cfg,
+        )
+        eval_diffusion = eval_sp["diffusion"]
         self.rollout.wake_up()
         try:
             if self.diffusion_sync is not None:
@@ -340,18 +343,30 @@ class PETrainer(BaseTrainer):
             scorers = [("reward", self.reward)] + [
                 (s.name, s.reward) for s in self._eval_suites if s.data_source is None
             ]
-            metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+            metrics = self._eval_pass(
+                self.data_source, self.eval_num_prompts, scorers, eval_sp, step, media_prefix="eval"
+            )
             for suite in self._eval_suites:
                 if suite.data_source is not None:
                     n = suite.num_prompts or self.eval_num_prompts
-                    metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+                    metrics.update(
+                        self._eval_pass(
+                            suite.data_source,
+                            n,
+                            [(suite.name, suite.reward)],
+                            eval_sp,
+                            step,
+                            media_prefix=f"eval/{suite.name}",
+                        )
+                    )
         finally:
             self.rollout.sleep()
         logger.info(
-            "EVAL step %d  (cfg=%.1f eta=%.1f)  %s",
+            "EVAL step %d  (%d steps, cfg=%.1f eta=%.1f)  %s",
             step,
-            self.eval_cfg_text_scale,
-            self.eval_eta,
+            eval_diffusion.num_inference_steps,
+            cfg_scale_of(eval_diffusion),
+            eval_diffusion.eta,
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
         self.wandb_logger.log_eval(step, metrics)
@@ -364,6 +379,8 @@ class PETrainer(BaseTrainer):
         scorers: List[Tuple[str, Any]],
         eval_sp: Dict[str, BaseSamplingParams],
         step: int,
+        *,
+        media_prefix: Optional[str] = None,
     ) -> Dict[str, float]:
         """One generate→score sweep over one eval set; returns each scorer's mean.
 
@@ -371,6 +388,9 @@ class PETrainer(BaseTrainer):
         P-prompt req, so the chunk must be divisible by the engine dp; ``batch_size``
         is what training already runs, so it is divisible. A ragged tail
         (``num_prompts`` not a multiple of ``batch_size``) is floored off.
+
+        ``media_prefix`` names the wandb key family for the preview grid drawn
+        from the FIRST chunk (see :meth:`BaseTrainer._log_eval_media`).
         """
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
@@ -382,13 +402,18 @@ class PETrainer(BaseTrainer):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self.rollout.generate(request)
+            first_scored: Optional[Sample] = None
             for name, reward in scorers:
                 scored = reward.score_and_attach(generated)
+                if first_scored is None:
+                    first_scored = scored
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     r = hydrate(rewards).to(torch.float32)
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
+            if media_prefix and start == 0 and first_scored is not None:
+                self._log_eval_media(first_scored, step, prefix=media_prefix)
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def _ckpt_sides(self):

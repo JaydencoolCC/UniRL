@@ -13,6 +13,7 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.trainer.eval_sampling import build_eval_sampling, cfg_scale_of
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
@@ -57,8 +58,9 @@ class DiffusionTrainer(BaseTrainer):
         eval_num_prompts: int = 64,
         eval_samples_per_prompt: int = 4,
         eval_chunk_prompts: int = 16,
-        eval_cfg_text_scale: float = 4.0,
+        eval_cfg_text_scale: Optional[float] = None,
         eval_eta: float = 0.0,
+        eval_sampling_cfg: Optional[Any] = None,
         eval_rewards_cfg: Optional[Any] = None,
         task_config: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -72,8 +74,10 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_num_prompts = int(eval_num_prompts)
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_chunk_prompts = int(eval_chunk_prompts)
-        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
+        # None = inherit the training guidance, so a CFG-off run cannot silently eval with CFG on.
+        self.eval_cfg_text_scale = None if eval_cfg_text_scale is None else float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
+        self._eval_sampling_cfg = eval_sampling_cfg
         self._eval_rewards_cfg = eval_rewards_cfg
         self._eval_suites: List[EvalRewardSuite] = []
         self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
@@ -506,15 +510,14 @@ class DiffusionTrainer(BaseTrainer):
         """Periodic eval on the eval set (no training); returns the mean reward.
 
         Mirrors :meth:`_rollout_and_score`'s rollout+reward path but skips advantage/backward.
-        Generates at the deterministic best-quality setting (``cfg_text_scale=
-        eval_cfg_text_scale``, ``eta=eval_eta`` — at ``eval_eta=0`` the SDE gate
-        is also cleared, so the request is pure ODE; ``eval_samples_per_prompt``
-        x_T per prompt) and scores. The training reward plus every shared-set
-        ``eval_rewards`` suite scores the SAME generated images over the default
-        eval set (``run.eval_data_path``, ``eval_num_prompts`` prompts); each
-        own-set suite then gets its own generation pass over its own prompts.
-        All means land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``);
-        returns ``eval/reward``.
+        Eval sampling INHERITS the training ``sampling:`` block and overlays the
+        ``eval_*`` knobs plus the recipe's ``eval_sampling:`` block on top — see
+        :func:`unirl.trainer.eval_sampling.build_eval_sampling` for the precedence.
+        The training reward plus every shared-set ``eval_rewards`` suite scores the
+        SAME generated images over the default eval set (``run.eval_data_path``,
+        ``eval_num_prompts`` prompts); each own-set suite then gets its own
+        generation pass over its own prompts. All means land in one ``eval/*`` row
+        (``eval/reward`` + ``eval/<suite>``); returns ``eval/reward``.
 
         ``sync_weights=False`` evaluates the policy already resident in the rollout
         engine without changing its weight version, and ``sleep_after=False`` leaves
@@ -527,22 +530,14 @@ class DiffusionTrainer(BaseTrainer):
                 "DiffusionTrainer.evaluate: no reward configured (the recipe has no `reward:` "
                 "block) — evaluation scores generations and needs one."
             )
-        base_diffusion = self.sampling_params.get("diffusion")
-        replace_kwargs = dict(
-            samples_per_prompt=self.eval_samples_per_prompt,
+        eval_sp = build_eval_sampling(
+            self.sampling_params,
+            cfg_text_scale=self.eval_cfg_text_scale,
             eta=self.eval_eta,
+            samples_per_prompt=self.eval_samples_per_prompt,
+            overrides=self._eval_sampling_cfg,
         )
-        if self.eval_eta <= 0.0:
-            # Deterministic eval must also clear the SDE gate: eta=0 with gated
-            # steps is a contradictory request — the central kernel degrades such
-            # steps to ODE, but worker-resident schedulers (BAGEL) refuse the pair.
-            replace_kwargs.update(sde_indices=[], scheduler=None)
-        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
-            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
-        else:
-            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
-        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
-        eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
+        eval_diffusion = eval_sp["diffusion"]
         self.rollout.wake_up()
         try:
             if sync_weights and self.weight_sync is not None:
@@ -550,20 +545,32 @@ class DiffusionTrainer(BaseTrainer):
             scorers = [("reward", self.reward)] + [
                 (s.name, s.reward) for s in self._eval_suites if s.data_source is None
             ]
-            metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+            metrics = self._eval_pass(
+                self.data_source, self.eval_num_prompts, scorers, eval_sp, step, media_prefix="eval"
+            )
             for suite in self._eval_suites:
                 if suite.data_source is not None:
                     n = suite.num_prompts or self.eval_num_prompts
-                    metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+                    metrics.update(
+                        self._eval_pass(
+                            suite.data_source,
+                            n,
+                            [(suite.name, suite.reward)],
+                            eval_sp,
+                            step,
+                            media_prefix=f"eval/{suite.name}",
+                        )
+                    )
         finally:
             if sleep_after:
                 self.rollout.sleep()
         logger.info(
-            "EVAL step %d  (%d samples/prompt, cfg=%.1f eta=%.1f)  %s",
+            "EVAL step %d  (%d samples/prompt, %d steps, cfg=%.1f eta=%.1f)  %s",
             step,
             self.eval_samples_per_prompt,
-            self.eval_cfg_text_scale,
-            self.eval_eta,
+            eval_diffusion.num_inference_steps,
+            cfg_scale_of(eval_diffusion),
+            eval_diffusion.eta,
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
         self.wandb_logger.log_eval(step, metrics)
@@ -576,6 +583,8 @@ class DiffusionTrainer(BaseTrainer):
         scorers: List[Tuple[str, Any]],
         eval_sp: Dict[str, BaseSamplingParams],
         step: int,
+        *,
+        media_prefix: Optional[str] = None,
     ) -> Dict[str, float]:
         """One generate→score sweep over one eval set; returns each scorer's mean.
 
@@ -583,6 +592,10 @@ class DiffusionTrainer(BaseTrainer):
         never holds N x the KV/decoded on the driver (the it2i memory
         bottleneck). Scores the single scorable (segment-carrying) track with
         every scorer — single-track for now; revisit if multi-track lands.
+
+        ``media_prefix`` names the wandb key family for the preview grid drawn
+        from the FIRST chunk (see :meth:`BaseTrainer._log_eval_media`); the first
+        scorer's Sample is used so captions carry its reward.
         """
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
@@ -593,13 +606,18 @@ class DiffusionTrainer(BaseTrainer):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self.rollout.generate(request)
+            first_scored: Optional[Sample] = None
             for name, reward in scorers:
                 scored = reward.score_and_attach(generated)
+                if first_scored is None:
+                    first_scored = scored
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     r = hydrate(rewards).to(torch.float32)
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
+            if media_prefix and start == 0 and first_scored is not None:
+                self._log_eval_media(first_scored, step, prefix=media_prefix)
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def train(

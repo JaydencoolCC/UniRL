@@ -251,6 +251,63 @@ an evaluation and checkpoint fall on the same step, evaluation runs first.
 - Agentic evaluation is not implemented. Barrier and partial variants raise if
   evaluation is enabled; async variants currently force it off.
 
+## Eval sampling: what eval shares with the RL rollout, and what it does not
+
+Eval **inherits the training `sampling:` block** and overlays only what the recipe
+asks for. The rollout's own params are untouched, so eval settings never leak into
+the trajectories the policy is trained on.
+
+| Recipe key | Overrides | Default when unset |
+| --- | --- | --- |
+| `eval_num_prompts` | prompts pulled from `run.eval_data_path` | `64` (diffusion) |
+| `eval_samples_per_prompt` | images per eval prompt | `4` (diffusion) |
+| `eval_chunk_prompts` | prompts per eval `generate` (driver memory) | `16` (diffusion) |
+| `eval_cfg_text_scale` | CFG scale (`cfg_text_scale` on BAGEL, else `guidance_scale`) | **inherits `sampling.guidance_scale`** |
+| `eval_eta` | SDE noise level; `<= 0` also clears the SDE gate → pure ODE | `0.0` |
+| `eval_sampling:` | **any** `DiffusionSamplingParams` field | inherits `sampling:` |
+
+`eval_sampling:` is a plain overlay, not a Hydra target — it takes no `_target_`,
+and an unknown field raises instead of being silently dropped. It applies last, so
+it wins over the scalar knobs above:
+
+```yaml
+sampling:                       # the RL rollout: cheap, stochastic, CFG on
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 4.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 8
+
+eval_interval: 20
+eval_samples_per_prompt: 4
+eval_sampling:                  # eval only: full step count and resolution
+  num_inference_steps: 28
+  height: 1024
+  width: 1024
+```
+
+CFG is decoupled by construction: `sampling.guidance_scale` is what the rollout
+samples with **and what the trainer replays log-probs at** (they must match — the
+policy being optimized is the CFG-combined sampler), while `eval_cfg_text_scale`
+(or `eval_sampling.guidance_scale`) is eval-only. Leaving it unset inherits the
+training guidance, so a CFG-off run cannot silently evaluate with CFG on.
+
+## Eval media
+
+`logging.log_media: true` uploads a preview grid at every eval under
+`eval/generated_media` (`eval/<suite>/generated_media` for own-set suites), on the
+`eval/step` axis so it lines up with `eval/reward`. `media_log_interval` paces the
+rollout panel only — eval already has `eval_interval` as its cadence.
+
+The grid is a **fixed comparison set**, not a fresh draw: eval prompts are the head
+of the eval file and eval x_T is keyed on prompt content and sibling ordinal
+(`make_prompt_seed_group_id`, independent of rollout id and rank), so the first
+`media_max_items` samples are the same prompts at the same noise at every eval.
+Panels across a run are therefore directly comparable, and so are two runs sharing
+an eval set and `sampling.seed`.
+
 ## Gotchas
 
 - **Multi-update means disjoint optimizer mini-batches, not repeated full-batch

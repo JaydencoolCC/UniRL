@@ -58,8 +58,10 @@ def main(cfg: DictConfig) -> None:
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", True),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", cfg.batch_size),
-        eval_cfg_text_scale=float(cfg.get("eval_cfg_text_scale", 4.0)),
+        # Unset ⇒ eval inherits `sampling.guidance_scale` instead of a fixed default.
+        eval_cfg_text_scale=cfg.get("eval_cfg_text_scale"),
         eval_eta=float(cfg.get("eval_eta", 0.0)),
+        eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
     )
     trainer.train(
